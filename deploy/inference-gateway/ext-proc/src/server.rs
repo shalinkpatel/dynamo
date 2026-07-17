@@ -933,7 +933,7 @@ struct ExtProcError {
     status_code: StatusCode,
     message: String,
     /// Response headers to attach to the immediate response. Empty for most
-    /// failures; carries `Retry-After` when a policy class sheds a request.
+    /// failures; carries `Retry-After` when a shed rejects a request.
     headers: Vec<(String, String)>,
 }
 
@@ -962,6 +962,18 @@ impl ExtProcError {
             // In-flight limit saturated: shed as retryable backpressure. The
             // variant message ("endpoint picker overloaded") is client-safe.
             PickError::Overloaded => Self::new(StatusCode::ServiceUnavailable, e.to_string()),
+            // Fleet-wide, request-blind shed: every discovered worker is
+            // overloaded on raw KV/prefill load, checked before tokenization or
+            // per-class routing. 429 + optional Retry-After, same as a per-class
+            // shed below, but with no class in the body since none was resolved.
+            PickError::AllWorkersOverloaded { retry_after_secs } => {
+                let mut err = Self::new(StatusCode::TooManyRequests, e.to_string());
+                if let Some(secs) = retry_after_secs {
+                    err.headers
+                        .push(("retry-after".to_string(), secs.to_string()));
+                }
+                err
+            }
             // A policy class refused admission. 429 is what gateway failover
             // logic already understands, and `Retry-After` tells the client when
             // to come back instead of leaving it to guess. The picker logs which
@@ -1601,6 +1613,34 @@ mod tests {
     fn overloaded_pick_error_maps_to_503() {
         let err = ExtProcError::from_pick_error(PickError::Overloaded);
         assert_eq!(err.status_code, StatusCode::ServiceUnavailable);
+    }
+
+    /// The fleet-wide, request-blind shed (Gate A) maps to 429 and advertises
+    /// `Retry-After` the same way the per-class shed does, since both are a
+    /// deliberate load-shed verdict rather than an error.
+    #[test]
+    fn all_workers_overloaded_pick_error_maps_to_429_with_retry_after() {
+        let err = ExtProcError::from_pick_error(PickError::AllWorkersOverloaded {
+            retry_after_secs: Some(5),
+        });
+
+        assert_eq!(err.status_code, StatusCode::TooManyRequests);
+        assert_eq!(
+            err.headers,
+            vec![("retry-after".to_string(), "5".to_string())]
+        );
+    }
+
+    /// Without a configured delay the fleet-wide shed still answers 429, just
+    /// with no hint, rather than inventing a retry time.
+    #[test]
+    fn all_workers_overloaded_pick_error_omits_absent_retry_after() {
+        let err = ExtProcError::from_pick_error(PickError::AllWorkersOverloaded {
+            retry_after_secs: None,
+        });
+
+        assert_eq!(err.status_code, StatusCode::TooManyRequests);
+        assert!(err.headers.is_empty());
     }
 
     /// A per-class shed maps to 429 and advertises `Retry-After`, which is what

@@ -151,10 +151,19 @@ pub enum PickError {
     /// multiplexing means the connection cap does not bound concurrent requests.
     #[error("endpoint picker overloaded")]
     Overloaded,
+    /// Every eligible worker is overloaded on the fleet-wide KV/prefill load
+    /// signal (`KvWorkerMonitor`), before tokenization or per-class routing ever
+    /// runs → 429 with `Retry-After`. This is the cheap, request-blind backstop:
+    /// it costs nothing to refuse a fully saturated pool, but it cannot see
+    /// request size or retry status. Distinct from [`Self::Saturated`], which is
+    /// a per-class refusal made *after* routing knows the request's class.
+    #[error("all workers overloaded")]
+    AllWorkersOverloaded { retry_after_secs: Option<u64> },
     /// The request's policy class refused admission while the fleet was saturated,
     /// so it is shed rather than queued → 429 with `Retry-After`. Distinct from
     /// [`Self::Overloaded`], which is this process protecting itself rather than a
-    /// per-class fleet decision.
+    /// per-class fleet decision, and from [`Self::AllWorkersOverloaded`], which is
+    /// blind to request class.
     #[error("policy class {policy_class} is shedding load")]
     Saturated {
         policy_class: String,
