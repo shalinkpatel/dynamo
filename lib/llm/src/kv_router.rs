@@ -667,7 +667,6 @@ where
         Some(RouterHint {
             source_control_endpoint,
             block_hashes,
-            target_cached_prefix_blocks,
         })
     }
 
