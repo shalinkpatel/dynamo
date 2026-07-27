@@ -51,7 +51,9 @@ dynamo-vllm-sidecar \
 Use `VLLM_GRPC_ENDPOINT` instead of `--vllm-endpoint` when the endpoint is
 provided through the environment.
 
-The sidecar discovers `model_id`, the served name, parser defaults, context length, KV capacity, scheduler limits, and data-parallel layout through `vllm.Control`. `model_id` must be readable locally or fetchable by Dynamo for tokenization and chat templates.
+The sidecar discovers `model_id`, the served name, parser defaults, context length, KV capacity, and scheduler limits through `vllm.Control`. `model_id` must be readable locally or fetchable by Dynamo for tokenization and chat templates.
+
+Data-parallel registration is omitted because Control reports global topology, not the rank range hosted by the connected frontend.
 
 Aggregated serving is the default. Set the existing `--disaggregation-mode` to `prefill` or `decode` only for non-aggregated deployments; the current Control API does not report engine role.
 

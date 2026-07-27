@@ -75,14 +75,6 @@ impl DiscoveredModel {
     }
 
     pub(crate) fn engine_config(&self) -> EngineConfig {
-        let parallelism = self.server.parallelism.as_ref();
-        let data_parallel_size =
-            nonzero(parallelism.map_or(0, |parallelism| parallelism.data_parallel_size));
-        let data_parallel_start_rank = data_parallel_size.map(|_| {
-            parallelism
-                .expect("parallelism was present")
-                .data_parallel_rank
-        });
         EngineConfig {
             model: self.source.clone(),
             served_model_name: Some(self.served_name.clone()),
@@ -93,8 +85,6 @@ impl DiscoveredModel {
                 total_kv_blocks: nonzero(self.server.total_kv_blocks),
                 max_num_seqs: nonzero(self.server.max_running_requests),
                 max_num_batched_tokens: nonzero(self.server.max_batched_tokens),
-                data_parallel_size,
-                data_parallel_start_rank,
                 ..Default::default()
             }),
         }

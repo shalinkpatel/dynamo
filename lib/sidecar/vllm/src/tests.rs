@@ -33,6 +33,7 @@ use crate::proto as pb;
 struct FakeVllm {
     requests: Arc<Mutex<Vec<pb::GenerateRequest>>>,
     peers: Arc<Mutex<Vec<SocketAddr>>>,
+    model_info_override: Arc<Mutex<Option<pb::ModelInfo>>>,
     reject: Arc<AtomicBool>,
     hang: Arc<AtomicBool>,
     hang_before_headers: Arc<AtomicBool>,
@@ -176,7 +177,13 @@ impl pb::control_server::Control for FakeVllm {
         &self,
         _request: Request<pb::GetModelInfoRequest>,
     ) -> Result<Response<pb::ModelInfo>, Status> {
-        Ok(Response::new(model_info()))
+        let model = self
+            .model_info_override
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(model_info);
+        Ok(Response::new(model))
     }
 
     async fn abort(
@@ -469,14 +476,17 @@ fn request() -> PreprocessedRequest {
 }
 
 fn engine(endpoint: &str, mode: DisaggregationMode, connections: usize) -> VllmSidecarEngine {
+    let transport = GrpcTransportConfig {
+        connections: NonZeroUsize::new(connections).expect("non-zero connection count"),
+        ..Default::default()
+    };
     VllmSidecarEngine::new(
         GrpcEndpoint::parse(endpoint, "--vllm-endpoint").expect("valid test endpoint"),
         DiscoveredModel::from_proto(model_info(), server_info()).expect("valid discovery"),
         mode,
-        GrpcTransportConfig {
-            connections: NonZeroUsize::new(connections).expect("non-zero connection count"),
-            ..Default::default()
-        },
+        transport,
+        crate::client::startup_deadline(transport.startup_deadline)
+            .expect("valid startup deadline"),
     )
 }
 
@@ -531,8 +541,8 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     assert_eq!(registration.total_kv_blocks, Some(4096));
     assert_eq!(registration.max_num_seqs, Some(128));
     assert_eq!(registration.max_num_batched_tokens, Some(2048));
-    assert_eq!(registration.data_parallel_size, Some(4));
-    assert_eq!(registration.data_parallel_start_rank, Some(2));
+    assert_eq!(registration.data_parallel_size, None);
+    assert_eq!(registration.data_parallel_start_rank, None);
 
     let outputs = collect(&engine, request()).await;
     assert_eq!(outputs.len(), 1);
@@ -597,16 +607,85 @@ async fn startup_waits_for_control_and_inference_health() {
         .health
         .set_service_status(CONTROL_SERVICE, HealthServingStatus::Serving)
         .await;
-    server
-        .health
-        .set_service_status(INFERENCE_SERVICE, HealthServingStatus::Serving)
-        .await;
 
     let (engine, _) = tokio::time::timeout(std::time::Duration::from_secs(2), bootstrap)
         .await
         .expect("bootstrap did not observe SERVING")
         .expect("bootstrap task");
-    engine.start(0).await.expect("start");
+    let start = tokio::spawn(async move { engine.start(0).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!start.is_finished(), "startup ignored Inference health");
+
+    server
+        .health
+        .set_service_status(INFERENCE_SERVICE, HealthServingStatus::Serving)
+        .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), start)
+        .await
+        .expect("startup did not observe SERVING")
+        .expect("startup task")
+        .expect("start");
+}
+
+#[tokio::test]
+async fn startup_rejects_model_identity_changes_after_bootstrap() {
+    let server = FakeServer::start(FakeVllm::default()).await;
+    let (engine, _) = engine_from_args(&server.endpoint).await;
+    let mut changed = model_info();
+    changed.model_id = "different-model".to_string();
+    *server.service.model_info_override.lock().await = Some(changed);
+
+    let error = engine
+        .start(0)
+        .await
+        .expect_err("startup accepted a changed model identity");
+    assert!(error.to_string().contains("model identity changed"));
+}
+
+#[tokio::test]
+async fn startup_uses_the_deadline_established_before_start() {
+    let server = FakeServer::start(FakeVllm::default()).await;
+    let transport = GrpcTransportConfig {
+        connections: NonZeroUsize::MIN,
+        ..Default::default()
+    };
+    let engine = VllmSidecarEngine::new(
+        GrpcEndpoint::parse(&server.endpoint, "--vllm-endpoint").unwrap(),
+        DiscoveredModel::from_proto(model_info(), server_info()).unwrap(),
+        DisaggregationMode::Aggregated,
+        transport,
+        tokio::time::Instant::now() + std::time::Duration::from_millis(25),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let error = tokio::time::timeout(std::time::Duration::from_millis(250), engine.start(0))
+        .await
+        .expect("startup reset the expired deadline")
+        .expect_err("startup accepted an expired deadline");
+    assert!(error.to_string().contains("startup deadline"));
+}
+
+#[tokio::test]
+async fn missing_health_registration_fails_without_retrying() {
+    let mut server = FakeServer::start(FakeVllm::default()).await;
+    server.health.clear_service_status(CONTROL_SERVICE).await;
+    let endpoint = GrpcEndpoint::parse(&server.endpoint, "--vllm-endpoint").unwrap();
+    let transport = GrpcTransportConfig::default();
+    let deadline = crate::client::startup_deadline(transport.startup_deadline).unwrap();
+    let client = VllmClient::connect(&endpoint, transport, deadline)
+        .await
+        .expect("connect");
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        client.wait_for_services(&[CONTROL_SERVICE], deadline, transport.retry_interval),
+    )
+    .await
+    .expect("missing health registration was retried")
+    .expect_err("missing health registration was accepted");
+    assert!(error.to_string().contains("standard gRPC health API"));
 }
 
 #[tokio::test]
@@ -695,7 +774,8 @@ async fn pool_uses_each_configured_connection() {
         ..Default::default()
     };
     let endpoint = GrpcEndpoint::parse(&server.endpoint, "--vllm-endpoint").unwrap();
-    let client = VllmClient::connect(&endpoint, transport)
+    let deadline = crate::client::startup_deadline(transport.startup_deadline).unwrap();
+    let client = VllmClient::connect(&endpoint, transport, deadline)
         .await
         .expect("connect pool");
     assert_eq!(client.connection_count(), 2);

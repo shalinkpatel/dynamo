@@ -9,6 +9,7 @@ use dynamo_backend_common::{
 use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig};
 use futures::stream::BoxStream;
 use tokio::sync::OnceCell;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::Args;
@@ -21,6 +22,7 @@ pub struct VllmSidecarEngine {
     model: DiscoveredModel,
     mode: DisaggregationMode,
     transport: GrpcTransportConfig,
+    startup_deadline: Instant,
     client: OnceCell<VllmClient>,
     cancel: CancellationToken,
 }
@@ -38,12 +40,14 @@ impl VllmSidecarEngine {
         model: DiscoveredModel,
         mode: DisaggregationMode,
         transport: GrpcTransportConfig,
+        startup_deadline: Instant,
     ) -> Self {
         Self {
             endpoint,
             model,
             mode,
             transport,
+            startup_deadline,
             client: OnceCell::new(),
             cancel: CancellationToken::new(),
         }
@@ -86,9 +90,14 @@ impl VllmSidecarEngine {
 
         let endpoint = GrpcEndpoint::parse(&args.vllm_endpoint, "--vllm-endpoint")?;
         let transport = args.sidecar.grpc.config();
-        let model = bootstrap_discover(&endpoint, transport)?;
+        let startup_deadline = client::startup_deadline(transport.startup_deadline)?;
+        eprintln!(
+            "Discovering vLLM model metadata from {endpoint}; startup deadline: {:?}",
+            transport.startup_deadline
+        );
+        let model = bootstrap_discover(&endpoint, transport, startup_deadline)?;
         let mode = args.sidecar.common.disaggregation_mode;
-        let engine = Self::new(endpoint, model.clone(), mode, transport);
+        let engine = Self::new(endpoint, model.clone(), mode, transport, startup_deadline);
         let tool_call_parser = args
             .sidecar
             .common
@@ -143,15 +152,16 @@ impl LLMEngine for VllmSidecarEngine {
             mode = %self.mode,
             "connecting to vLLM gRPC"
         );
-        let client = VllmClient::connect(&self.endpoint, self.transport).await?;
+        let client =
+            VllmClient::connect(&self.endpoint, self.transport, self.startup_deadline).await?;
         client
             .wait_for_services(
                 &[CONTROL_SERVICE, INFERENCE_SERVICE],
-                self.transport.startup_deadline,
+                self.startup_deadline,
                 self.transport.retry_interval,
             )
             .await?;
-        let (model, server) = client.discover(self.transport.startup_deadline).await?;
+        let (model, server) = client.discover(self.startup_deadline).await?;
         let observed = DiscoveredModel::from_proto(model, server)?;
         self.model.ensure_same_identity(&observed)?;
         let connection_count = client.connection_count();
@@ -250,6 +260,7 @@ impl LLMEngine for VllmSidecarEngine {
 fn bootstrap_discover(
     endpoint: &GrpcEndpoint,
     transport: GrpcTransportConfig,
+    startup_deadline: Instant,
 ) -> Result<DiscoveredModel, DynamoError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -260,15 +271,15 @@ fn bootstrap_discover(
             connections: std::num::NonZeroUsize::MIN,
             ..transport
         };
-        let client = VllmClient::connect(endpoint, bootstrap_transport).await?;
+        let client = VllmClient::connect(endpoint, bootstrap_transport, startup_deadline).await?;
         client
             .wait_for_services(
                 &[CONTROL_SERVICE],
-                transport.startup_deadline,
+                startup_deadline,
                 transport.retry_interval,
             )
             .await?;
-        let (model, server) = client.discover(transport.startup_deadline).await?;
+        let (model, server) = client.discover(startup_deadline).await?;
         DiscoveredModel::from_proto(model, server)
     })
 }
