@@ -3083,6 +3083,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.13.1",
+ "tonic-health",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -3107,6 +3108,7 @@ dependencies = [
  "tokio-util",
  "tonic 0.13.1",
  "tonic-build 0.13.1",
+ "tonic-health",
  "tracing",
 ]
 
