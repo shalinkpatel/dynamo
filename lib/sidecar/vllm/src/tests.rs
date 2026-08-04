@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dynamo_backend_common::engine::RoutingHints;
 use dynamo_backend_common::{
     DisaggregationMode, FinishReason, GenerateContext, LLMEngine, MultimodalData, OutputOptions,
     PrefillResult, PreprocessedRequest, SamplingOptions, StopConditions,
@@ -498,7 +499,11 @@ fn request() -> PreprocessedRequest {
             prompt_logprobs: Some(1),
             ..Default::default()
         })
-        .mdc_sum(Some("cache-salt".to_string()))
+        .mdc_sum(Some("model-checksum".to_string()))
+        .routing(Some(RoutingHints {
+            cache_namespace: Some("cache-salt".to_string()),
+            ..Default::default()
+        }))
         .extra_args(Some(json!({
             "bypass_prefix_cache": true,
             "kv_transfer_params": {
@@ -592,7 +597,7 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     assert_eq!(sources[0].dp_rank(), 2);
 
     let mut routed_request = serde_json::to_value(request()).expect("serialize request");
-    routed_request["routing"] = json!({"dp_rank": 2});
+    routed_request["routing"] = json!({"dp_rank": 2, "cache_salt": "cache-salt"});
     let outputs = collect(
         &engine,
         serde_json::from_value(routed_request).expect("deserialize routed request"),
@@ -640,7 +645,7 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     assert!(stopping.ignore_eos);
     let kv = sent.kv.as_ref().unwrap();
     assert!(kv.bypass_prefix_cache);
-    assert_eq!(kv.cache_salt, "cache-salt");
+    assert_eq!(kv.cache_salt, "dynamo-cache-salt:cache-salt");
     assert_eq!(
         struct_to_json(kv.kv_transfer_params.clone().unwrap()).unwrap(),
         json!({"connector_data": {"values": [1, true, null]}})

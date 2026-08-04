@@ -12,6 +12,8 @@ use crate::proto as pb;
 
 const VLLM_LOGPROB_FLOOR: f64 = -9999.0;
 const MULTIMODAL_PROMPT_TOKEN_IDS_KEY: &str = "_dynamo_sidecar_multimodal_prompt_token_ids";
+// Must match DYNAMO_CACHE_SALT_PREFIX in lib/kv-router/src/zmq_wire/extra_keys.rs.
+const DYNAMO_CACHE_SALT_PREFIX: &str = "dynamo-cache-salt:";
 
 pub(crate) fn build_generate_request(
     request: PreprocessedRequest,
@@ -64,8 +66,7 @@ pub(crate) fn build_generate_request(
         .unwrap_or(0);
     let cache_salt = routing
         .as_mut()
-        .and_then(|routing| routing.cache_namespace.take())
-        .or(request.mdc_sum);
+        .and_then(|routing| routing.cache_namespace.take());
 
     let sampling = request.sampling_options;
     let stop_conditions = request.stop_conditions;
@@ -385,7 +386,9 @@ fn build_kv_parameters(
 
     Ok(pb::KvCacheParameters {
         bypass_prefix_cache,
-        cache_salt: cache_salt.unwrap_or_default(),
+        cache_salt: cache_salt
+            .map(|cache_salt| format!("{DYNAMO_CACHE_SALT_PREFIX}{cache_salt}"))
+            .unwrap_or_default(),
         kv_transfer_params: kv_transfer_params.map(json_to_struct).transpose()?,
         ec_transfer_params: None,
     })
