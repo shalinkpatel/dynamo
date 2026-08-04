@@ -11,6 +11,7 @@ use crate::json::{json_to_struct, struct_to_json};
 use crate::proto as pb;
 
 const VLLM_LOGPROB_FLOOR: f64 = -9999.0;
+const MULTIMODAL_PROMPT_TOKEN_IDS_KEY: &str = "_dynamo_sidecar_multimodal_prompt_token_ids";
 
 pub(crate) fn build_generate_request(
     request: PreprocessedRequest,
@@ -19,7 +20,23 @@ pub(crate) fn build_generate_request(
 ) -> Result<pb::GenerateRequest, DynamoError> {
     validate_request(&request, mode)?;
 
-    let media = build_media(&request)?;
+    let has_media = request
+        .multi_modal_data
+        .as_ref()
+        .is_some_and(|media| media.values().any(|items| !items.is_empty()));
+    // Multimodal preprocessing happens on the aggregate/prefill engine. The
+    // decode engine receives only token IDs plus the KV handoff, so forwarding
+    // media again would duplicate image processing.
+    let media = if mode.is_decode() {
+        Vec::new()
+    } else {
+        build_media(&request)?
+    };
+    let mut prefill_result = request.prefill_result;
+    let mut token_ids = request.token_ids;
+    if mode.is_decode() && has_media {
+        token_ids = take_multimodal_prompt_token_ids(&mut prefill_result)?;
+    }
     let data_parallel_rank = request.routing.as_ref().and_then(|routing| {
         if mode.is_prefill() {
             routing.prefill_dp_rank.or(routing.dp_rank)
@@ -52,13 +69,22 @@ pub(crate) fn build_generate_request(
 
     let sampling = request.sampling_options;
     let stop_conditions = request.stop_conditions;
-    let kv = build_kv_parameters(request.extra_args, request.prefill_result, cache_salt, mode)?;
+    let mut extra_args = request.extra_args;
+    if has_media && let Some(serde_json::Value::Object(extra)) = extra_args.as_mut() {
+        // The frontend retains the original chat messages and rendered prompt
+        // for multimodal bookkeeping after it has already produced token_ids
+        // and multi_modal_data. The gRPC request carries those preprocessed
+        // fields directly; these values are not vLLM engine options.
+        extra.remove("messages");
+        extra.remove("formatted_prompt");
+    }
+    let kv = build_kv_parameters(extra_args, prefill_result, cache_salt, mode)?;
 
     Ok(pb::GenerateRequest {
         request_id,
         model: String::new(),
         prompt: Some(pb::generate_request::Prompt::TokenIds(pb::TokenIds {
-            ids: request.token_ids,
+            ids: token_ids,
         })),
         temperature: sampling.temperature,
         sampling: Some(pb::RandomSampling {
@@ -88,7 +114,7 @@ pub(crate) fn build_generate_request(
             ignore_eos: stop_conditions.ignore_eos.unwrap_or(false),
         }),
         response: Some(pb::ResponseOptions {
-            prompt_token_ids: prompt_logprobs.is_some(),
+            prompt_token_ids: prompt_logprobs.is_some() || (has_media && mode.is_prefill()),
             prompt_logprobs: prompt_logprobs.is_some(),
             prompt_candidates: prompt_logprobs.map(top_n_candidates).transpose()?,
             output_text: Some(true),
@@ -103,6 +129,34 @@ pub(crate) fn build_generate_request(
         media,
         data_parallel_rank,
     })
+}
+
+fn take_multimodal_prompt_token_ids(
+    prefill_result: &mut Option<PrefillResult>,
+) -> Result<Vec<u32>, DynamoError> {
+    let params = &mut prefill_result
+        .as_mut()
+        .ok_or_else(|| {
+            client::invalid_argument("multimodal decode request is missing the prefill result")
+        })?
+        .disaggregated_params;
+    let value = params
+        .as_object_mut()
+        .and_then(|params| params.remove(MULTIMODAL_PROMPT_TOKEN_IDS_KEY))
+        .ok_or_else(|| {
+            client::invalid_argument(
+                "multimodal decode request is missing expanded prefill token IDs",
+            )
+        })?;
+    let token_ids: Vec<u32> = serde_json::from_value(value).map_err(|error| {
+        client::invalid_argument(format!("multimodal prefill token IDs are invalid: {error}"))
+    })?;
+    if token_ids.is_empty() {
+        return Err(client::invalid_argument(
+            "multimodal prefill token IDs must not be empty",
+        ));
+    }
+    Ok(token_ids)
 }
 
 fn media_source(source: &str) -> Result<pb::media_item::Source, DynamoError> {
@@ -457,6 +511,8 @@ fn validate_request(
 
 pub(crate) struct ResponseState {
     prompt_tokens: u32,
+    has_media: bool,
+    multimodal_prompt_token_ids: Option<Vec<u32>>,
     completion_tokens: u32,
     is_prefill: bool,
     output_logprobs: Option<u32>,
@@ -468,6 +524,11 @@ impl ResponseState {
     pub(crate) fn new(request: &PreprocessedRequest, mode: DisaggregationMode) -> Self {
         Self {
             prompt_tokens: request.token_ids.len() as u32,
+            has_media: request
+                .multi_modal_data
+                .as_ref()
+                .is_some_and(|media| media.values().any(|items| !items.is_empty())),
+            multimodal_prompt_token_ids: None,
             completion_tokens: 0,
             is_prefill: mode.is_prefill(),
             output_logprobs: request.output_options.logprobs,
@@ -590,6 +651,28 @@ impl ResponseState {
                 "prefill terminal is missing kv_transfer_params",
             ));
         }
+        if self.is_prefill && self.has_media {
+            let token_ids = self.multimodal_prompt_token_ids.take().ok_or_else(|| {
+                client::protocol_error(
+                    "multimodal prefill did not return expanded prompt token IDs",
+                )
+            })?;
+            let params = mapped
+                .disaggregated_params
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    client::protocol_error("prefill kv_transfer_params is not a JSON object")
+                })?;
+            params.insert(
+                MULTIMODAL_PROMPT_TOKEN_IDS_KEY.to_string(),
+                serde_json::to_value(token_ids).map_err(|error| {
+                    client::protocol_error(format!(
+                        "failed to encode multimodal prefill token IDs: {error}"
+                    ))
+                })?,
+            );
+        }
         self.attach_prompt_data(&mut mapped);
         Ok(Some(mapped))
     }
@@ -602,10 +685,26 @@ impl ResponseState {
 
     fn consume_prompt_info(&mut self, prompt: pb::PromptInfo) -> Result<(), DynamoError> {
         if prompt.num_prompt_tokens != self.prompt_tokens {
-            return Err(client::protocol_error(format!(
-                "prompt token count {} does not match request count {}",
-                prompt.num_prompt_tokens, self.prompt_tokens
-            )));
+            if !self.has_media {
+                return Err(client::protocol_error(format!(
+                    "prompt token count {} does not match request count {}",
+                    prompt.num_prompt_tokens, self.prompt_tokens
+                )));
+            }
+            // Multimodal preprocessing expands placeholder token IDs into the
+            // model-specific media sequence. vLLM's post-processing count is
+            // authoritative for usage and prompt-logprob validation.
+            self.prompt_tokens = prompt.num_prompt_tokens;
+        }
+        if self.is_prefill && self.has_media {
+            if prompt.token_ids.len() != prompt.num_prompt_tokens as usize {
+                return Err(client::protocol_error(format!(
+                    "multimodal prefill returned {} prompt token IDs for {} prompt tokens",
+                    prompt.token_ids.len(),
+                    prompt.num_prompt_tokens
+                )));
+            }
+            self.multimodal_prompt_token_ids = Some(prompt.token_ids.clone());
         }
         if !self.expect_prompt_logprobs {
             return Ok(());
