@@ -23,6 +23,7 @@ pub(crate) struct DiscoveredModel {
     pub served_name: String,
     pub reasoning_parser: Option<String>,
     pub tool_call_parser: Option<String>,
+    pub supports_multimodal: bool,
     identity: ModelIdentity,
     server: pb::ServerInfo,
 }
@@ -59,6 +60,7 @@ impl DiscoveredModel {
             served_name,
             reasoning_parser,
             tool_call_parser,
+            supports_multimodal: model.supports_multimodal,
             identity,
             server,
         })
@@ -75,6 +77,7 @@ impl DiscoveredModel {
     }
 
     pub(crate) fn engine_config(&self) -> EngineConfig {
+        let parallelism = self.server.parallelism.as_ref();
         EngineConfig {
             model: self.source.clone(),
             served_model_name: Some(self.served_name.clone()),
@@ -85,6 +88,10 @@ impl DiscoveredModel {
                 total_kv_blocks: nonzero(self.server.total_kv_blocks),
                 max_num_seqs: nonzero(self.server.max_running_requests),
                 max_num_batched_tokens: nonzero(self.server.max_batched_tokens),
+                data_parallel_size: parallelism
+                    .and_then(|parallelism| nonzero(parallelism.data_parallel_size)),
+                data_parallel_start_rank: parallelism
+                    .map(|parallelism| parallelism.data_parallel_rank),
                 ..Default::default()
             }),
         }

@@ -25,9 +25,11 @@ It is a standalone Rust executable.
 - Token and text requests through Dynamo preprocessing
 - Sampling, stop conditions, structured output, logprobs, cache options, and priority
 - Opaque `kv_transfer_params` handoff
+- Data-parallel rank routing and KV-event source discovery
+- Image URL and data-URI inputs, including media UUIDs
 
-The initial protocol does not support multimodal input, LoRA, KV-aware data
-parallel routing, encode workers, beam search, or `n > 1`.
+The protocol does not support LoRA, encode workers, beam search, `n > 1`,
+preprocessed multimodal features, or audio/video media.
 
 ## Run
 
@@ -51,9 +53,9 @@ dynamo-vllm-sidecar \
 Use `VLLM_GRPC_ENDPOINT` instead of `--vllm-endpoint` when the endpoint is
 provided through the environment.
 
-The sidecar discovers `model_id`, the served name, parser defaults, context length, KV capacity, and scheduler limits through `vllm.Control`. `model_id` must be readable locally or fetchable by Dynamo for tokenization and chat templates.
+The sidecar discovers `model_id`, the served name, parser defaults, context length, KV capacity, scheduler limits, data-parallel topology, and KV-event sources through `vllm.Control`. `model_id` must be readable locally or fetchable by Dynamo for tokenization and chat templates.
 
-Data-parallel registration is omitted because Control reports global topology, not the rank range hosted by the connected frontend.
+Control reports the global data-parallel size and the rank hosted by the connected frontend. Dynamo forwards the selected rank on each generation request and uses discovered KV-event sources for KV-aware routing.
 
 Aggregated serving is the default. Set the existing `--disaggregation-mode` to `prefill` or `decode` only for non-aggregated deployments; the current Control API does not report engine role.
 
@@ -66,6 +68,8 @@ interval, and a five-minute deadline for establishing the full connection
 pool. Override them with `--grpc-connect-attempt-timeout-secs`,
 `--grpc-retry-interval-secs`, and `--grpc-startup-deadline-secs`, or with the
 corresponding `DYN_SIDECAR_GRPC_*` environment variables.
+
+Each request owns its response stream but borrows a channel from the shared pool. Cancellation stops polling and drops only that request's stream. vLLM then aborts the corresponding engine request while the pooled HTTP/2 connection remains available to other requests; the sidecar does not call the Control `Abort` RPC.
 
 ## Test without vLLM or a GPU
 
@@ -94,11 +98,7 @@ disaggregated prefill/decode with NIXL KV transfer.
 There is no published vLLM sidecar image yet, so you build and push your own from
 `Dockerfile` — the same pattern as the TensorRT-LLM and SGLang sidecars.
 
-> [!NOTE]
-> vLLM's `vllm-rs` exposes no gRPC health method, so the engine's probes can only
-> confirm the gRPC port accepts connections (not that the model is loaded) —
-> weaker than the TensorRT-LLM and SGLang sidecars, which make a real HealthCheck
-> RPC. The engine image must be a stock vLLM build that ships `vllm-rs` (v0.26.0+).
+The sidecar waits for both the Control and Inference services through the standard gRPC health API before registering the worker. The deployment manifests retain lightweight socket probes for container lifecycle monitoring. The engine image must include a `vllm-rs` build compatible with the vendored protocol.
 
 ### Prerequisites
 

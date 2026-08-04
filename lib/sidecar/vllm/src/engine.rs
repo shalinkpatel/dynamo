@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use dynamo_backend_common::{
-    DisaggregationMode, DynamoError, GenerateContext, LLMEngine, LLMEngineOutput,
+    DisaggregationMode, DynamoError, GenerateContext, KvEventSource, LLMEngine, LLMEngineOutput,
     LLMEngineOutputExt, WorkerConfig, usage,
 };
 use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig};
@@ -128,7 +128,7 @@ impl VllmSidecarEngine {
                 .sidecar
                 .common
                 .exclude_tools_when_tool_choice_none,
-            enable_kv_routing: false,
+            enable_kv_routing: true,
             disaggregation_mode: mode,
             route_to_encoder: false,
             ..Default::default()
@@ -184,6 +184,17 @@ impl LLMEngine for VllmSidecarEngine {
         request: dynamo_backend_common::PreprocessedRequest,
         ctx: GenerateContext,
     ) -> Result<BoxStream<'static, Result<LLMEngineOutput, DynamoError>>, DynamoError> {
+        if request
+            .multi_modal_data
+            .as_ref()
+            .is_some_and(|media| media.values().any(|items| !items.is_empty()))
+            && !self.model.supports_multimodal
+        {
+            return Err(client::invalid_argument(format!(
+                "model `{}` does not advertise multimodal support",
+                self.model.served_name
+            )));
+        }
         let client = self
             .client
             .get()
@@ -254,6 +265,36 @@ impl LLMEngine for VllmSidecarEngine {
     async fn cleanup(&self) -> Result<(), DynamoError> {
         self.cancel.cancel();
         Ok(())
+    }
+
+    async fn kv_event_sources(&self) -> Result<Vec<KvEventSource>, DynamoError> {
+        let client = self
+            .client
+            .get()
+            .ok_or_else(|| client::engine_shutdown("vLLM sidecar is not started"))?;
+        client
+            .kv_event_sources()
+            .await?
+            .into_iter()
+            .filter(|source| source.transport == "zmq")
+            .map(|source| {
+                let dp_rank = source.data_parallel_rank.ok_or_else(|| {
+                    client::protocol_error(
+                        "GetKvEventSources returned a ZMQ source without data_parallel_rank",
+                    )
+                })?;
+                if source.endpoint.trim().is_empty() || source.topic.trim().is_empty() {
+                    return Err(client::protocol_error(
+                        "GetKvEventSources returned a ZMQ source without endpoint or topic",
+                    ));
+                }
+                Ok(KvEventSource::Zmq {
+                    endpoint: source.endpoint,
+                    topic: source.topic,
+                    dp_rank,
+                })
+            })
+            .collect()
     }
 }
 

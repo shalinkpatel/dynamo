@@ -287,6 +287,15 @@ impl pb::control_server::Control for VllmMockerService {
         }
         Ok(Response::new(pb::AbortResponse {}))
     }
+
+    async fn get_kv_event_sources(
+        &self,
+        _request: Request<pb::GetKvEventSourcesRequest>,
+    ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
+        Ok(Response::new(pb::GetKvEventSourcesResponse {
+            sources: Vec::new(),
+        }))
+    }
 }
 
 fn checked_token(signal: &OutputSignal) -> BoxedStatusResult<u32> {

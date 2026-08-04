@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dynamo_backend_common::{
-    DisaggregationMode, FinishReason, GenerateContext, LLMEngine, OutputOptions, PrefillResult,
-    PreprocessedRequest, SamplingOptions, StopConditions,
+    DisaggregationMode, FinishReason, GenerateContext, LLMEngine, MultimodalData, OutputOptions,
+    PrefillResult, PreprocessedRequest, SamplingOptions, StopConditions,
 };
 use dynamo_sidecar_common::{GrpcEndpoint, GrpcTransportConfig};
 use futures::{Stream, StreamExt};
@@ -191,6 +191,26 @@ impl pb::control_server::Control for FakeVllm {
         _request: Request<pb::AbortRequest>,
     ) -> Result<Response<pb::AbortResponse>, Status> {
         Ok(Response::new(pb::AbortResponse {}))
+    }
+
+    async fn get_kv_event_sources(
+        &self,
+        _request: Request<pb::GetKvEventSourcesRequest>,
+    ) -> Result<Response<pb::GetKvEventSourcesResponse>, Status> {
+        Ok(Response::new(pb::GetKvEventSourcesResponse {
+            sources: vec![pb::KvEventSource {
+                transport: "zmq".to_string(),
+                endpoint: "tcp://127.0.0.1:20081".to_string(),
+                topic: "kv-events".to_string(),
+                replay_endpoint: String::new(),
+                data_parallel_rank: Some(2),
+                encoding: "msgpack".to_string(),
+                schema_version: 1,
+                buffer_steps: 0,
+                hwm: 0,
+                max_queue_size: 0,
+            }],
+        }))
     }
 }
 
@@ -541,10 +561,20 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     assert_eq!(registration.total_kv_blocks, Some(4096));
     assert_eq!(registration.max_num_seqs, Some(128));
     assert_eq!(registration.max_num_batched_tokens, Some(2048));
-    assert_eq!(registration.data_parallel_size, None);
-    assert_eq!(registration.data_parallel_start_rank, None);
+    assert_eq!(registration.data_parallel_size, Some(4));
+    assert_eq!(registration.data_parallel_start_rank, Some(2));
 
-    let outputs = collect(&engine, request()).await;
+    let sources = engine.kv_event_sources().await.expect("KV event sources");
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].dp_rank(), 2);
+
+    let mut routed_request = serde_json::to_value(request()).expect("serialize request");
+    routed_request["routing"] = json!({"dp_rank": 2});
+    let outputs = collect(
+        &engine,
+        serde_json::from_value(routed_request).expect("deserialize routed request"),
+    )
+    .await;
     assert_eq!(outputs.len(), 1);
     let terminal = &outputs[0];
     assert_eq!(terminal.token_ids, [42]);
@@ -560,6 +590,7 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     let sent = requests.first().expect("recorded request");
     assert_eq!(sent.model, "served-model");
     assert_eq!(sent.priority, 0);
+    assert_eq!(sent.data_parallel_rank, Some(2));
     let sampling = sent.sampling.as_ref().unwrap();
     assert_eq!(
         (sampling.top_k, sampling.top_p, sampling.min_p),
@@ -591,6 +622,42 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
         struct_to_json(kv.kv_transfer_params.clone().unwrap()).unwrap(),
         json!({"connector_data": {"values": [1, true, null]}})
     );
+}
+
+#[tokio::test]
+async fn multimodal_image_is_forwarded_with_uuid() {
+    let service = FakeVllm::default();
+    let mut discovered = model_info();
+    discovered.supports_multimodal = true;
+    *service.model_info_override.lock().await = Some(discovered);
+    let server = FakeServer::start(service).await;
+    let (engine, _) = engine_from_args(&server.endpoint).await;
+    engine.start(0).await.expect("start");
+
+    let mut image_request = request();
+    image_request.multi_modal_data = Some(std::collections::HashMap::from([(
+        "image_url".to_string(),
+        vec![MultimodalData::RawUrl(
+            "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        )],
+    )]));
+    image_request.multi_modal_uuids = Some(std::collections::HashMap::from([(
+        "image_url".to_string(),
+        vec![Some("image-1".to_string())],
+    )]));
+
+    let outputs = collect(&engine, image_request).await;
+    assert_eq!(outputs[0].finish_reason, Some(FinishReason::Stop));
+
+    let requests = server.service.requests.lock().await;
+    let media = &requests.last().expect("recorded request").media;
+    assert_eq!(media.len(), 1);
+    assert_eq!(media[0].modality(), pb::Modality::Image);
+    assert_eq!(media[0].uuid, "image-1");
+    assert!(matches!(
+        media[0].source.as_ref(),
+        Some(pb::media_item::Source::DataUri(_))
+    ));
 }
 
 #[tokio::test]
@@ -741,29 +808,31 @@ async fn prefill_decode_handoff_is_opaque_and_repeatable() {
     }
 }
 
-#[test]
-fn component_honors_config_for_aggregated_but_fixes_disagg_roles() {
-    let component = |extra: &[&str]| {
+#[tokio::test]
+async fn component_honors_config_for_aggregated_but_fixes_disagg_roles() {
+    let server = FakeServer::start(FakeVllm::default()).await;
+    for (extra, expected) in [
+        (Vec::<&str>::new(), "custom"),
+        (vec!["--disaggregation-mode", "prefill"], "prefill"),
+        (vec!["--disaggregation-mode", "decode"], "backend"),
+    ] {
         let mut argv = vec![
-            "dynamo-vllm-sidecar",
-            "--vllm-endpoint",
-            "127.0.0.1:50051",
-            "--model-path",
-            "test-model",
-            "--component",
-            "custom",
+            "dynamo-vllm-sidecar".to_string(),
+            "--vllm-endpoint".to_string(),
+            server.endpoint.clone(),
+            "--component".to_string(),
+            "custom".to_string(),
         ];
-        argv.extend_from_slice(extra);
-        VllmSidecarEngine::from_args(Some(argv.iter().map(|s| s.to_string()).collect()))
-            .expect("from_args")
-            .1
-            .component
-    };
-    // Aggregated keeps the operator-configured component.
-    assert_eq!(component(&[]), "custom");
-    // Disaggregated roles override to fixed names so the frontend can route.
-    assert_eq!(component(&["--disaggregation-mode", "prefill"]), "prefill");
-    assert_eq!(component(&["--disaggregation-mode", "decode"]), "backend");
+        argv.extend(extra.into_iter().map(str::to_string));
+        let component =
+            tokio::task::spawn_blocking(move || VllmSidecarEngine::from_args(Some(argv)))
+                .await
+                .expect("bootstrap task")
+                .expect("from_args")
+                .1
+                .component;
+        assert_eq!(component, expected);
+    }
 }
 
 #[tokio::test]
@@ -883,11 +952,9 @@ async fn unsupported_features_fail_before_rpc_submission() {
     multimodal.mm_processor_kwargs = Some(json!({"use_audio_in_video": true}));
     requests.push(multimodal);
 
-    for routing in [json!({"lora_name": "adapter"}), json!({"dp_rank": 1})] {
-        let mut value = serde_json::to_value(request()).expect("serialize request");
-        value["routing"] = routing;
-        requests.push(serde_json::from_value(value).expect("deserialize request"));
-    }
+    let mut lora_request = serde_json::to_value(request()).expect("serialize request");
+    lora_request["routing"] = json!({"lora_name": "adapter"});
+    requests.push(serde_json::from_value(lora_request).expect("deserialize request"));
 
     for unsupported in requests {
         let context = dynamo_backend_common::testing::mock_context();

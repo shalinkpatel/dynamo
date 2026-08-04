@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use dynamo_backend_common::{
-    DisaggregationMode, DynamoError, GuidedDecodingOptions, LLMEngineOutput, PrefillResult,
-    PreprocessedRequest, StopReason, TopLogprob, usage,
+    DisaggregationMode, DynamoError, GuidedDecodingOptions, LLMEngineOutput, MultimodalData,
+    PrefillResult, PreprocessedRequest, StopReason, TopLogprob, usage,
 };
 
 use crate::client;
@@ -18,6 +18,15 @@ pub(crate) fn build_generate_request(
     mode: DisaggregationMode,
 ) -> Result<pb::GenerateRequest, DynamoError> {
     validate_request(&request, mode)?;
+
+    let media = build_media(&request)?;
+    let data_parallel_rank = request.routing.as_ref().and_then(|routing| {
+        if mode.is_prefill() {
+            routing.prefill_dp_rank.or(routing.dp_rank)
+        } else {
+            routing.dp_rank
+        }
+    });
 
     let prompt_logprobs = request.output_options.prompt_logprobs;
     let output_logprobs = request.output_options.logprobs;
@@ -90,7 +99,90 @@ pub(crate) fn build_generate_request(
         kv: Some(kv),
         truncate_prompt_tokens: 0,
         priority,
+        session_id: None,
+        media,
+        data_parallel_rank,
     })
+}
+
+fn media_source(source: &str) -> Result<pb::media_item::Source, DynamoError> {
+    if source.starts_with("data:") {
+        Ok(pb::media_item::Source::DataUri(source.to_string()))
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        Ok(pb::media_item::Source::Url(source.to_string()))
+    } else {
+        Err(client::invalid_argument(
+            "vLLM gRPC image input must use an http://, https://, or data: URI",
+        ))
+    }
+}
+
+fn build_media(request: &PreprocessedRequest) -> Result<Vec<pb::MediaItem>, DynamoError> {
+    let Some(media_by_modality) = request.multi_modal_data.as_ref() else {
+        if request
+            .multi_modal_uuids
+            .as_ref()
+            .is_some_and(|uuids| !uuids.is_empty())
+        {
+            return Err(client::invalid_argument(
+                "multi_modal_uuids were provided without multi_modal_data",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+
+    let mut media = Vec::new();
+    for (key, items) in media_by_modality {
+        if items.is_empty() {
+            continue;
+        }
+        if key != "image_url" {
+            return Err(client::invalid_argument(format!(
+                "vLLM gRPC currently supports image_url media only; got `{key}`"
+            )));
+        }
+        let uuids = request
+            .multi_modal_uuids
+            .as_ref()
+            .and_then(|by_modality| by_modality.get(key));
+        if let Some(uuids) = uuids
+            && uuids.len() != items.len()
+        {
+            return Err(client::invalid_argument(format!(
+                "multi_modal_uuids.{key} has {} entries for {} media items",
+                uuids.len(),
+                items.len()
+            )));
+        }
+
+        for (index, item) in items.iter().enumerate() {
+            let source = match item {
+                MultimodalData::Url(url) => media_source(url.as_str())?,
+                MultimodalData::RawUrl(source) => media_source(source)?,
+                MultimodalData::Decoded(_) => {
+                    return Err(client::invalid_argument(
+                        "vLLM sidecar cannot dereference pre-decoded RDMA media; configure URL passthrough",
+                    ));
+                }
+                MultimodalData::UuidOnly(_) => {
+                    return Err(client::invalid_argument(
+                        "vLLM gRPC requires a media source and cannot resolve UUID-only media",
+                    ));
+                }
+            };
+            let uuid = uuids
+                .and_then(|uuids| uuids.get(index))
+                .and_then(Clone::clone)
+                .unwrap_or_default();
+            media.push(pb::MediaItem {
+                modality: pb::Modality::Image as i32,
+                source: Some(source),
+                mime_type: String::new(),
+                uuid,
+            });
+        }
+    }
+    Ok(media)
 }
 
 fn top_n_candidates(count: u32) -> Result<pb::CandidateTokens, DynamoError> {
@@ -298,13 +390,9 @@ fn validate_request(
             "prompt embeddings are not supported by vLLM gRPC v0.25.1",
         ));
     }
-    if request.multi_modal_data.is_some()
-        || request.mm_routing_info.is_some()
-        || request.mm_processor_kwargs.is_some()
-        || request.encoder_result.is_some()
-    {
+    if request.mm_processor_kwargs.is_some() || request.encoder_result.is_some() {
         return Err(client::invalid_argument(
-            "multimodal requests are not supported by vLLM gRPC v0.25.1",
+            "preprocessed multimodal features are not supported by vLLM gRPC",
         ));
     }
     if mode.is_encode() {
@@ -320,15 +408,6 @@ fn validate_request(
     {
         return Err(client::invalid_argument(
             "LoRA request selection is not supported by vLLM gRPC v0.25.1",
-        ));
-    }
-    if request
-        .routing
-        .as_ref()
-        .is_some_and(|routing| routing.dp_rank.is_some() || routing.prefill_dp_rank.is_some())
-    {
-        return Err(client::invalid_argument(
-            "KV-aware data-parallel routing is not supported by vLLM gRPC v0.25.1",
         ));
     }
     if request.bootstrap_info.is_some() {
