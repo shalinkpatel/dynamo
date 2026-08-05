@@ -43,9 +43,8 @@ For more background on the snapshot architecture and startup improvements, see
 | **TensorRT-LLM** | Experimental | Work in progress | Work in progress |
 
 - TensorRT-LLM support is limited to the experimental single-GPU aggregated text-worker path.
-- Snapshot with GMS is not a supported production path and is disabled in normal deployments.
-  Experimental testing requires the internal GMS Snapshot feature gate and CUDA Driver r610 or
-  later.
+- IntraPod Snapshot with GMS is experimental and requires CUDA Driver r610 or later. Enable the
+  operator's general Checkpoint capability; there is no separate GMS Snapshot gate.
 - Multi-GPU support has limited validation and currently uses legacy IPC only for peer-to-peer
   communication.
 
@@ -243,8 +242,6 @@ spec:
             image: registry.example.com/dynamo/vllm-placeholder:1.0.0
             ...
 ```
-
-GMS + Snapshot support is currently disabled.
 
 For a full working example, see [deploy/operator/config/samples/nvidia.com_v1alpha1_dynamocheckpoint.yaml](https://github.com/ai-dynamo/dynamo/blob/main/deploy/operator/config/samples/nvidia.com_v1alpha1_dynamocheckpoint.yaml).
 
@@ -444,7 +441,10 @@ kubectl patch dgd vllm-auto-demo -n ${NAMESPACE} --type=merge \
 
 ## Failover Restore
 
-Failover restore is not yet available. The current Snapshot flow does not support GMS + Snapshot, so do not use failover restore as a supported checkpoint/restore path. For current GMS and active/passive failover guidance, see [Shadow Engine Failover](shadow-engine-failover.md).
+Failover restore is not yet available. Configurations that enable both Snapshot and active/passive
+failover are temporarily rejected. InterPod Snapshot with failover is follow-on work. For current
+GMS and active/passive failover guidance, see
+[Shadow Engine Failover](shadow-engine-failover.md).
 
 ## Lower-Level Testing With `snapshotctl`
 
@@ -580,7 +580,9 @@ status:
 - **Backend and topology support is limited**: single-GPU support is the most mature path; see [Backend and Topology Support](#backend-and-topology-support) for the current scope.
 - **Worker coverage is narrow**: specialized workers such as multimodal, embedding, and diffusion are not supported.
 - **Multi-GPU remains preview**: vLLM tensor-parallel configurations have limited validation and are not yet a broadly supported path across clusters.
-- **GMS restore remains experimental**: GMS + Snapshot is currently disabled.
+- **GMS restore remains experimental**: IntraPod Snapshot with GMS uses the general Checkpoint
+  capability and has no separate GMS gate. InterPod Snapshot with GMS is unsupported, and Snapshot
+  with active/passive failover is temporarily rejected.
 - **Admission is create-only**: with DGD `startupPolicy: Immediate`, only Pods created after a checkpoint is `Ready` are restore-shaped. Existing Pods cold-started before checkpoint readiness keep running as-is.
 - **Restore admission must be installed**: DGD restores rely on the snapshot Pod mutating webhook, so upgrade the snapshot chart/webhook configuration along with the operator and CRDs when enabling these features.
 - **Network state is sensitive**: restore is sensitive to live TCP socket state. Loopback bootstrap/control sockets are the most reliable path today.

@@ -83,8 +83,8 @@ The following diagram illustrates same-node process-level recovery:
   as a complete failover workflow.
 - Do not use it for hardware failure, GPU loss, node loss, cross-node recovery,
   in-flight request recovery, or KV-cache recovery.
-- Do not combine it with Snapshot restore. Snapshot plus GMS is not yet
-  available.
+- Do not combine active/passive failover with Snapshot restore. The operator
+  temporarily rejects this configuration.
 
 ## GPU Memory Service
 
@@ -139,9 +139,12 @@ For the cross-feature backend overview, see [Compatibility](../../../../referenc
 - It is not a hardware fault tolerance mechanism for GPU, node, or rack loss.
 - It does not diagnose or fix the backend failure.
 - It does not preserve in-flight requests, network sockets, or KV cache state.
-- It does not make Snapshot restore supported for GPU memory workloads.
-- Snapshot plus GMS is temporarily blocked by admission because of known GPU
-  driver restore issues.
+- Ordinary IntraPod Snapshot with GMS uses the operator's general Checkpoint
+  capability and has no separate GMS Snapshot gate.
+- InterPod Snapshot with GMS is unsupported.
+- Snapshot with active/passive failover is temporarily rejected. IntraPod
+  Snapshot with failover is not implemented, and InterPod Snapshot with
+  failover is follow-on work.
 - It is not covered by the normal v1beta1 compatibility guarantees while it
   lives under `experimental`.
 
