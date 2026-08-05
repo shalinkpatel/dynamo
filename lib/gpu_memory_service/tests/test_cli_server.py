@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import sys
+import textwrap
+from types import SimpleNamespace
 
 import pytest
 from _deps import HAS_GMS
@@ -39,6 +42,93 @@ def test_child_command_launches_default_multi_tag_runner():
         "--device-type",
         "cuda",
     ]
+
+
+def test_v1_cli_dispatches_cuda_only_child(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        runner.importlib,
+        "import_module",
+        lambda name: (
+            calls.append(("import", name))
+            or SimpleNamespace(main=lambda argv: calls.append(("main", argv)))
+        ),
+    )
+
+    runner.main(["--use-v1", "--device", "3"])
+
+    assert calls == [
+        ("import", "gpu_memory_service.v1.cli"),
+        ("main", ["--device", "3"]),
+    ]
+    assert server._child_command(3, "cuda", use_v1=True) == [
+        sys.executable,
+        "-m",
+        "gpu_memory_service",
+        "--use-v1",
+        "--device",
+        "3",
+    ]
+    with pytest.raises(SystemExit):
+        server.main(["--use-v1", "--device-type", "xpu"])
+    assert "--use-v1 only supports --device-type=cuda" in capsys.readouterr().err
+
+
+def test_default_cli_help_does_not_import_torch():
+    code = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        class BlockTorch(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                if fullname == "torch" or fullname.startswith("torch."):
+                    raise ModuleNotFoundError("torch is intentionally unavailable")
+                if fullname == "gpu_memory_service.v1" or fullname.startswith(
+                    "gpu_memory_service.v1."
+                ):
+                    raise ModuleNotFoundError("GMS V1 is intentionally unavailable")
+
+        sys.meta_path.insert(0, BlockTorch())
+        from gpu_memory_service.cli.runner import main
+        main(["--help"])
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "GPU Memory Service" in result.stdout
+
+
+def test_generic_v1_modules_do_not_import_torch():
+    code = textwrap.dedent(
+        """
+        import importlib.abc
+        import sys
+
+        class BlockTorch(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                if fullname == "torch" or fullname.startswith("torch."):
+                    raise ModuleNotFoundError("torch is intentionally unavailable")
+
+        sys.meta_path.insert(0, BlockTorch())
+        import gpu_memory_service.cli.runner
+        import gpu_memory_service.v1.cli
+        import gpu_memory_service.v1.memory_manager
+        """
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 class _Process:
