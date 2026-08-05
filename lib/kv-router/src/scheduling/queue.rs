@@ -63,6 +63,24 @@ struct SelectedWorkerForRequest {
     selected_worker_load: AdvisoryWorkerLoad,
 }
 
+fn target_cached_prefix_blocks(request: &SchedulingRequest, target: WorkerWithDpRank) -> u32 {
+    let device = request
+        .overlap
+        .tier_overlap_blocks
+        .device
+        .get(&target)
+        .copied()
+        .unwrap_or(0);
+    let lower_tier = request
+        .overlap
+        .tier_overlap_blocks
+        .host_pinned
+        .get(&target)
+        .copied()
+        .unwrap_or(0);
+    u32::try_from(device.saturating_add(lower_tier)).unwrap_or(u32::MAX)
+}
+
 #[allow(clippy::large_enum_variant)]
 enum AdmissionCommand {
     Enqueue {
@@ -637,11 +655,8 @@ impl<
                     }
                     let _ = ack_tx.send(lease);
                 }
-                AdmissionCommand::SelectWithoutAdmission {
-                    mut request,
-                    resp_tx,
-                } => {
-                    let result = self.select_without_admission_inner(&mut request, Instant::now());
+                AdmissionCommand::SelectWithoutAdmission { request, resp_tx } => {
+                    let result = self.select_without_admission_inner(request, Instant::now());
                     let _ = resp_tx.send(result);
                 }
                 AdmissionCommand::Update { worker, ack_tx } => {
@@ -967,10 +982,12 @@ impl<
 
     fn select_without_admission_inner(
         &self,
-        request: &mut SchedulingRequest,
+        mut request: SchedulingRequest,
         decay_now: Instant,
     ) -> Result<AdvisorySchedulingResponse, KvSchedulerError> {
-        let selected = self.select_worker_for_request(request, decay_now)?;
+        let selected = self.select_worker_for_request(&mut request, decay_now)?;
+        let target_cached_prefix_blocks =
+            target_cached_prefix_blocks(&request, selected.selection.worker);
 
         Ok(AdvisorySchedulingResponse {
             selected_worker_load: selected.selected_worker_load,
@@ -979,8 +996,8 @@ impl<
                 effective_overlap_blocks: selected.selection.effective_overlap_blocks,
                 cached_tokens: selected.selection.cached_tokens,
                 selected_worker_tiers: selected.selected_worker_tiers,
-                overlap: request.overlap.clone(),
-                router_hint_candidates: request.router_hint_candidates.clone(),
+                target_cached_prefix_blocks,
+                router_hint_candidates: request.router_hint_candidates.take(),
                 potential_decode_blocks: selected.selection.potential_decode_blocks,
             },
         })
@@ -998,13 +1015,15 @@ impl<
             }
         };
 
+        let target_cached_prefix_blocks =
+            target_cached_prefix_blocks(&request, selected.selection.worker);
         let response = SchedulingResponse {
             best_worker: selected.selection.worker,
             effective_overlap_blocks: selected.selection.effective_overlap_blocks,
             cached_tokens: selected.selection.cached_tokens,
             selected_worker_tiers: selected.selected_worker_tiers,
-            overlap: request.overlap.clone(),
-            router_hint_candidates: request.router_hint_candidates.clone(),
+            target_cached_prefix_blocks,
+            router_hint_candidates: request.router_hint_candidates.take(),
             potential_decode_blocks: selected.selection.potential_decode_blocks,
         };
 
