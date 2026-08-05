@@ -360,6 +360,19 @@ async fn anthropic_messages(
         ),
     );
 
+    // Same aggregator backstop the chat handler sets, for the same reason: a
+    // Nemotron force_nonempty_content turn that produced only reasoning must
+    // surface it as content. The streaming stage usually resolves this before
+    // aggregation, but wiring it here too keeps the two aggregation entry points
+    // from drifting if that deferral is ever narrowed.
+    let move_reasoning_to_content_when_empty =
+        crate::preprocessor::OpenAIPreprocessor::wants_reasoning_as_content_when_empty(
+            parsing_options.reasoning_parser.as_deref(),
+            request.chat_template_args.as_ref(),
+        );
+    let parsing_options = parsing_options
+        .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
+
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
     // Create inflight_guard early to ensure all errors are counted
