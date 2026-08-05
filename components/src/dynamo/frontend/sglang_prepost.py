@@ -1008,7 +1008,9 @@ class SglangStreamingPostProcessor:
             self.history_tool_calls_count,
         )
 
-    def _incremental_decode(self, new_token_ids: list[int]) -> str:
+    def _incremental_decode(
+        self, new_token_ids: list[int], *, flush: bool = False
+    ) -> str:
         """Decode new tokens with lookback window for multi-byte char boundaries.
 
         Re-decodes a small window of previous tokens alongside new tokens so that
@@ -1044,7 +1046,16 @@ class SglangStreamingPostProcessor:
             window_tokens, skip_special_tokens=self._skip_special_tokens
         )
 
-        return window_text[len(prefix_text) :]
+        # A byte-level tokenizer may decode an incomplete trailing UTF-8
+        # sequence as U+FFFD.  Do not count that placeholder as emitted: when
+        # the next token completes the character, U+FFFD and the completed
+        # character have the same Python string length and the old
+        # prefix-length slice would skip the real character permanently.
+        stable_prefix_text = prefix_text.rstrip("\ufffd")
+        delta_text = window_text[len(stable_prefix_text) :]
+        if not flush:
+            delta_text = delta_text.rstrip("\ufffd")
+        return delta_text
 
     def _parse_reasoning_delta(
         self, delta_text: str, finish_reason: str | None
@@ -1111,7 +1122,11 @@ class SglangStreamingPostProcessor:
         if finish_reason:
             token_ids = self._strip_trailing_eos_token_ids(list(token_ids))
 
-        delta_text = self._incremental_decode(token_ids) if token_ids else ""
+        delta_text = (
+            self._incremental_decode(token_ids, flush=bool(finish_reason))
+            if token_ids or finish_reason
+            else ""
+        )
 
         if self._fast_plain_text:
             if delta_text:

@@ -2821,6 +2821,13 @@ class TestPreprocessChatRequest:  # FRONTEND.1 — chat-template input preproces
 class TestIncrementalDetokenization:  # FRONTEND.6 — token-id stream → text
     """Test the sliding-window incremental detokenizer."""
 
+    class ByteTokenizer:
+        """Decode each token as one byte to exercise split UTF-8 sequences."""
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            del skip_special_tokens
+            return bytes(token_ids).decode("utf-8", errors="replace")
+
     def test_basic_decode(self, tokenizer):
         """Tokens decode to expected text."""
         post = SglangStreamingPostProcessor(
@@ -2850,6 +2857,46 @@ class TestIncrementalDetokenization:  # FRONTEND.6 — token-id stream → text
             if choice and "content" in choice.get("delta", {}):
                 content += choice["delta"]["content"]
         assert text in content
+
+    def test_split_multibyte_character_is_not_replaced(self):
+        """A UTF-8 character split across chunks is emitted once completed."""
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+        )
+
+        content = ""
+        encoded = "한".encode("utf-8")
+        for index, token_id in enumerate(encoded):
+            choice = post.process_output(
+                {
+                    "token_ids": [token_id],
+                    "finish_reason": "stop" if index == len(encoded) - 1 else None,
+                }
+            )
+            if choice and "content" in choice["delta"]:
+                content += choice["delta"]["content"]
+
+        assert content == "한"
+        assert "\ufffd" not in content
+
+    def test_trailing_replacement_character_is_flushed_on_finish(self):
+        """A legitimate trailing U+FFFD is delayed, not dropped."""
+        post = SglangStreamingPostProcessor(
+            tokenizer=self.ByteTokenizer(),
+            tool_call_parser=None,
+            reasoning_parser=None,
+        )
+
+        pending = post.process_output(
+            {"token_ids": list("\ufffd".encode("utf-8")), "finish_reason": None}
+        )
+        finished = post.process_output({"token_ids": [], "finish_reason": "stop"})
+
+        assert pending is None
+        assert finished is not None
+        assert finished["delta"]["content"] == "\ufffd"
 
     def test_empty_token_ids(self, tokenizer):
         """Empty token_ids with no finish_reason returns None."""
