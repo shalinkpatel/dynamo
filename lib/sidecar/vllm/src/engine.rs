@@ -87,6 +87,13 @@ impl VllmSidecarEngine {
                 "route-to-encoder is not supported by the vLLM sidecar",
             ));
         }
+        if args.sidecar.common.dyn_tool_call_parser.is_some()
+            || args.sidecar.common.dyn_reasoning_parser.is_some()
+        {
+            return Err(client::invalid_argument(
+                "vLLM gRPC does not preserve the request options required by Dynamo tool-call and reasoning parsers",
+            ));
+        }
 
         let endpoint = GrpcEndpoint::parse(&args.vllm_endpoint, "--vllm-endpoint")?;
         let transport = args.sidecar.grpc.config();
@@ -98,16 +105,6 @@ impl VllmSidecarEngine {
         let model = bootstrap_discover(&endpoint, transport, startup_deadline)?;
         let mode = args.sidecar.common.disaggregation_mode;
         let engine = Self::new(endpoint, model.clone(), mode, transport, startup_deadline);
-        let tool_call_parser = args
-            .sidecar
-            .common
-            .dyn_tool_call_parser
-            .or_else(|| model.tool_call_parser.clone());
-        let reasoning_parser = args
-            .sidecar
-            .common
-            .dyn_reasoning_parser
-            .or_else(|| model.reasoning_parser.clone());
         let config = WorkerConfig {
             namespace: args.sidecar.common.namespace,
             // Prefill/decode must register under fixed role components so the
@@ -122,8 +119,12 @@ impl VllmSidecarEngine {
             custom_jinja_template: args.sidecar.common.custom_jinja_template,
             model_name: model.source.clone(),
             served_model_name: Some(model.served_name.clone()),
-            tool_call_parser,
-            reasoning_parser,
+            // Control exposes vLLM's configured parsers, but the current
+            // inference protocol cannot preserve visible stop-token IDs,
+            // skip_special_tokens=false, or reasoning metadata. Do not make
+            // the Dynamo frontend emit request semantics the server discards.
+            tool_call_parser: None,
+            reasoning_parser: None,
             exclude_tools_when_tool_choice_none: args
                 .sidecar
                 .common
@@ -203,18 +204,27 @@ impl LLMEngine for VllmSidecarEngine {
         let mut state = ResponseState::new(&request, self.mode);
         let mut proto_request = build_generate_request(request, request_id, self.mode)?;
         proto_request.model.clone_from(&self.model.served_name);
+        let defer_request_cancellation = self.mode.is_decode();
         let stopped_ctx = ctx.inner_arc();
         let shutdown = self.cancel.clone();
-        let mut cancellation = Box::pin(async move {
+        let mut request_cancellation = Box::pin(async move { stopped_ctx.stopped().await });
+        let mut shutdown_cancellation = Box::pin(async move { shutdown.cancelled().await });
+        let stream = if defer_request_cancellation {
+            // A cancelled disaggregated decode must still reach vLLM so its
+            // NIXL receiver consumes and releases the KV transfer. Request
+            // cancellation is observed after response headers below.
             tokio::select! {
-                _ = stopped_ctx.stopped() => {}
-                _ = shutdown.cancelled() => {}
+                biased;
+                _ = shutdown_cancellation.as_mut() => None,
+                result = client.generate_stream(proto_request) => Some(result?),
             }
-        });
-        let stream = tokio::select! {
-            biased;
-            _ = cancellation.as_mut() => None,
-            result = client.generate_stream(proto_request) => Some(result?),
+        } else {
+            tokio::select! {
+                biased;
+                _ = shutdown_cancellation.as_mut() => None,
+                _ = request_cancellation.as_mut() => None,
+                result = client.generate_stream(proto_request) => Some(result?),
+            }
         };
         let Some(mut stream) = stream else {
             let output = cancelled(&state);
@@ -222,40 +232,78 @@ impl LLMEngine for VllmSidecarEngine {
         };
 
         Ok(Box::pin(async_stream::stream! {
+            let mut request_cancelled = false;
+            let mut first_token_observed = false;
             loop {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.as_mut() => {
-                        yield Ok(cancelled(&state));
-                        break;
+                let message = if request_cancelled {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_cancellation.as_mut() => None,
+                        message = stream.message() => Some(message),
                     }
-                    message = stream.message() => {
-                        match message {
-                            Ok(Some(response)) => match state.convert(response) {
-                                Ok(Some(output)) => {
-                                    let terminal = output.finish_reason.is_some();
-                                    yield Ok(output);
-                                    if terminal {
-                                        break;
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_cancellation.as_mut() => None,
+                        _ = request_cancellation.as_mut() => {
+                            if defer_request_cancellation && !first_token_observed {
+                                request_cancelled = true;
+                                continue;
+                            }
+                            None
+                        }
+                        message = stream.message() => Some(message),
+                    }
+                };
+
+                let Some(message) = message else {
+                    yield Ok(cancelled(&state));
+                    break;
+                };
+                match message {
+                    Ok(Some(response)) => {
+                        let response_has_token = response
+                            .outputs
+                            .as_ref()
+                            .is_some_and(|output| output.num_tokens > 0);
+                        let transfer_completed = response.outputs.as_ref().is_some_and(|output| {
+                            output.num_tokens > 0 || output.finish_info.is_some()
+                        });
+                        match state.convert(response) {
+                            Ok(Some(output)) => {
+                                first_token_observed |= response_has_token;
+                                if request_cancelled && transfer_completed {
+                                    // Dropping this request's stream now triggers
+                                    // vLLM's automatic abort without affecting
+                                    // the pooled HTTP/2 connection.
+                                    if first_token_observed {
+                                        ctx.notify_first_token();
                                     }
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    yield Err(error);
+                                    yield Ok(cancelled(&state));
                                     break;
                                 }
-                            },
-                            Ok(None) => {
-                                yield Err(client::protocol_error(
-                                    "GenerateStream ended before a terminal response",
-                                ));
-                                break;
+                                let terminal = output.finish_reason.is_some();
+                                yield Ok(output);
+                                if terminal {
+                                    break;
+                                }
                             }
-                            Err(status) => {
-                                yield Err(client::status_to_dynamo("GenerateStream", status));
+                            Ok(None) => {}
+                            Err(error) => {
+                                yield Err(error);
                                 break;
                             }
                         }
+                    }
+                    Ok(None) => {
+                        yield Err(client::protocol_error(
+                            "GenerateStream ended before a terminal response",
+                        ));
+                        break;
+                    }
+                    Err(status) => {
+                        yield Err(client::status_to_dynamo("GenerateStream", status));
+                        break;
                     }
                 }
             }
@@ -283,9 +331,9 @@ impl LLMEngine for VllmSidecarEngine {
                         "GetKvEventSources returned a ZMQ source without data_parallel_rank",
                     )
                 })?;
-                if source.endpoint.trim().is_empty() || source.topic.trim().is_empty() {
+                if source.endpoint.trim().is_empty() {
                     return Err(client::protocol_error(
-                        "GetKvEventSources returned a ZMQ source without endpoint or topic",
+                        "GetKvEventSources returned a ZMQ source without an endpoint",
                     ));
                 }
                 Ok(KvEventSource::Zmq {

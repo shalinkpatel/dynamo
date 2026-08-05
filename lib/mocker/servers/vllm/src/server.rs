@@ -131,6 +131,7 @@ impl VllmMockerService {
                     anyhow::anyhow!("max_num_batched_tokens exceeds the Control API range")
                 })?
                 .unwrap_or_default(),
+            supports_explicit_data_parallel_rank: true,
         };
         Ok(Self {
             config: Arc::new(config),

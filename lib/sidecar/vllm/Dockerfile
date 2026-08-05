@@ -5,8 +5,8 @@
 #
 # The sidecar is a pure gRPC connector + tokenizer; it needs no GPU and no vLLM
 # runtime, so it ships in a slim Debian image separate from the heavy vLLM engine
-# container. The two run side by side in one pod and talk over loopback (see
-# deploy/agg.yaml).
+# container. The two can run side by side and talk over loopback once compatible
+# Kubernetes images and manifests are published.
 #
 # Build from the repository root (the workspace is needed to compile the crate):
 #   docker build -f lib/sidecar/vllm/Dockerfile -t dynamo-vllm-sidecar:1.3.0 .

@@ -40,6 +40,9 @@ struct FakeVllm {
     hang_before_headers: Arc<AtomicBool>,
     headers_pending: Arc<AtomicBool>,
     release_headers: Arc<Notify>,
+    hold_before_first_token: Arc<AtomicBool>,
+    first_token_pending: Arc<AtomicBool>,
+    release_first_token: Arc<Notify>,
     server_stream_dropped: Arc<AtomicBool>,
 }
 
@@ -131,6 +134,9 @@ impl pb::inference_server::Inference for FakeVllm {
             "nested": {"flags": [true, null, "opaque"]},
         });
         let hang = self.hang.load(Ordering::SeqCst);
+        let hold_before_first_token = self.hold_before_first_token.load(Ordering::SeqCst);
+        let first_token_pending = self.first_token_pending.clone();
+        let release_first_token = self.release_first_token.clone();
         let dropped = self.server_stream_dropped.clone();
 
         let stream = async_stream::try_stream! {
@@ -162,6 +168,12 @@ impl pb::inference_server::Inference for FakeVllm {
                 prompt_info: Some(prompt_info),
                 outputs: None,
             };
+
+            if hold_before_first_token {
+                first_token_pending.store(true, Ordering::SeqCst);
+                release_first_token.notified().await;
+                first_token_pending.store(false, Ordering::SeqCst);
+            }
 
             if hang {
                 loop {
@@ -216,7 +228,8 @@ impl pb::control_server::Control for FakeVllm {
             sources: vec![pb::KvEventSource {
                 transport: "zmq".to_string(),
                 endpoint: "tcp://127.0.0.1:20081".to_string(),
-                topic: "kv-events".to_string(),
+                // Empty is vLLM's default and means subscribe to all topics.
+                topic: String::new(),
                 replay_endpoint: String::new(),
                 data_parallel_rank: Some(2),
                 encoding: "msgpack".to_string(),
@@ -259,7 +272,23 @@ fn server_info() -> pb::ServerInfo {
         total_kv_blocks: 4096,
         max_running_requests: 128,
         max_batched_tokens: 2048,
+        supports_explicit_data_parallel_rank: true,
     }
+}
+
+#[test]
+fn dp_routing_requires_an_explicit_rank_capability() {
+    let mut unsupported = server_info();
+    unsupported.supports_explicit_data_parallel_rank = false;
+    let error = DiscoveredModel::from_proto(model_info(), unsupported)
+        .expect_err("DP routing accepted a server that silently discards the rank");
+    assert!(error.to_string().contains("explicit data-parallel rank"));
+
+    let mut single_rank = server_info();
+    single_rank.supports_explicit_data_parallel_rank = false;
+    single_rank.parallelism.as_mut().unwrap().data_parallel_size = 1;
+    DiscoveredModel::from_proto(model_info(), single_rank)
+        .expect("single-rank serving does not require explicit rank routing");
 }
 
 fn sequence_response(
@@ -578,8 +607,8 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     let (engine, worker) = engine_from_args(&server.endpoint).await;
     assert_eq!(worker.model_name, "model-source");
     assert_eq!(worker.served_model_name.as_deref(), Some("served-model"));
-    assert_eq!(worker.reasoning_parser.as_deref(), Some("deepseek_r1"));
-    assert_eq!(worker.tool_call_parser.as_deref(), Some("hermes"));
+    assert!(worker.reasoning_parser.is_none());
+    assert!(worker.tool_call_parser.is_none());
     let config = engine.start(0).await.expect("start");
     assert_eq!(config.model, "model-source");
     assert_eq!(config.served_model_name.as_deref(), Some("served-model"));
@@ -595,6 +624,10 @@ async fn aggregated_generation_converts_request_stream_and_usage() {
     let sources = engine.kv_event_sources().await.expect("KV event sources");
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].dp_rank(), 2);
+    assert!(matches!(
+        &sources[0],
+        dynamo_backend_common::KvEventSource::Zmq { topic, .. } if topic.is_empty()
+    ));
 
     let mut routed_request = serde_json::to_value(request()).expect("serialize request");
     routed_request["routing"] = json!({"dp_rank": 2, "cache_salt": "cache-salt"});
@@ -669,10 +702,6 @@ async fn multimodal_image_is_forwarded_with_uuid() {
             "data:image/png;base64,iVBORw0KGgo=".to_string(),
         )],
     )]));
-    image_request.multi_modal_uuids = Some(std::collections::HashMap::from([(
-        "image_url".to_string(),
-        vec![Some("image-1".to_string())],
-    )]));
     image_request.output_options.prompt_logprobs = None;
     image_request
         .extra_args
@@ -685,6 +714,7 @@ async fn multimodal_image_is_forwarded_with_uuid() {
                 json!([{"role": "user", "content": [{"type": "image_url"}]}]),
             ),
             ("formatted_prompt".to_string(), json!("<image>\nDescribe.")),
+            ("mm_hashes".to_string(), json!(["0123456789abcdef"])),
         ]);
 
     let outputs = collect(&engine, image_request.clone()).await;
@@ -702,7 +732,10 @@ async fn multimodal_image_is_forwarded_with_uuid() {
     let media = &requests.last().expect("recorded request").media;
     assert_eq!(media.len(), 1);
     assert_eq!(media[0].modality(), pb::Modality::Image);
-    assert_eq!(media[0].uuid, "image-1");
+    assert_eq!(
+        media[0].uuid,
+        "0123456789abcdef000000000000000000000000000000000000000000000000"
+    );
     assert!(matches!(
         media[0].source.as_ref(),
         Some(pb::media_item::Source::DataUri(_))
@@ -1049,6 +1082,90 @@ async fn cancellation_interrupts_pending_response_headers() {
     let terminal = stream.next().await.unwrap().unwrap();
     assert_eq!(terminal.finish_reason, Some(FinishReason::Cancelled));
     server.service.release_headers.notify_waiters();
+}
+
+#[tokio::test]
+async fn decode_cancellation_waits_for_submission_and_first_token() {
+    let service = FakeVllm::default();
+    service.hang_before_headers.store(true, Ordering::SeqCst);
+    service
+        .hold_before_first_token
+        .store(true, Ordering::SeqCst);
+    let server = FakeServer::start(service).await;
+    let engine = engine(&server.endpoint, DisaggregationMode::Decode, 1);
+    engine.start(0).await.expect("start");
+
+    let mut decode_request = request();
+    decode_request.prefill_result = Some(PrefillResult {
+        disaggregated_params: json!({
+            "do_remote_decode": false,
+            "do_remote_prefill": true,
+            "remote_engine_id": "prefill-0",
+            "remote_host": "127.0.0.1",
+            "remote_port": 20097,
+            "remote_block_ids": [7, 8],
+        }),
+        prompt_tokens_details: None,
+    });
+    let context = dynamo_backend_common::testing::mock_context();
+    let generate = engine.generate(decode_request, GenerateContext::new(context.clone(), None));
+    tokio::pin!(generate);
+
+    tokio::select! {
+        _ = &mut generate => panic!("decode returned before response headers were gated"),
+        _ = async {
+            while !server.service.headers_pending.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    assert_eq!(server.service.requests.lock().await.len(), 1);
+    context.stop_generating();
+    tokio::select! {
+        _ = &mut generate => panic!("decode cancellation returned before response headers"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    server.service.release_headers.notify_one();
+    let mut stream = tokio::time::timeout(std::time::Duration::from_secs(2), &mut generate)
+        .await
+        .expect("decode response headers")
+        .expect("decode stream");
+    let next = stream.next();
+    tokio::pin!(next);
+    tokio::select! {
+        _ = &mut next => panic!("decode returned before the first token was gated"),
+        _ = async {
+            while !server.service.first_token_pending.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    assert!(
+        !server.service.server_stream_dropped.load(Ordering::SeqCst),
+        "decode stream dropped before the first token"
+    );
+    tokio::select! {
+        _ = &mut next => panic!("decode cancellation completed before the first token"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    server.service.release_first_token.notify_one();
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), &mut next)
+        .await
+        .expect("first token did not release decode cancellation")
+        .expect("cancelled terminal")
+        .expect("cancelled output");
+    assert_eq!(terminal.finish_reason, Some(FinishReason::Cancelled));
+    drop(stream);
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !server.service.server_stream_dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("server stream dropped after first token");
 }
 
 #[tokio::test]

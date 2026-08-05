@@ -12,6 +12,7 @@ use crate::proto as pb;
 
 const VLLM_LOGPROB_FLOOR: f64 = -9999.0;
 const MULTIMODAL_PROMPT_TOKEN_IDS_KEY: &str = "_dynamo_sidecar_multimodal_prompt_token_ids";
+const MM_HASHES_KEY: &str = "mm_hashes";
 // Must match DYNAMO_CACHE_SALT_PREFIX in lib/kv-router/src/zmq_wire/extra_keys.rs.
 const DYNAMO_CACHE_SALT_PREFIX: &str = "dynamo-cache-salt:";
 
@@ -29,10 +30,15 @@ pub(crate) fn build_generate_request(
     // Multimodal preprocessing happens on the aggregate/prefill engine. The
     // decode engine receives only token IDs plus the KV handoff, so forwarding
     // media again would duplicate image processing.
+    let forwarded_mm_uuids = if has_media && !mode.is_decode() {
+        forwarded_mm_uuids(&request)?
+    } else {
+        None
+    };
     let media = if mode.is_decode() {
         Vec::new()
     } else {
-        build_media(&request)?
+        build_media(&request, forwarded_mm_uuids.as_deref())?
     };
     let mut prefill_result = request.prefill_result;
     let mut token_ids = request.token_ids;
@@ -78,6 +84,7 @@ pub(crate) fn build_generate_request(
         // fields directly; these values are not vLLM engine options.
         extra.remove("messages");
         extra.remove("formatted_prompt");
+        extra.remove(MM_HASHES_KEY);
     }
     let kv = build_kv_parameters(extra_args, prefill_result, cache_salt, mode)?;
 
@@ -172,7 +179,59 @@ fn media_source(source: &str) -> Result<pb::media_item::Source, DynamoError> {
     }
 }
 
-fn build_media(request: &PreprocessedRequest) -> Result<Vec<pb::MediaItem>, DynamoError> {
+fn forwarded_mm_uuids(request: &PreprocessedRequest) -> Result<Option<Vec<String>>, DynamoError> {
+    let has_user_uuid = request
+        .multi_modal_uuids
+        .as_ref()
+        .is_some_and(|by_modality| {
+            by_modality
+                .values()
+                .flatten()
+                .any(|uuid| uuid.as_ref().is_some_and(|uuid| !uuid.is_empty()))
+        });
+    if has_user_uuid {
+        return Ok(None);
+    }
+
+    let hashes = match request.extra_args.as_ref() {
+        Some(serde_json::Value::Object(extra)) => extra.get(MM_HASHES_KEY),
+        _ => None,
+    };
+    let Some(hashes) = hashes else {
+        return Ok(None);
+    };
+    let hashes = hashes.as_array().ok_or_else(|| {
+        client::invalid_argument("extra_args.mm_hashes must be an array of strings")
+    })?;
+    if hashes.is_empty() {
+        return Ok(None);
+    }
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(index, hash)| {
+            let hash = hash
+                .as_str()
+                .filter(|hash| !hash.is_empty())
+                .ok_or_else(|| {
+                    client::invalid_argument(format!(
+                        "extra_args.mm_hashes[{index}] must be a non-empty string"
+                    ))
+                })?;
+            let mut uuid = hash.to_string();
+            if uuid.len() < 64 {
+                uuid.extend(std::iter::repeat_n('0', 64 - uuid.len()));
+            }
+            Ok(uuid)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn build_media(
+    request: &PreprocessedRequest,
+    forwarded_uuids: Option<&[String]>,
+) -> Result<Vec<pb::MediaItem>, DynamoError> {
     let Some(media_by_modality) = request.multi_modal_data.as_ref() else {
         if request
             .multi_modal_uuids
@@ -209,6 +268,15 @@ fn build_media(request: &PreprocessedRequest) -> Result<Vec<pb::MediaItem>, Dyna
                 items.len()
             )));
         }
+        if let Some(uuids) = forwarded_uuids
+            && uuids.len() != items.len()
+        {
+            return Err(client::invalid_argument(format!(
+                "extra_args.mm_hashes has {} entries for {} media items",
+                uuids.len(),
+                items.len()
+            )));
+        }
 
         for (index, item) in items.iter().enumerate() {
             let source = match item {
@@ -228,6 +296,7 @@ fn build_media(request: &PreprocessedRequest) -> Result<Vec<pb::MediaItem>, Dyna
             let uuid = uuids
                 .and_then(|uuids| uuids.get(index))
                 .and_then(Clone::clone)
+                .or_else(|| forwarded_uuids.and_then(|uuids| uuids.get(index)).cloned())
                 .unwrap_or_default();
             media.push(pb::MediaItem {
                 modality: pb::Modality::Image as i32,

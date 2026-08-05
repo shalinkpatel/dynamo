@@ -21,8 +21,6 @@ struct ModelIdentity {
 pub(crate) struct DiscoveredModel {
     pub source: String,
     pub served_name: String,
-    pub reasoning_parser: Option<String>,
-    pub tool_call_parser: Option<String>,
     pub supports_multimodal: bool,
     identity: ModelIdentity,
     server: pb::ServerInfo,
@@ -38,6 +36,16 @@ impl DiscoveredModel {
                 "unsupported Control API version `{}`; expected `{SUPPORTED_API_VERSION}`",
                 server.api_version
             )));
+        }
+        if server
+            .parallelism
+            .as_ref()
+            .is_some_and(|parallelism| parallelism.data_parallel_size > 1)
+            && !server.supports_explicit_data_parallel_rank
+        {
+            return Err(client::protocol_error(
+                "vLLM reports data parallelism greater than one but does not advertise explicit data-parallel rank routing",
+            ));
         }
         let source = required("model_id", model.model_id)?;
         let served_name = required("served_model_name", model.served_model_name)?;
@@ -58,8 +66,6 @@ impl DiscoveredModel {
         Ok(Self {
             source,
             served_name,
-            reasoning_parser,
-            tool_call_parser,
             supports_multimodal: model.supports_multimodal,
             identity,
             server,

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: vLLM Sidecar
-subtitle: Run Dynamo beside a stock vLLM engine through native gRPC.
+subtitle: Run Dynamo beside a compatible vLLM engine through native gRPC.
 ---
 
 > [!WARNING]
@@ -20,7 +20,7 @@ architecture.
 | Deployment path | Aggregated | Disaggregated |
 |---|---|---|
 | Local launcher | Validated on one GPU | Validated on two GPUs with NIXL |
-| Kubernetes example | Validated | Validated with NIXL |
+| Kubernetes example | Deferred | Deferred |
 
 This table covers launch topology only. The
 [vLLM feature matrix](overview.md#feature-support-matrix) describes the in-process
@@ -65,11 +65,4 @@ curl localhost:8000/v1/chat/completions \
 
 ## Deploy on Kubernetes
 
-No published vLLM sidecar image is available yet. Follow the
-[Kubernetes quick start](https://github.com/ai-dynamo/dynamo/blob/main/lib/sidecar/vllm/README.md#deploy-on-kubernetes-quick-start)
-to build the CPU-only sidecar image and pair it with a stock upstream vLLM
-image. The source tree includes
-[aggregated](https://github.com/ai-dynamo/dynamo/blob/main/lib/sidecar/vllm/deploy/agg.yaml)
-and
-[disaggregated](https://github.com/ai-dynamo/dynamo/blob/main/lib/sidecar/vllm/deploy/disagg.yaml)
-manifests.
+Kubernetes examples are deferred until compatible vLLM and Dynamo sidecar images are published. The existing stock vLLM image uses an older monolithic gRPC service and does not provide the split Inference, Control, explicit-rank capability, and health contracts required by this sidecar.
