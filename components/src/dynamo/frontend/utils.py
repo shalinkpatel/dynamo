@@ -91,6 +91,22 @@ def extract_mm_urls(
     return mm_data or None
 
 
+def attach_monitor(choice: dict[str, Any], engine_response: dict[str, Any]) -> None:
+    """Copy the coordinator's monitor fields from an engine response onto a choice's delta.
+
+    A monitor error means the coordinator held the chunk it was scoring, so report
+    content_filter and drop the held content, which must never reach the client.
+    """
+    delta = choice["delta"]
+    if (events := engine_response.get("monitor_events")) is not None:
+        delta["monitor_events"] = events
+    if error := engine_response.get("monitor_error"):
+        delta["monitor_error"] = error
+        choice["finish_reason"] = "content_filter"
+        for key in ("content", "reasoning_content", "tool_calls"):
+            delta.pop(key, None)
+
+
 def make_backend_error(engine_response: dict[str, Any]) -> dict[str, Any]:
     """Build an OpenAI-style error dict, guarding against None/missing message."""
     backend_msg = engine_response.get("message") or "unknown backend error"

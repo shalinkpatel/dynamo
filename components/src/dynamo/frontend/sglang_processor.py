@@ -34,6 +34,7 @@ from .sglang_prepost import (
 )
 from .utils import (
     PreprocessError,
+    attach_monitor,
     extract_mm_urls,
     handle_engine_error,
     make_internal_error,
@@ -57,7 +58,7 @@ def _runtime_config_parser_name(
 
 
 def _unsupported_n_message(n: int) -> str:
-    return f"Unsupported value: 'n={n}'. " "This endpoint currently supports only n=1."
+    return f"Unsupported value: 'n={n}'. This endpoint currently supports only n=1."
 
 
 _FINISH_REASON_MAP: dict[str, str] = {
@@ -249,6 +250,10 @@ def _build_dynamo_preproc(
     mm_data = extract_mm_urls(request.get("messages", []))
     if mm_data:
         preproc["multi_modal_data"] = mm_data
+
+    # Monitor opt-in; the coordinator selects monitors from it.
+    if (names := request.get("requested_monitors")) is not None:
+        preproc["extra_args"] = {"requested_monitors": names}
 
     return preproc
 
@@ -478,6 +483,9 @@ class SglangProcessor:
             # TTFT, then switch to the configured interval.
             pending_token_ids: list[int] = []
             pending_usage: dict[str, Any] | None = None
+            # Monitor events, max-merged across batched chunks.
+            pending_monitor: dict[str, float] | None = None
+            pending_monitor_error: str | None = None
             first_chunk = True
 
             async for dynamo_response in dynamo_stream:
@@ -514,7 +522,14 @@ class SglangProcessor:
                     pending_usage = usage
 
                 pending_token_ids.extend(new_ids)
-
+                if (events := engine_response.get("monitor_events")) is not None:
+                    pending_monitor = pending_monitor or {}
+                    for name, value in events.items():
+                        prev = pending_monitor.get(name, value)
+                        pending_monitor[name] = max(value, prev)
+                pending_monitor_error = (
+                    engine_response.get("monitor_error") or pending_monitor_error
+                )
                 # Flush on finish or when we've accumulated enough tokens.
                 # First chunk flushes immediately (si=1) to minimize TTFT.
                 flush_threshold = 1 if first_chunk else stream_interval
@@ -528,6 +543,17 @@ class SglangProcessor:
                         t_pp0 = time.monotonic()
 
                     choice = post.process_output(mapped_response)
+                    if choice is None and (pending_monitor or pending_monitor_error):
+                        # An event with no text still needs its own chunk.
+                        choice = {"index": 0, "delta": {}, "finish_reason": None}
+                    if choice:
+                        attach_monitor(
+                            choice,
+                            {
+                                "monitor_events": pending_monitor,
+                                "monitor_error": pending_monitor_error,
+                            },
+                        )
 
                     if self.debug_perf:
                         t_pp1 = time.monotonic()
@@ -553,6 +579,8 @@ class SglangProcessor:
 
                     pending_token_ids = []
                     pending_usage = None
+                    pending_monitor = None
+                    pending_monitor_error = None
                     first_chunk = False
         except Unknown:
             raise

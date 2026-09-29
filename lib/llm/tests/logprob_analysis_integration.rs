@@ -387,6 +387,7 @@ fn create_response_with_linear_probs(
             role: Some(Role::Assistant),
             refusal: None,
             reasoning_content: None,
+            monitor: None,
         },
         finish_reason: Some(FinishReason::Stop),
         logprobs: Some(ChatChoiceLogprobs {
@@ -468,6 +469,7 @@ fn create_multi_choice_response(
                     role: Some(Role::Assistant),
                     refusal: None,
                     reasoning_content: None,
+                    monitor: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
                 logprobs: Some(ChatChoiceLogprobs {

@@ -943,6 +943,33 @@ pub enum ServiceTierResponse {
 /// Extends upstream `ChatCompletionResponseMessage` with:
 /// - `content`: `Option<ChatCompletionMessageContent>` (multimodal) instead of `Option<String>`
 /// - `reasoning_content`: model reasoning output (DeepSeek-R1, QwQ)
+/// Safety-monitor fields, flattened into the delta and message; absent on
+/// unmonitored output.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq)]
+pub struct MonitorMeta {
+    /// Monitor values fired on this segment; the max per monitor on a non-streaming message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_events: Option<std::collections::HashMap<String, f64>>,
+    /// Monitoring failure reason; the choice finished with `content_filter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_error: Option<String>,
+}
+
+impl MonitorMeta {
+    pub fn is_empty(&self) -> bool {
+        self.monitor_events.is_none() && self.monitor_error.is_none()
+    }
+
+    /// Flattened `Option` deserializes as `Some` even when both keys are absent;
+    /// collapse that to `None`.
+    fn deserialize_option<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Self>, D::Error> {
+        let meta = Self::deserialize(d)?;
+        Ok((!meta.is_empty()).then_some(meta))
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ChatCompletionResponseMessage {
     /// Always serialized (as `null` when None) so clients can rely on the
@@ -965,6 +992,12 @@ pub struct ChatCompletionResponseMessage {
     /// `null` invents one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(
+        flatten,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "MonitorMeta::deserialize_option"
+    )]
+    pub monitor: Option<MonitorMeta>,
 }
 
 /// Stream options with per-chunk usage reporting.
@@ -1113,6 +1146,12 @@ pub struct ChatCompletionStreamResponseDelta {
     /// Streaming reasoning content (DeepSeek-R1, QwQ models).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(
+        flatten,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "MonitorMeta::deserialize_option"
+    )]
+    pub monitor: Option<MonitorMeta>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -1323,6 +1362,7 @@ mod tests {
             function_call: None,
             audio: None,
             reasoning_content: None,
+            monitor: None,
         };
         let value = serde_json::to_value(message).unwrap();
         assert!(value.get("reasoning_content").is_none());
@@ -1591,6 +1631,7 @@ mod tests {
                     role: Some(Role::Assistant),
                     refusal: None,
                     reasoning_content: None,
+                    monitor: None,
                 },
                 finish_reason: None,
                 logprobs: None,
@@ -1663,6 +1704,7 @@ mod tests {
                     role: None,
                     refusal: None,
                     reasoning_content: None,
+                    monitor: None,
                 },
                 finish_reason: None,
                 logprobs: None,

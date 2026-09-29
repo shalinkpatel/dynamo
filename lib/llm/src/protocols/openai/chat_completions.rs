@@ -460,6 +460,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_requested_monitors_parses_and_rejects_empty_names() {
+        let parse = |monitors: serde_json::Value| -> NvCreateChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "requested_monitors": monitors
+            }))
+            .unwrap()
+        };
+        let request = parse(json!(["harm", "cyber"]));
+        assert_eq!(
+            request.baseten_ext.requested_monitors.as_deref(),
+            Some(&["harm".to_string(), "cyber".to_string()][..])
+        );
+        ValidateRequest::validate(&request).unwrap();
+        ValidateRequest::validate(&parse(json!([]))).unwrap();
+        assert!(ValidateRequest::validate(&parse(json!(["harm", ""]))).is_err());
+    }
+
+    #[test]
     fn test_system_message_without_content_carries_dynamic_tools() {
         // Kimi K3 official protocol: a system message may carry only a
         // `tools` list (dynamic tool declarations) and no `content`.

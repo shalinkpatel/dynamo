@@ -281,6 +281,11 @@ pub struct BasetenExt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[builder(default, setter(strip_option))]
     pub mocker_config: Option<HashMap<String, serde_json::Value>>,
+
+    /// Monitors to run for this chat completion; forwarded as `extra_args.requested_monitors`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    pub requested_monitors: Option<Vec<String>>,
 }
 
 impl BasetenExt {
@@ -300,9 +305,17 @@ impl BasetenExt {
             && self.thinking_token_budget.is_none()
             && self.chat_template_args.is_none()
             && self.mocker_config.is_none()
+            && self.requested_monitors.is_none()
     }
 
     pub fn validate_request(&self) -> anyhow::Result<()> {
+        if let Some(names) = &self.requested_monitors {
+            anyhow::ensure!(
+                names.iter().all(|name| !name.is_empty()),
+                "requested_monitors entries must be non-empty strings"
+            );
+        }
+
         if let Some(ranges) = self.cache_control.as_deref() {
             validate_cache_control_ranges(ranges)?;
         }

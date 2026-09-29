@@ -222,3 +222,65 @@ The Python extension in `lib/bindings/python` only converts Python values,
 adapts the response stream, and exposes the Rust admission result as PyO3
 classes. Changes to routing, reroute, cancellation, and guard cleanup
 belong in this crate.
+
+## Monitor gate
+
+The local `GenerationCoordinator` joins probe-sidecar scores to the token stream
+and reports per-monitor values; the frontend enforces the stop policy. Both read
+the same TOML.
+
+```
+DYN_MONITOR_CONFIG=/path/monitoring.toml   # coordinator and frontend; unset: nothing built; invalid: startup fails
+DYN_MONITOR_TOPIC=monitors                 # event-plane topic in the coordinator namespace
+DYN_MONITOR_HOLD_TIMEOUT_MS=2000           # max wait per chunk for its score rows
+```
+
+The config is a `[monitoring]` TOML plus `streams` (the sidecar's
+column order, required with monitors):
+
+```toml
+[monitoring]
+version = 1
+streams = ["harm"]
+
+[monitoring.monitors.harm]
+return_when = "on_request"   # or "always"
+event_threshold = 0.8
+stop_threshold = 0.95        # optional; frontend stops the stream at this value
+
+[monitoring.monitors.harm.config]
+probe = "harm"               # or probes = {a = 0.5, b = 0.5}
+on = "output"                # prompt | output | both
+temperature = 1.0
+bias = 0.0
+calibration = "sigmoid"      # or linear
+repeat = "always"            # or once
+```
+
+Unknown keys fail; `[monitoring.capture]` is rejected. `stop_threshold` must be
+finite and `>= event_threshold` (equal to it when `repeat = once`), and monitored
+generation requires `n = 1`. The frontend serves
+`GET /monitors` (`{"version":1,"monitors":[...],"capture":{"enabled":false}}`) from the
+same file; without `DYN_MONITOR_CONFIG` the route does not exist.
+
+The probe sidecar publishes msgpack `MonitorMessage { request_id, start, rows }`
+on the topic: `rows[k]` scores absolute position `start + k` (prompt positions
+first, then output), one f32 logit per stream. Positions may repeat (radix
+replay); the first copy wins. `request_id` is the worker's context id.
+
+A request opts in with `requested_monitors` in the worker request map: absent runs
+the always-on monitors (none: unmonitored, untouched, never waits); a list, even
+empty, adds the named ones; an unknown name fails the request before routing.
+For a monitored request each chunk is held until rows cover its
+`token_ids_diff` (the response's final token may stay unscored), then every output
+gets `monitor_events: {name: value}` (`{}` when nothing fired); prompt events ride
+the first chunk. A hold timeout or malformed row never releases held content: the
+chunk becomes `content_filter` with `monitor_events: {}` and `monitor_error`.
+The coordinator reports values and never acts on them. The frontend HTTP layer
+(every engine and processor path) applies `stop_threshold`: the tripping chunk
+becomes a `content_filter` chunk carrying the events and generation is cancelled;
+non-streaming responses get an empty `content_filter` message. Requires a
+coordinator namespace; remote-client coordinators do not run the gate.
+
+`cargo test -p dynamo-b10-client monitor`; the event-plane round trip is
+`#[ignore]` and needs a discoverable event plane.

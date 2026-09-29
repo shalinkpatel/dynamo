@@ -9,6 +9,7 @@
 //! admission metadata. Model-specific request validation and serialization
 //! stay at the language binding and are passed here as opaque MessagePack maps.
 
+use crate::monitor::{Mailbox, MonitorGate};
 use crate::{
     CancellationPolicy, RequestContext, RouteAndConnectOutcome, RouteOptions, RouterRequestNew,
     RouterWorkerCoordinator, RouterWorkerPhase, stream_with_optional_prefill_mark,
@@ -122,6 +123,7 @@ pub struct GenerationCoordinator {
     strategy: DisaggregationStrategy,
     prefill_mark_timing: PrefillMarkTiming,
     disagg_request_id_machine_id: u64,
+    monitor: Option<Arc<MonitorGate>>,
 }
 
 impl GenerationCoordinator {
@@ -178,6 +180,7 @@ impl GenerationCoordinator {
         strategy: DisaggregationStrategy,
         prefill_mark_timing: PrefillMarkTiming,
         disagg_request_id_machine_id: u64,
+        monitor: Option<Arc<MonitorGate>>,
     ) -> Result<Self> {
         if strategy == DisaggregationStrategy::PrefillFirst && next.is_none() {
             bail!("next coordinator is required for prefill-first generation");
@@ -188,6 +191,7 @@ impl GenerationCoordinator {
             strategy,
             prefill_mark_timing,
             disagg_request_id_machine_id,
+            monitor,
         })
     }
 
@@ -198,15 +202,25 @@ impl GenerationCoordinator {
         options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
         validate_generation_request(&request, self.strategy)?;
-        match self.strategy {
+        let monitor = self.subscribe_monitor(&context, &request)?;
+        let outcome = match self.strategy {
             DisaggregationStrategy::Aggregated => {
-                self.generate_aggregated(context, request, options.primary)
-                    .await
+                self.generate_aggregated(context.clone(), request, options.primary)
+                    .await?
             }
             DisaggregationStrategy::PrefillFirst => {
-                self.generate_prefill_first(context, request, options).await
+                self.generate_prefill_first(context.clone(), request, options)
+                    .await?
             }
-        }
+        };
+        // Wrap the connected stream with the monitor gate once, at the front door.
+        Ok(match (outcome, monitor) {
+            (GenerationOutcome::Connected(mut generated), Some(mailbox)) => {
+                generated.stream = MonitorGate::wrap(generated.stream, mailbox, context.inner());
+                GenerationOutcome::Connected(generated)
+            }
+            (outcome, _) => outcome,
+        })
     }
 
     async fn generate_aggregated(
@@ -260,8 +274,9 @@ impl GenerationCoordinator {
                 yield item;
             }
         };
+        let stream = ResponseStream::new(Box::pin(output), context.inner());
         Ok(GenerationOutcome::Connected(GeneratedRequest {
-            stream: ResponseStream::new(Box::pin(output), context.inner()),
+            stream,
             admission,
         }))
     }
@@ -336,8 +351,9 @@ impl GenerationCoordinator {
                 let _guard = prefill_guard;
                 yield Annotated::from_data(prefill_response);
             };
+            let stream = ResponseStream::new(Box::pin(output), context.inner());
             return Ok(GenerationOutcome::Connected(GeneratedRequest {
-                stream: ResponseStream::new(Box::pin(output), context.inner()),
+                stream,
                 admission,
             }));
         };
@@ -484,10 +500,47 @@ impl GenerationCoordinator {
                 }
             }
         };
+        let stream = ResponseStream::new(Box::pin(output), context.inner());
         Ok(GenerationOutcome::Connected(GeneratedRequest {
-            stream: ResponseStream::new(Box::pin(output), context.inner()),
+            stream,
             admission,
         }))
+    }
+
+    /// Register with the monitor gate before routing; unknown names fail the request.
+    fn subscribe_monitor(
+        &self,
+        context: &RequestContext,
+        request: &GenerationRequest,
+    ) -> Result<Option<Mailbox>> {
+        // Top-level, or under extra_args where the frontend forwards it.
+        let req = &request.primary_worker_request;
+        let value = map_get_value(req, "requested_monitors")
+            .or_else(|| map_get_value(map_get_value(req, "extra_args")?, "requested_monitors"));
+        let requested: Option<Vec<String>> = match value {
+            Some(value) => rmpv::ext::from_value(value.clone())
+                .context("requested_monitors must be a list of monitor names")?,
+            None => None,
+        };
+        match &self.monitor {
+            Some(gate) => {
+                let mailbox = gate.subscribe(
+                    context.id(),
+                    requested.as_deref(),
+                    request.routing_request.tokens.len() as u64,
+                )?;
+                // MonitorMessage has no choice index, so a monitored request must
+                // produce a single output.
+                if mailbox.is_some() && request_sampling_n(req) > 1 {
+                    bail!("monitored generation requires n = 1");
+                }
+                Ok(mailbox)
+            }
+            None if requested.is_some() => {
+                bail!("requested_monitors requires a coordinator that deploys monitors")
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -731,10 +784,19 @@ fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
         .map(|(_, value)| value)
 }
 
-fn map_get_mut<'a>(map: &'a mut [(Value, Value)], key: &str) -> Option<&'a mut Value> {
+pub(crate) fn map_get_mut<'a>(map: &'a mut [(Value, Value)], key: &str) -> Option<&'a mut Value> {
     map.iter_mut()
         .find(|(candidate, _)| candidate.as_str() == Some(key))
         .map(|(_, value)| value)
+}
+
+/// The request's sampling `n` (`sampling_options.n` or top-level `n`); 1 when absent.
+fn request_sampling_n(req: &Value) -> u64 {
+    map_get_value(req, "sampling_options")
+        .and_then(|opts| map_get_value(opts, "n"))
+        .or_else(|| map_get_value(req, "n"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
 }
 
 fn map_get_value<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
@@ -753,7 +815,7 @@ fn set_map_field(target: &mut Value, key: &str, value: Value) -> Result<()> {
     Ok(())
 }
 
-fn set_map_entry(map: &mut Vec<(Value, Value)>, key: &str, value: Value) {
+pub(crate) fn set_map_entry(map: &mut Vec<(Value, Value)>, key: &str, value: Value) {
     if let Some(existing) = map_get_mut(map, key) {
         *existing = value;
     } else {

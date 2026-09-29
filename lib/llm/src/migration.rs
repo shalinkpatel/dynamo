@@ -438,6 +438,8 @@ mod tests {
             worker_trace_link: None,
             completion_usage: None,
             engine_data: None,
+            monitor_events: None,
+            monitor_error: None,
         })
     }
 

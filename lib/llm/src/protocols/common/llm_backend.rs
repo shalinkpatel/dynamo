@@ -136,6 +136,14 @@ pub struct BackendOutput {
     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_data: Option<serde_json::Value>,
+
+    /// Monitor values fired on this chunk; on every chunk of a monitored request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_events: Option<std::collections::HashMap<String, f64>>,
+
+    /// Monitoring failure reason; the request stops with `content_filter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_error: Option<String>,
 }
 
 /// The LLM engine and backnd with manage it's own state, specifically translating how a
@@ -209,6 +217,14 @@ pub struct LLMEngineOutput {
     /// Dynamo does not inspect this field; it is serialized as-is into `nvext.engine_data`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_data: Option<serde_json::Value>,
+
+    /// Monitor values fired on this chunk; on every chunk of a monitored request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_events: Option<std::collections::HashMap<String, f64>>,
+
+    /// Monitoring failure reason; the request stops with `content_filter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_error: Option<String>,
 }
 
 impl LLMEngineOutput {
@@ -230,6 +246,7 @@ impl LLMEngineOutput {
             extra_args: None,
             completion_usage: None,
             engine_data: None,
+            ..Default::default()
         }
     }
 
@@ -251,6 +268,7 @@ impl LLMEngineOutput {
             extra_args: None,
             completion_usage: None,
             engine_data: None,
+            ..Default::default()
         }
     }
 
@@ -272,6 +290,7 @@ impl LLMEngineOutput {
             extra_args: None,
             completion_usage: None,
             engine_data: None,
+            ..Default::default()
         }
     }
 
@@ -293,6 +312,7 @@ impl LLMEngineOutput {
             extra_args: None,
             completion_usage: None,
             engine_data: None,
+            ..Default::default()
         }
     }
 }

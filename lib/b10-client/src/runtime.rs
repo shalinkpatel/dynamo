@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::monitor::MonitorGate;
 use crate::{
     DeniedGenerationRequest, DeniedRequest, DisaggregationStrategy, GenerationCoordinator,
     GenerationCoordinatorClient, GenerationCoordinatorService, GenerationOptions,
@@ -48,6 +49,7 @@ struct LocalCoordinator {
     options: LocalCoordinatorOptions,
     ready: OnceCell<GenerationCoordinator>,
     shutdown_token: CancellationToken,
+    monitor_ns: Option<dynamo_runtime::component::Namespace>,
 }
 
 impl LocalCoordinator {
@@ -71,12 +73,17 @@ impl LocalCoordinator {
                     }
                     _ => None,
                 };
+                let monitor = match &self.monitor_ns {
+                    Some(ns) => MonitorGate::from_env(ns.clone()).await?,
+                    None => None,
+                };
                 GenerationCoordinator::new(
                     primary,
                     next,
                     self.options.strategy,
                     self.options.mark_timing,
                     self.options.machine_id,
+                    monitor,
                 )
             })
             .await
@@ -186,32 +193,47 @@ impl GenerationCoordinatorRuntime {
             strategy: options.strategy,
             started: OnceCell::new(),
         });
-        let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) =
-            if is_client_force.unwrap_or(settings.remotes.is_some() || default_remote.is_some()) {
-                ensure!(
-                    settings.remotes.is_some() || default_remote.is_some(),
-                    "remote coordinator mode requires remotes"
-                );
-                let namespace = runtime
+        let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) = if is_client_force
+            .unwrap_or(settings.remotes.is_some() || default_remote.is_some())
+        {
+            ensure!(
+                settings.remotes.is_some() || default_remote.is_some(),
+                "remote coordinator mode requires remotes"
+            );
+            let namespace =
+                runtime
                     .namespace(namespace.context(
                         "namespace is required for configured remote coordinator mode",
                     )?)?;
-                (
-                    Arc::new(RemoteGenerationCoordinator::from_runtime_config(
-                        config,
-                        Some(&namespace),
-                        default_remote,
-                    )?),
-                    None,
-                )
-            } else {
-                let local = Arc::new(LocalCoordinator {
-                    options,
-                    ready: OnceCell::new(),
-                    shutdown_token,
-                });
-                (local.clone(), Some(local))
+            (
+                Arc::new(RemoteGenerationCoordinator::from_runtime_config(
+                    config,
+                    Some(&namespace),
+                    default_remote,
+                )?),
+                None,
+            )
+        } else {
+            // Nothing monitor-related is built unless DYN_MONITOR_CONFIG is set.
+            let configured = std::env::var(
+                dynamo_runtime::config::environment_names::llm::monitor::DYN_MONITOR_CONFIG,
+            )
+            .is_ok_and(|m| !m.trim().is_empty());
+            let monitor_ns = match (configured, namespace.as_deref()) {
+                (false, _) => None,
+                (true, None) => {
+                    anyhow::bail!("DYN_MONITOR_CONFIG is set but the coordinator has no namespace")
+                }
+                (true, Some(ns)) => Some(runtime.namespace(ns)?),
             };
+            let local = Arc::new(LocalCoordinator {
+                options,
+                ready: OnceCell::new(),
+                shutdown_token,
+                monitor_ns,
+            });
+            (local.clone(), Some(local))
+        };
         Ok(Self {
             client,
             local,

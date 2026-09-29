@@ -43,6 +43,7 @@ from dynamo.frontend.sglang_processor import (
 )
 from dynamo.frontend.utils import (
     PreprocessError,
+    attach_monitor,
     nvext_extra_field_requested,
     random_call_id,
     random_uuid,
@@ -1705,6 +1706,101 @@ class TestIncrementalDetokenization:  # FRONTEND.6 — token-id stream → text
 
         return asyncio.run(collect())
 
+    def test_requested_monitors_forwarded_in_extra_args(self):
+        """The opt-in reaches the coordinator; absent, no extra_args key at all."""
+        base = {"model": "m", "messages": []}
+        assert "extra_args" not in _build_dynamo_preproc(
+            base, prompt_token_ids=[1], model_name="m", eos_token_id=None
+        )
+        with_names = _build_dynamo_preproc(
+            {**base, "requested_monitors": ["harm"]},
+            prompt_token_ids=[1],
+            model_name="m",
+            eos_token_id=None,
+        )
+        assert with_names["extra_args"] == {"requested_monitors": ["harm"]}
+
+    def test_monitor_events_lifted_and_max_merged_across_batch(self, tokenizer):
+        """Monitor fields ride each emitted chunk's delta; a batched flush carries the
+        max per monitor. Stopping is the HTTP layer's job, not the processor's."""
+        processor = SglangProcessor(
+            tokenizer=tokenizer,
+            routed_engine=FakeRoutedEngine(
+                items=[
+                    {"token_ids": [101], "monitor_events": {"harm": 0.2}},
+                    {"token_ids": [102], "monitor_events": {"harm": 0.95}},
+                    {"token_ids": [103], "monitor_events": {"harm": 0.1}},
+                    {"token_ids": [104], "monitor_events": {}, "finish_reason": "stop"},
+                ]
+            ),
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_id=None,
+            stream_interval=10,
+        )
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer, tool_call_parser=None, reasoning_parser=None
+        )
+
+        async def collect():
+            return [
+                item
+                async for item in processor._generate_and_stream(
+                    "req-mon", {"model": "m"}, {}, [], post
+                )
+            ]
+
+        items = asyncio.run(collect())
+        deltas = [c["choices"][0]["delta"] for c in items]
+        # First chunk flushes alone; the rest batch until finish.
+        assert deltas[0]["monitor_events"] == {"harm": 0.2}
+        assert deltas[1]["monitor_events"] == {"harm": 0.95}
+        assert [c["choices"][0]["finish_reason"] for c in items] == [None, "stop"]
+
+    def test_monitor_error_on_finish_chunk_yields_content_filter(self, tokenizer):
+        """A coordinator hold (monitor_error) reaches the client as content_filter
+        with the held content dropped; the engine mapping still says content_filter
+        for other finish reasons."""
+        processor = SglangProcessor(
+            tokenizer=tokenizer,
+            routed_engine=FakeRoutedEngine(
+                items=[
+                    {"token_ids": [101]},
+                    {
+                        "token_ids": [],
+                        "finish_reason": "content_filter",
+                        "monitor_events": {},
+                        "monitor_error": "monitor scores did not arrive within 200ms",
+                    },
+                ]
+            ),
+            tool_call_parser_name=None,
+            reasoning_parser_name=None,
+            eos_token_id=None,
+        )
+        post = SglangStreamingPostProcessor(
+            tokenizer=tokenizer, tool_call_parser=None, reasoning_parser=None
+        )
+
+        async def collect():
+            return [
+                item
+                async for item in processor._generate_and_stream(
+                    "req-hold", {"model": "m"}, {}, [], post
+                )
+            ]
+
+        items = asyncio.run(collect())
+
+        final = items[-1]["choices"][0]
+        assert final["finish_reason"] == "content_filter"
+        assert final["delta"]["monitor_events"] == {}
+        assert (
+            final["delta"]["monitor_error"]
+            == "monitor scores did not arrive within 200ms"
+        )
+        assert "content" not in final["delta"]
+
     def test_routed_engine_is_error_yields_internal_error(self, tokenizer):
         """is_error() True yields a single internal_error chunk with the comment text."""
         items = self._run_stream(
@@ -1861,6 +1957,34 @@ class TestUtilities:  # (mixed — see per-test annotations)
         )
         assert not nvext_extra_field_requested({"nvext": {}}, "stop_reason")
         assert not nvext_extra_field_requested({}, "stop_reason")
+
+    def test_attach_monitor_events_only(self):
+        """Events ride the delta untouched; nothing else is added."""
+        choice = {"index": 0, "delta": {}, "finish_reason": None}
+        attach_monitor(choice, {"monitor_events": {"harm": 0.9}, "monitor_error": None})
+        assert choice["delta"] == {"monitor_events": {"harm": 0.9}}
+        assert choice["finish_reason"] is None
+
+    def test_attach_monitor_error_forces_content_filter(self):
+        """A monitor error forces content_filter and pops the held content."""
+        choice = {
+            "index": 0,
+            "delta": {
+                "content": "held text",
+                "reasoning_content": "held reasoning",
+                "tool_calls": [{"id": "call_1"}],
+            },
+            "finish_reason": None,
+        }
+        attach_monitor(choice, {"monitor_error": "monitor scores timed out"})
+        assert choice["finish_reason"] == "content_filter"
+        assert choice["delta"] == {"monitor_error": "monitor scores timed out"}
+
+    def test_attach_monitor_absent_fields_adds_nothing(self):
+        """Neither field present leaves the choice exactly as it was."""
+        choice = {"index": 0, "delta": {}, "finish_reason": None}
+        attach_monitor(choice, {})
+        assert choice == {"index": 0, "delta": {}, "finish_reason": None}
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ mod context;
 mod coordinator;
 mod generation;
 mod guard;
+pub mod monitor;
 mod payload_copy;
 pub mod protocol;
 mod remote;
@@ -32,6 +33,7 @@ pub use generation::{
     GenerationRequest, PrefillMarkTiming, WorkerLoad, WorkerMode,
 };
 pub use guard::RouterRequestGuard;
+pub use monitor::{MonitorFeed, MonitorGate, MonitorMessage, MonitoringConfig};
 pub use remote::RemoteGenerationCoordinator;
 pub use runtime::{CoordinatorClient, GenerationCoordinatorRuntime, LocalCoordinatorOptions};
 pub use service::{GenerationCoordinatorService, RunningGenerationCoordinatorService};

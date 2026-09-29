@@ -402,6 +402,21 @@ pub mod llm {
         pub const DYN_AUDIT_JSONL_GZ_ROLL_LINES: &str = "DYN_AUDIT_JSONL_GZ_ROLL_LINES";
     }
 
+    /// Coordinator monitor gate (safety-probe monitors).
+    pub mod monitor {
+        /// Path to the monitoring TOML, read by the coordinator (monitors to run)
+        /// and the frontend (`GET /monitors`, per-monitor `stop_threshold`). Unset:
+        /// nothing is built. Invalid: startup fails.
+        pub const DYN_MONITOR_CONFIG: &str = "DYN_MONITOR_CONFIG";
+
+        /// Event-plane topic the probe sidecar publishes score rows on. Default `monitors`.
+        pub const DYN_MONITOR_TOPIC: &str = "DYN_MONITOR_TOPIC";
+
+        /// Milliseconds a chunk may wait for its score rows before the request
+        /// is stopped with `monitor_error`. Default 2000.
+        pub const DYN_MONITOR_HOLD_TIMEOUT_MS: &str = "DYN_MONITOR_HOLD_TIMEOUT_MS";
+    }
+
     /// Agent trace configuration
     pub mod agent_trace {
         /// Master switch. Truthy enables tracing with defaults for sinks,

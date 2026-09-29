@@ -54,6 +54,8 @@ fn build_backend_output_with_finish(text: &str, finish: common::FinishReason) ->
         disaggregated_params: None,
         worker_trace_link: None,
         engine_data: None,
+        monitor_events: None,
+        monitor_error: None,
     }
 }
 

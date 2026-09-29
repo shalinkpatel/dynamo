@@ -1,3 +1,5 @@
+mod monitor_tests;
+
 use super::coordinator::{
     RouteAndConnectOutcome, RouteSource, RouterGuardClient, route_and_connect, route_request,
     shield_route_and_connect, stream_with_optional_prefill_mark,
@@ -36,6 +38,7 @@ use std::time::{Duration, Instant};
 macro_rules! jv {
     ($($x:tt)*) => { serde_json::from_value::<rmpv::Value>(serde_json::json!($($x)*)).unwrap() };
 }
+pub(crate) use jv;
 
 /// Convert a `serde_json::Value` to `rmpv::Value` for test fixtures.
 fn jv_value(v: serde_json::Value) -> rmpv::Value {
@@ -2878,6 +2881,7 @@ fn generation_coordinator(
     next_router: Option<Arc<RouterGuardClientForTesting>>,
     next_worker: Option<Arc<RouterGuardClientForTesting>>,
     strategy: DisaggregationStrategy,
+    monitor: Option<Arc<crate::monitor::MonitorGate>>,
 ) -> GenerationCoordinator {
     let primary = Arc::new(
         RouterWorkerCoordinator::new(router, worker, TEST_BLOCK_SIZE).expect("primary coordinator"),
@@ -2894,6 +2898,7 @@ fn generation_coordinator(
         strategy,
         PrefillMarkTiming::AfterPrefillCompute,
         7,
+        monitor,
     )
     .expect("generation coordinator")
 }
@@ -2956,6 +2961,7 @@ async fn bids_use_selected_costs_and_require_complete_disaggregated_pairs() {
             strategy,
             PrefillMarkTiming::AfterPrefillCompute,
             7,
+            None,
         )
         .unwrap();
         let result = coordinator
@@ -3085,6 +3091,7 @@ async fn load_queries_http_choose_bid_without_dispatch() {
         Some(decode.clone()),
         Some(worker.clone()),
         DisaggregationStrategy::PrefillFirst,
+        None,
     );
     let (_, server) = generation_transport(coordinator, true).await;
     let mut config = baseten_configmap::UnifiedConfig::default();
@@ -3308,6 +3315,7 @@ async fn generation_error_scenario(phase: &str) {
         DisaggregationStrategy::PrefillFirst,
         PrefillMarkTiming::AfterTransfer,
         7,
+        None,
     )
     .unwrap();
     let context = build_test_context(phase);
@@ -3417,6 +3425,7 @@ async fn generation_coordinator_prefill_first_moves_handoff_and_drops_bootstrap(
             Some(decode_router.clone()),
             Some(decode_worker.clone()),
             DisaggregationStrategy::PrefillFirst,
+            None,
         );
 
         let (coordinator, server) = generation_transport(coordinator, remote).await;
@@ -3573,6 +3582,7 @@ async fn generation_coordinator_empty_prefill_handoff_preserves_completion() {
                     Some(decode_router.clone()),
                     Some(decode_worker.clone()),
                     DisaggregationStrategy::PrefillFirst,
+                    None,
                 );
                 let (coordinator, server) = generation_transport(coordinator, remote).await;
                 let responses = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3675,6 +3685,7 @@ async fn generation_coordinator_empty_prefill_failure_cleans_up_both_workers() {
                 Some(decode_router.clone()),
                 Some(decode_worker),
                 DisaggregationStrategy::PrefillFirst,
+                None,
             );
             let (coordinator, server) = generation_transport(coordinator, remote).await;
             let responses = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3782,6 +3793,7 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
             Some(decode_router),
             Some(decode_worker),
             DisaggregationStrategy::PrefillFirst,
+            None,
         );
 
         let (coordinator, server) = generation_transport(coordinator, remote).await;
@@ -3857,6 +3869,7 @@ async fn generation_coordinator_shields_prefill_to_decode_handoff() {
         Some(decode_router.clone()),
         Some(decode_worker.clone()),
         DisaggregationStrategy::PrefillFirst,
+        None,
     );
     let context = build_test_context("generation-handoff-cancel");
     let context_for_task = context.clone();

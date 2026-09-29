@@ -328,8 +328,17 @@ impl OpenAIPreprocessor {
         }
     }
 
-    fn backend_extra_args<R: NvExtProvider>(request: &R) -> Option<serde_json::Value> {
+    fn backend_extra_args<R: NvExtProvider + BasetenExtProvider>(
+        request: &R,
+    ) -> Option<serde_json::Value> {
         let mut extra_args = serde_json::Map::new();
+
+        if let Some(names) = request
+            .baseten_ext()
+            .and_then(|ext| ext.requested_monitors.as_ref())
+        {
+            extra_args.insert("requested_monitors".to_string(), serde_json::json!(names));
+        }
 
         if let Some(nvext_passthrough) = Self::nvext_passthrough_args(request) {
             extra_args.insert(
@@ -801,7 +810,7 @@ impl OpenAIPreprocessor {
     }
 
     pub async fn gather_multi_modal_data<
-        R: OAIChatLikeRequest + MediaRequestExt + NvExtProvider,
+        R: OAIChatLikeRequest + MediaRequestExt + NvExtProvider + BasetenExtProvider,
     >(
         &self,
         request: &R,
@@ -3081,6 +3090,21 @@ mod tests {
                 "FAILED: {desc}",
             );
         }
+    }
+
+    #[test]
+    fn test_backend_extra_args_forwards_requested_monitors() {
+        let request: NvCreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "requested_monitors": ["harm"]
+        }))
+        .unwrap();
+        let extra_args = OpenAIPreprocessor::backend_extra_args(&request).unwrap();
+        assert_eq!(
+            extra_args["requested_monitors"],
+            serde_json::json!(["harm"])
+        );
     }
 
     #[test]

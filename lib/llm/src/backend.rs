@@ -396,6 +396,8 @@ impl
                     disaggregated_params: data.disaggregated_params,
                     worker_trace_link: data.worker_trace_link,
                     engine_data: data.engine_data,
+                    monitor_events: data.monitor_events,
+                    monitor_error: data.monitor_error,
                 })
             })
         });

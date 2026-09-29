@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Monitoring config shared by the frontend policy tests (lib/llm) and the
+# coordinator gate tests (lib/b10-client): one on-request monitor with a stop
+# threshold and one always-on monitor over a single stream.
+
+[monitoring]
+version = 1
+streams = ["harm"]
+
+[monitoring.monitors.harm]
+return_when = "on_request"
+event_threshold = 0.5
+stop_threshold = 0.9
+
+[monitoring.monitors.harm.config]
+probe = "harm"
+on = "output"
+temperature = 1.0
+bias = 0.0
+calibration = "linear"
+repeat = "always"
+
+[monitoring.monitors.sustained]
+return_when = "always"
+event_threshold = 0.5
+
+[monitoring.monitors.sustained.config]
+probe = "harm"
+on = "output"
+calibration = "linear"

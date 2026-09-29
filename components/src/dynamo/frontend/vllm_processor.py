@@ -38,6 +38,7 @@ from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine, fet
 
 from .prepost import StreamingPostProcessor, preprocess_chat_request
 from .utils import (
+    attach_monitor,
     extract_mm_urls,
     handle_engine_error,
     make_internal_error,
@@ -675,7 +676,19 @@ class VllmProcessor:
                         }
                         break
                     choice = post.process_output(output)
+                    if choice is None and (
+                        engine_response.get("monitor_events") is not None
+                        or engine_response.get("monitor_error")
+                    ):
+                        # Metadata-only chunk: no text to emit, but the monitor
+                        # fields still need a chunk of their own.
+                        choice = {
+                            "index": output.index,
+                            "delta": {},
+                            "finish_reason": None,
+                        }
                     if choice:
+                        attach_monitor(choice, engine_response)
                         choices.append(choice)
 
                 if choices:

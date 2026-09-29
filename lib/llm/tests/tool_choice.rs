@@ -138,6 +138,8 @@ fn build_backend_output(text: &str) -> BackendOutput {
         disaggregated_params: None,
         worker_trace_link: None,
         engine_data: None,
+        monitor_events: None,
+        monitor_error: None,
     }
 }
 
@@ -308,6 +310,8 @@ async fn test_streaming_named_tool_buffers_until_finish() {
             disaggregated_params: None,
             worker_trace_link: None,
             engine_data: None,
+            monitor_events: None,
+            monitor_error: None,
         };
 
         let response = generator
@@ -377,6 +381,8 @@ async fn test_streaming_required_tool_parallel() {
             disaggregated_params: None,
             worker_trace_link: None,
             engine_data: None,
+            monitor_events: None,
+            monitor_error: None,
         };
 
         let response = generator
@@ -448,6 +454,8 @@ fn test_no_tool_choice_outputs_normal_text() {
         disaggregated_params: None,
         worker_trace_link: None,
         engine_data: None,
+        monitor_events: None,
+        monitor_error: None,
     };
 
     let response = generator
@@ -490,6 +498,7 @@ fn make_text_chunk(
                     function_call: None,
                     refusal: None,
                     reasoning_content: None,
+                    monitor: None,
                 },
                 finish_reason: if finish {
                     Some(dynamo_protocols::types::FinishReason::Stop)

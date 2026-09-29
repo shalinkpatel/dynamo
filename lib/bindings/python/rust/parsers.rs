@@ -184,6 +184,7 @@ fn make_stream_chunk(chunk: &CaptureChunk) -> Annotated<NvCreateChatCompletionSt
             function_call: None,
             refusal: None,
             reasoning_content: None,
+            monitor: None,
         },
         finish_reason: chunk.finish_reason,
         logprobs: None,

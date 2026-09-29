@@ -1335,6 +1335,7 @@ fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool
                 role: _,
                 refusal,
                 reasoning_content,
+                monitor,
             } = &c.delta;
             // `Text("")` happens during multi-byte UTF-8 token assembly;
             // `Parts(vec![])` is a structurally empty multimodal payload.
@@ -1350,6 +1351,8 @@ fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool
                 && tool_calls.is_none()
                 && refusal.is_none()
                 && reasoning_content.is_none()
+                // A monitored chunk carries events even with no text.
+                && monitor.is_none()
         })
 }
 
@@ -1619,47 +1622,85 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
+        let monitor_policy = super::monitors::MonitorPolicy::global();
+        let monitor_ctx = ctx.clone();
+        let mut monitor_stopped = false;
+        // Cancel upstream generation only once the SSE stream is torn down (after
+        // [DONE]). Calling stop_generating inside the closure would race
+        // monitor_for_disconnects into its Cancelled arm, which omits [DONE].
+        struct StopOnDrop(Option<Arc<dyn dynamo_runtime::engine::AsyncEngineContext>>);
+        impl StopOnDrop {
+            /// Arm upstream cancellation for when the stream is dropped.
+            fn arm(&mut self, ctx: Arc<dyn dynamo_runtime::engine::AsyncEngineContext>) {
+                self.0 = Some(ctx);
+            }
+        }
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                if let Some(ctx) = self.0.take() {
+                    ctx.stop_generating();
+                }
+            }
+        }
+        let mut stop_guard = StopOnDrop(None);
 
-        // flat_map lets us optionally prepend extra SSE events before each regular chunk:
+        // scan lets us optionally prepend extra SSE events before each regular chunk and
+        // end the stream after a monitor trip:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
         //   - `event: reasoning_dispatch`  — complete reasoning block (emitted once)
-        // When both flags are off the flat_map is equivalent to the original map + filter_map.
-        let stream = stream.flat_map(move |response| {
-            // Extract side-channel events before the response is consumed by EventConverter.
-            let mut events: Vec<Result<Event, axum::Error>> = vec![];
-            // Drop empty chunks from multi-byte token assembly.
-            if response.data.as_ref().is_some_and(is_empty_stream_response) {
-                return stream::iter(events);
-            }
-            if tool_dispatch_enabled {
-                events.extend(streaming_tool_dispatch_events(
-                    &response,
-                    &mut dispatched_tool_ids,
-                ));
-            }
-            if reasoning_dispatch_enabled {
-                events.extend(accumulate_reasoning_dispatch(
-                    &response,
-                    &mut reasoning_buffer,
-                ));
-            }
-
-            // Convert to SSE event (this consumes the response).
-            // EventConverter will detect `event: "error"` and convert to SSE error events.
-            let sse_result = process_response_using_event_converter_and_observe_metrics(
-                EventConverter::from(response),
-                &mut response_collector,
-                &mut http_queue_guard,
-            );
-
-            // Side-channel events come first, then the regular data event.
-            match sse_result {
-                Ok(Some(ev)) => events.push(Ok(ev)),
-                Ok(None) => {}
-                Err(e) => events.push(Err(e)),
-            }
-            stream::iter(events)
-        });
+        // With both flags off and nothing tripping, scan matches the original map + filter_map.
+        let stream = stream
+            .scan((), move |_, mut response| {
+                let out: Option<Vec<Result<Event, axum::Error>>> = if monitor_stopped {
+                    // The trip chunk was already emitted; ending the stream here lets
+                    // monitor_for_disconnects mark_ok + emit [DONE]. scan may pull and
+                    // drop one more upstream item before it returns None.
+                    None
+                } else {
+                    let mut events: Vec<Result<Event, axum::Error>> = vec![];
+                    if let (Some(policy), Some(data)) = (monitor_policy, response.data.as_mut())
+                        && let Some((monitor, value)) = policy.stop_chunk(data)
+                    {
+                        tracing::warn!(%monitor, value, "monitor stop_threshold reached; stopping");
+                        // Arm upstream cancellation for stream teardown after [DONE].
+                        stop_guard.arm(monitor_ctx.clone());
+                        monitor_stopped = true;
+                    }
+                    // Drop empty chunks from multi-byte token assembly.
+                    if response.data.as_ref().is_some_and(is_empty_stream_response) {
+                        Some(events)
+                    } else {
+                        if tool_dispatch_enabled {
+                            events.extend(streaming_tool_dispatch_events(
+                                &response,
+                                &mut dispatched_tool_ids,
+                            ));
+                        }
+                        if reasoning_dispatch_enabled {
+                            events.extend(accumulate_reasoning_dispatch(
+                                &response,
+                                &mut reasoning_buffer,
+                            ));
+                        }
+                        // Convert to SSE event (this consumes the response).
+                        // EventConverter will detect `event: "error"` and convert to SSE error events.
+                        let sse_result = process_response_using_event_converter_and_observe_metrics(
+                            EventConverter::from(response),
+                            &mut response_collector,
+                            &mut http_queue_guard,
+                        );
+                        // Side-channel events come first, then the regular data event.
+                        match sse_result {
+                            Ok(Some(ev)) => events.push(Ok(ev)),
+                            Ok(None) => {}
+                            Err(e) => events.push(Err(e)),
+                        }
+                        Some(events)
+                    }
+                };
+                futures::future::ready(out.map(stream::iter))
+            })
+            .flatten();
         let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle, true);
 
         let mut sse_stream = Sse::new(stream);
@@ -1693,7 +1734,7 @@ async fn chat_completions(
             );
         });
 
-        let response =
+        let mut response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
                 .await
                 .map_err(|e| {
@@ -1709,6 +1750,11 @@ async fn chat_completions(
                     inflight_guard.mark_error(extract_error_type_from_response(&err_response));
                     err_response
                 })?;
+        if let Some(policy) = super::monitors::MonitorPolicy::global()
+            && let Some((monitor, value)) = policy.stop_message(&mut response)
+        {
+            tracing::warn!(request_id, %monitor, value, "monitor stop_threshold reached");
+        }
 
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
@@ -4412,6 +4458,7 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                monitor: None,
             },
             finish_reason: finish,
             logprobs: None,
@@ -4443,6 +4490,7 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4544,6 +4592,7 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4615,6 +4664,7 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4651,6 +4701,7 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4986,6 +5037,7 @@ mod tests {
                 role,
                 refusal: refusal.map(|s| s.to_string()),
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                monitor: None,
             },
             finish_reason: finish,
             logprobs: None,

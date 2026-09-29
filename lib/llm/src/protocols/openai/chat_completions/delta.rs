@@ -162,6 +162,7 @@ impl DeltaGenerator {
             },
             refusal: None,
             reasoning_content: None,
+            monitor: None,
         };
 
         let choice = dynamo_protocols::types::ChatChoiceStream {
@@ -301,6 +302,13 @@ impl crate::protocols::openai::DeltaGeneratorExt<NvCreateChatCompletionStreamRes
         // Create the streaming response.
         let index = delta.index.unwrap_or(0);
         let mut stream_response = self.create_choice(index, delta.text, finish_reason, logprobs);
+        if let Some(choice) = stream_response.inner.choices.first_mut() {
+            choice.delta.monitor = Some(dynamo_protocols::types::MonitorMeta {
+                monitor_events: delta.monitor_events,
+                monitor_error: delta.monitor_error,
+            })
+            .filter(|m| !m.is_empty());
+        }
 
         // Record finish for timing/ITL accounting even when timing is not returned to the client.
         // Kept at call site because it's a side effect on the tracker — not a gating decision.
@@ -473,7 +481,33 @@ mod tests {
             })),
             worker_trace_link: None,
             engine_data: None,
+            monitor_events: None,
+            monitor_error: None,
         }
+    }
+
+    #[test]
+    fn test_monitor_events_lifted_to_delta_and_omitted_when_none() {
+        let request = create_test_request();
+        let mut generator = request.response_generator("req-monitor".to_string());
+        let mut output = final_backend_output();
+        output.monitor_events = Some(std::collections::HashMap::from([(
+            "harm".to_string(),
+            0.91,
+        )]));
+        let response = generator.choice_from_postprocessor(output).unwrap();
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["choices"][0]["delta"]["monitor_events"],
+            serde_json::json!({"harm": 0.91})
+        );
+        assert!(wire["choices"][0]["delta"].get("monitor_error").is_none());
+
+        let response = generator
+            .choice_from_postprocessor(final_backend_output())
+            .unwrap();
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(wire["choices"][0]["delta"].get("monitor_events").is_none());
     }
 
     fn create_test_request_with_extra_fields(fields: Vec<String>) -> NvCreateChatCompletionRequest {
@@ -527,6 +561,8 @@ mod tests {
                 "disaggregated_kv_transfer_time_ms": 8.1,
                 "prefill_compute_time_ms": 45.6
             })),
+            monitor_events: None,
+            monitor_error: None,
         }
     }
 
@@ -732,6 +768,8 @@ mod tests {
             disaggregated_params: None,
             worker_trace_link: None,
             engine_data: None, // engine didn't provide any data
+            monitor_events: None,
+            monitor_error: None,
         };
 
         let response = generator

@@ -215,6 +215,7 @@ pub fn final_response_to_one_chunk_stream(
             function_call,
             refusal: ch.message.refusal.clone(),
             reasoning_content: ch.message.reasoning_content.clone(),
+            monitor: ch.message.monitor.clone(),
         };
 
         let choice = ChatChoiceStream {
@@ -275,6 +276,7 @@ mod tests {
                 function_call: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -315,6 +317,7 @@ mod tests {
                 function_call: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor: None,
             },
             finish_reason: Some(FinishReason::Stop),
             logprobs: None,
@@ -456,6 +459,7 @@ mod tests {
                                 function_call: None,
                                 refusal: None,
                                 reasoning_content: None,
+                                monitor: None,
                             },
                             finish_reason: None,
                             logprobs: None,
