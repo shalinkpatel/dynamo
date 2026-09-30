@@ -1054,7 +1054,9 @@ dependencies = [
  "dynamo-parsers 9.2.1",
  "dynamo-parsers-v2",
  "futures",
+ "serde_json",
  "tokio",
+ "tracing",
  "vllm-parser",
  "vllm-tokenizer",
 ]

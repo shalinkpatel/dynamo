@@ -77,3 +77,55 @@ handling of malformed input; this adapter does not add stricter validation.
 The serving layer still owns generation stops, prompt rendering, and finish
 reasons. This adds a selectable Rust parser, not a replacement of Baseten's Python
 Harmony processor or a claim of gpt-oss model-serving parity.
+
+## Kimi K3 argument streaming
+
+Select `baseten_kimi3_streaming` with the `dynamo` backend to emit native K3
+tool arguments chunk by chunk:
+
+```python
+parser = UnifiedParserStream("baseten_kimi3_streaming", tools=tools)
+events = parser.step(delta_text)
+```
+
+It accepts the same K3 XTML input as `kimi_k3`, including reasoning, response,
+call IDs, typed arguments, and raw JSON. Tool names appear at the call header;
+string values are JSON-escaped as they arrive, and typed JSON values also
+stream before their closing marker. Concatenate argument fragments by tool
+index. A fragment can contain an unfinished JSON string or value; `complete`
+becomes true when the call validates. Interpretation and execution of partial
+values belong to the consumer.
+
+The parser retains the original call buffer for validation and holds potential
+structural markers until it can distinguish them from literal data. Malformed
+or truncated input can fail after fragments have been emitted. Duplicate keys
+and invalid typed JSON that require rewriting prior output fail rather than
+revising committed fragments. Handle `ParserStreamError.events` explicitly.
+Guided JSON delegates to the ordinary upstream K3 parser and its configured policy.
+The existing `kimi_k3` selector keeps buffered-call behavior. This selector is
+available through the Rust/Python stream adapter; serving integration remains
+owned by the caller, as for the other unified families above.
+
+### Ownership and dependency upgrades
+
+`baseten_kimi3_streaming` is implemented locally in `src/kimi3/` and uses only
+upstream's public `UnifiedParser` and event contracts. It does not require a
+streaming constructor in frontend-crates or a permanently customized dependency
+revision. The existing frontend-crates dependency remains at its pre-streaming
+version/revision and can be upgraded independently.
+
+- `native.rs` contains the native K3 grammar extracted from frontend-crates
+  0.7.7 at revision `79b3c206fc7af040e64572f5a630d6348d05a5b5`, with source
+  provenance and Apache-2.0 attribution. Guided routing was excluded.
+- `streaming.rs` contains the local incremental argument projection, sharing
+  marker/header helpers with the native grammar.
+- `mod.rs` implements the public parser lifecycle and delegates guided JSON to
+  upstream. `tests.rs` retains native grammar regressions and streaming tests;
+  `tests/kimi3.rs` checks adapter-level guided parity and prefilled channels.
+
+When upgrading frontend-crates, review upstream K3 native changes against this
+snapshot, port applicable fixes deliberately, and run `cargo test -p
+baseten-parsers --locked`. Streaming parity compares valid native output against
+the current upstream parser across every UTF-8 split, while guided parity checks
+each chunk and error policy. This keeps the maintenance scope to K3; the rest
+of frontend-crates continues to come from the normal dependency.

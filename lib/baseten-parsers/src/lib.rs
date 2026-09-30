@@ -4,6 +4,7 @@
 //! Request-scoped lifecycle guards around the pinned upstream parser registries.
 
 mod harmony;
+mod kimi3;
 pub mod vllm;
 
 use anyhow::{Result, bail, ensure};
@@ -20,6 +21,7 @@ pub fn unified_parser_families() -> Vec<&'static str> {
     REGISTERED_UNIFIED_FAMILIES
         .iter()
         .chain(harmony::FAMILIES)
+        .chain(["baseten_kimi3_streaming"].iter())
         .copied()
         .collect()
 }
@@ -114,6 +116,8 @@ impl DynamoStream {
     pub fn new(family: &str, tools: &[Tool], init: UnifiedParserInit) -> Result<Self> {
         let parser: Box<dyn UnifiedParser> = if harmony::FAMILIES.contains(&family) {
             Box::new(harmony::HarmonyParser::new(tools)?)
+        } else if family == "baseten_kimi3_streaming" {
+            Box::new(kimi3::KimiK3Parser::new(tools))
         } else {
             upstream::create_unified_parser_for_family(family, tools)?
         };
