@@ -981,6 +981,12 @@ pub struct ChatCompletionResponseMessage {
     /// `null` invents one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Monitor values for this output; on a non-streaming message, the max per monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_events: Option<std::collections::HashMap<String, f64>>,
+    /// Reason monitoring failed for this output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_error: Option<String>,
 }
 
 /// Stream options with per-chunk usage reporting.
@@ -1129,6 +1135,12 @@ pub struct ChatCompletionStreamResponseDelta {
     /// Streaming reasoning content (DeepSeek-R1, QwQ models).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Monitor values for this output; on a non-streaming message, the max per monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_events: Option<std::collections::HashMap<String, f64>>,
+    /// Reason monitoring failed for this output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -1339,6 +1351,8 @@ mod tests {
             function_call: None,
             audio: None,
             reasoning_content: None,
+            monitor_events: None,
+            monitor_error: None,
         };
         let value = serde_json::to_value(message).unwrap();
         assert!(value.get("reasoning_content").is_none());
@@ -1663,6 +1677,8 @@ mod tests {
                     role: Some(Role::Assistant),
                     refusal: None,
                     reasoning_content: None,
+                    monitor_events: None,
+                    monitor_error: None,
                 },
                 finish_reason: None,
                 logprobs: None,
@@ -1735,6 +1751,8 @@ mod tests {
                     role: None,
                     refusal: None,
                     reasoning_content: None,
+                    monitor_events: None,
+                    monitor_error: None,
                 },
                 finish_reason: None,
                 logprobs: None,

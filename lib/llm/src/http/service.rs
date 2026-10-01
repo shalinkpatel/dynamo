@@ -30,6 +30,7 @@ pub mod error;
 pub mod health;
 pub mod health_b10;
 pub mod metrics;
+pub mod monitors;
 pub mod openapi_docs;
 pub mod realtime;
 pub mod service_v2;

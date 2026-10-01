@@ -402,6 +402,13 @@ pub mod llm {
         pub const DYN_AUDIT_JSONL_GZ_ROLL_LINES: &str = "DYN_AUDIT_JSONL_GZ_ROLL_LINES";
     }
 
+    /// Safety-probe monitors.
+    pub mod monitor {
+        /// Path to the monitoring TOML served at `GET /monitors`. Unset: no route.
+        /// Invalid: startup fails.
+        pub const DYN_MONITOR_CONFIG: &str = "DYN_MONITOR_CONFIG";
+    }
+
     /// Agent trace configuration
     pub mod agent_trace {
         /// Master switch. Truthy enables tracing with defaults for sinks,

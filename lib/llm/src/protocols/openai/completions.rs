@@ -459,6 +459,10 @@ impl OpenAIOutputOptionsProvider for NvCreateCompletionRequest {
 impl ValidateRequest for NvCreateCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
         validate_baseten_request_fields(&self.baseten_ext)?;
+        anyhow::ensure!(
+            self.baseten_ext.requested_monitors.is_none(),
+            "requested_monitors is only supported on /v1/chat/completions"
+        );
         validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
         validate::validate_model(&self.inner.model)?;
 

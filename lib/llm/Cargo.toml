@@ -57,6 +57,7 @@ harness = false
 required-features = ["agent-trace-bench"]
 
 [dependencies]
+toml = "0.8"
 baseten-configmap = { workspace = true }
 # repo
 dynamo-kv-router = { workspace = true, features = ["metrics", "runtime-protocols"] }

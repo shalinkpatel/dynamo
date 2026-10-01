@@ -65,6 +65,8 @@ impl ProtocolEnvelope for CcEnvelope {
             refusal: None,
             function_call: None,
             audio: None,
+            monitor_events: None,
+            monitor_error: None,
         };
         let body = CreateChatCompletionResponse {
             id: cc_id(created),
@@ -188,6 +190,8 @@ impl CcFraming {
             tool_calls: None,
             refusal: None,
             function_call: None,
+            monitor_events: None,
+            monitor_error: None,
         }
     }
 
@@ -201,6 +205,8 @@ impl CcFraming {
             tool_calls: None,
             refusal: None,
             function_call: None,
+            monitor_events: None,
+            monitor_error: None,
         }
     }
 

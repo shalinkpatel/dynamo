@@ -1335,6 +1335,8 @@ fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool
                 role: _,
                 refusal,
                 reasoning_content,
+                monitor_events,
+                monitor_error,
             } = &c.delta;
             // `Text("")` happens during multi-byte UTF-8 token assembly;
             // `Parts(vec![])` is a structurally empty multimodal payload.
@@ -1350,6 +1352,9 @@ fn is_empty_stream_response(resp: &NvCreateChatCompletionStreamResponse) -> bool
                 && tool_calls.is_none()
                 && refusal.is_none()
                 && reasoning_content.is_none()
+                // Event-only chunks (no text) must still reach the client.
+                && monitor_events.is_none()
+                && monitor_error.is_none()
         })
 }
 
@@ -4412,6 +4417,8 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason: finish,
             logprobs: None,
@@ -4443,6 +4450,8 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4544,6 +4553,8 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4615,6 +4626,8 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4651,6 +4664,8 @@ mod tests {
                 role: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason: None,
             logprobs: None,
@@ -4986,6 +5001,8 @@ mod tests {
                 role,
                 refusal: refusal.map(|s| s.to_string()),
                 reasoning_content: reasoning.map(|s| s.to_string()),
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason: finish,
             logprobs: None,
@@ -5221,6 +5238,14 @@ mod tests {
             !is_empty_stream_response(&resp),
             "Text(\"\") + logprobs must not be filtered",
         );
+
+        // Event-only monitor chunks carry no text but must reach the client.
+        let mut resp = make_delta(Some(""), None, None, None, None, None, None, None);
+        resp.inner.choices[0].delta.monitor_events = Some(Default::default());
+        assert!(!is_empty_stream_response(&resp), "monitor_events chunk");
+        let mut resp = make_delta(Some(""), None, None, None, None, None, None, None);
+        resp.inner.choices[0].delta.monitor_error = Some("timeout".to_string());
+        assert!(!is_empty_stream_response(&resp), "monitor_error chunk");
     }
 
     // ── completions empty-stream-response tests ──────────────────────

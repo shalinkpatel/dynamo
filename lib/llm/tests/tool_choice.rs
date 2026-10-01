@@ -490,6 +490,8 @@ fn make_text_chunk(
                     function_call: None,
                     refusal: None,
                     reasoning_content: None,
+                    monitor_events: None,
+                    monitor_error: None,
                 },
                 finish_reason: if finish {
                     Some(dynamo_protocols::types::FinishReason::Stop)

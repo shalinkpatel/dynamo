@@ -79,6 +79,11 @@ struct DeltaChoice {
     /// Optional reasoning content for the chat choice.
     reasoning_content: Option<String>,
 
+    /// Max value per monitor across chunks; `None` when no chunk was monitored.
+    monitor_events: Option<std::collections::HashMap<String, f64>>,
+    /// Last monitoring error seen.
+    monitor_error: Option<String>,
+
     /// Accumulated content parts for multimodal responses
     content_parts: Vec<dynamo_protocols::types::ChatCompletionResponseContentPart>,
 }
@@ -262,6 +267,8 @@ impl DeltaAggregator {
                                     tool_calls: None,
                                     reasoning_content: None,
                                     content_parts: Vec::new(),
+                                    monitor_events: None,
+                                    monitor_error: None,
                                 });
                         // Handle content based on type
                         if let Some(content) = &choice.delta.content {
@@ -280,6 +287,19 @@ impl DeltaAggregator {
                                 .reasoning_content
                                 .get_or_insert_with(String::new)
                                 .push_str(reasoning_content);
+                        }
+
+                        if let Some(events) = &choice.delta.monitor_events {
+                            let folded = state_choice
+                                .monitor_events
+                                .get_or_insert_with(Default::default);
+                            for (name, &value) in events {
+                                let max = folded.entry(name.clone()).or_insert(value);
+                                *max = max.max(value);
+                            }
+                        }
+                        if let Some(error) = &choice.delta.monitor_error {
+                            state_choice.monitor_error = Some(error.clone());
                         }
 
                         // #8640: streaming producers split a single tool call across
@@ -499,6 +519,8 @@ impl From<DeltaChoice> for dynamo_protocols::types::ChatChoice {
                 function_call: None,
                 audio: None,
                 reasoning_content: delta.reasoning_content,
+                monitor_events: delta.monitor_events,
+                monitor_error: delta.monitor_error,
             },
             index: delta.index,
             finish_reason,
@@ -599,6 +621,8 @@ mod tests {
             role,
             refusal: None,
             reasoning_content: None,
+            monitor_events: None,
+            monitor_error: None,
         };
         let logprobs = logprob.map(|lp| {
             let token = text.to_string();
@@ -661,6 +685,8 @@ mod tests {
             role,
             refusal: None,
             reasoning_content: None,
+            monitor_events: None,
+            monitor_error: None,
         };
         let choice = dynamo_protocols::types::ChatChoiceStream {
             index,
@@ -957,6 +983,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_monitor_events_max_fold_across_chunks() {
+        let chunk = |text: &str, events: Option<serde_json::Value>, error: Option<&str>| {
+            let mut delta = create_test_delta(
+                0,
+                text,
+                Some(dynamo_protocols::types::Role::Assistant),
+                None,
+                None,
+                None,
+            );
+            let d = &mut delta.data.as_mut().unwrap().inner.choices[0].delta;
+            d.monitor_events = events.map(|e| serde_json::from_value(e).unwrap());
+            d.monitor_error = error.map(str::to_string);
+            delta
+        };
+        let monitored = vec![
+            chunk("a", Some(serde_json::json!({"harm": 0.4})), Some("first")),
+            chunk(
+                "b",
+                Some(serde_json::json!({"harm": 0.9, "cyber": 0.2})),
+                None,
+            ),
+            chunk("c", Some(serde_json::json!({"harm": 0.5})), Some("last")),
+        ];
+        let response = DeltaAggregator::apply(stream::iter(monitored), ParsingOptions::default())
+            .await
+            .unwrap();
+        let message = &response.inner.choices[0].message;
+        let events = message.monitor_events.as_ref().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events["harm"], 0.9);
+        assert_eq!(events["cyber"], 0.2);
+        assert_eq!(message.monitor_error.as_deref(), Some("last"));
+
+        // Monitored but nothing fired: `{}` stays `{}`.
+        let quiet = vec![chunk("a", Some(serde_json::json!({})), None)];
+        let response = DeltaAggregator::apply(stream::iter(quiet), ParsingOptions::default())
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            wire["choices"][0]["message"]["monitor_events"],
+            serde_json::json!({})
+        );
+
+        let plain = vec![chunk("a", None, None), chunk("b", None, None)];
+        let response = DeltaAggregator::apply(stream::iter(plain), ParsingOptions::default())
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(&response).unwrap();
+        assert!(
+            wire["choices"][0]["message"]
+                .get("monitor_events")
+                .is_none()
+        );
+        assert!(wire["choices"][0]["message"].get("monitor_error").is_none());
+    }
+
+    #[tokio::test]
     async fn test_multiple_deltas_same_choice() {
         // Create multiple deltas with the same choice index
         // One will have a MessageRole and no FinishReason,
@@ -1137,6 +1222,8 @@ mod tests {
                             tool_calls: None,
                             refusal: None,
                             reasoning_content: None,
+                            monitor_events: None,
+                            monitor_error: None,
                         },
                         finish_reason: Some(dynamo_protocols::types::FinishReason::Stop),
                         logprobs: None,
@@ -1152,6 +1239,8 @@ mod tests {
                             tool_calls: None,
                             refusal: None,
                             reasoning_content: None,
+                            monitor_events: None,
+                            monitor_error: None,
                         },
                         finish_reason: Some(dynamo_protocols::types::FinishReason::Stop),
                         logprobs: None,
@@ -1778,6 +1867,8 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("Analyzing the question.".to_string()),
             content_parts: vec![],
+            monitor_events: None,
+            monitor_error: None,
         };
 
         let choice: dynamo_protocols::types::ChatChoice = delta.into();

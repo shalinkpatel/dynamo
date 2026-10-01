@@ -32,6 +32,8 @@ fn create_mock_response_chunk(
             function_call: None,
             refusal: None,
             reasoning_content,
+            monitor_events: None,
+            monitor_error: None,
         },
         finish_reason: None,
         logprobs: None,

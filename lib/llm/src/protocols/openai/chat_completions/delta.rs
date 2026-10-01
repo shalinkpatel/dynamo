@@ -162,6 +162,8 @@ impl DeltaGenerator {
             },
             refusal: None,
             reasoning_content: None,
+            monitor_events: None,
+            monitor_error: None,
         };
 
         let choice = dynamo_protocols::types::ChatChoiceStream {

@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Monitoring config for the `GET /monitors` tests: one on-request monitor with a
+# stop threshold (ignored by Rust) and one always-on monitor.
+
+[monitoring]
+version = 1
+
+[monitoring.monitors.sustained]
+return_when = "always"
+event_threshold = 0.5
+
+[monitoring.monitors.sustained.config]
+probe = "harm"
+on = "output"
+calibration = "linear"
+
+[monitoring.monitors.harm]
+return_when = "on_request"
+event_threshold = 0.5
+stop_threshold = 0.9
+
+[monitoring.monitors.harm.config]
+probe = "harm"
+on = "output"
+temperature = 1.0
+bias = 0.0
+calibration = "linear"
+repeat = "always"

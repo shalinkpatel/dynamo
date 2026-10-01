@@ -1407,6 +1407,8 @@ mod tests {
                 function_call: None,
                 refusal: None,
                 reasoning_content: None,
+                monitor_events: None,
+                monitor_error: None,
             },
             finish_reason,
             logprobs: None,

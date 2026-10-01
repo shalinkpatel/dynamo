@@ -963,6 +963,8 @@ mod tests {
                         role: Some(Role::Assistant),
                         refusal: None,
                         reasoning_content: None,
+                        monitor_events: None,
+                        monitor_error: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: Some(ChatChoiceLogprobs {
@@ -998,6 +1000,8 @@ mod tests {
                     role: Some(Role::Assistant),
                     refusal: None,
                     reasoning_content: None,
+                    monitor_events: None,
+                    monitor_error: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
                 logprobs: Some(ChatChoiceLogprobs {
@@ -1351,6 +1355,8 @@ mod tests {
                         role: Some(Role::Assistant),
                         refusal: None,
                         reasoning_content: None,
+                        monitor_events: None,
+                        monitor_error: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: None, // No logprobs

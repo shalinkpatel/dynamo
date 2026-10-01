@@ -622,6 +622,23 @@ impl OpenAIPreprocessor {
         Ok((preprocessed, annotations, prompt_injected_reasoning))
     }
 
+    /// Monitors are run by the Python chat processor, not this pipeline.
+    fn reject_requested_monitors<R: BasetenExtProvider>(request: &R) -> Result<()> {
+        if request
+            .baseten_ext()
+            .is_some_and(|ext| ext.requested_monitors.is_some())
+        {
+            // InvalidArgument is mapped to HTTP 400 by
+            // ErrorMessage::from_anyhow; a plain anyhow error would surface as 500.
+            return Err(DynamoError::builder()
+                .error_type(ErrorType::InvalidArgument)
+                .message("requested_monitors is only supported by the Python chat processor")
+                .build()
+                .into());
+        }
+        Ok(())
+    }
+
     pub fn builder<
         R: OAIChatLikeRequest
             + AnnotationsProvider
@@ -634,6 +651,7 @@ impl OpenAIPreprocessor {
         &self,
         request: &R,
     ) -> Result<PreprocessedRequestBuilder> {
+        Self::reject_requested_monitors(request)?;
         let mut builder = PreprocessedRequest::builder();
         builder.model(request.model());
         if let Some(mut config) = request
@@ -3081,6 +3099,32 @@ mod tests {
                 "FAILED: {desc}",
             );
         }
+    }
+
+    #[test]
+    fn test_rejects_requested_monitors() {
+        let request = |extra: serde_json::Value| -> NvCreateChatCompletionRequest {
+            let mut body = serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        OpenAIPreprocessor::reject_requested_monitors(&request(serde_json::json!({}))).unwrap();
+        let err = OpenAIPreprocessor::reject_requested_monitors(&request(
+            serde_json::json!({"requested_monitors": ["harm"]}),
+        ))
+        .unwrap_err();
+        // ErrorMessage::from_anyhow turns any InvalidArgument in the chain into HTTP 400.
+        let dynamo_err = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<DynamoError>())
+            .expect("error chain must contain a DynamoError");
+        assert_eq!(dynamo_err.error_type(), ErrorType::InvalidArgument);
+        assert!(dynamo_err.message().contains("Python chat processor"));
     }
 
     #[test]
