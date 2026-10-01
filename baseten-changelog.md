@@ -2679,6 +2679,10 @@ Baseten-specific; not upstreamable.
 every key into `unsupported_fields`). Nothing in lib/llm uses the crate yet
 (stack D6). Baseten-specific; not upstreamable.
 
+Test code sits in sibling `*_test.rs` files wired `#[cfg(test)] #[path =
+"..._test.rs"] mod tests;` (dynamo #967), the same split as tool-bank
+baseten #30180, so the two trees diff cleanly for harmonization.
+
 Egress conformance grafts over the shared crate's tool-bank framing (stack
 D5): status-aware public error framing (OpenAI/Anthropic `error.type` by HTTP
 status class — 429 rate_limit, 4xx invalid_request/authentication/permission/
