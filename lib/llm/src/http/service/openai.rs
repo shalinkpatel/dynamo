@@ -74,6 +74,7 @@ use crate::types::Annotated;
 use dynamo_protocols::types::ChatCompletionMessageContent;
 use dynamo_protocols::types::ChatCompletionStreamResponseDelta;
 use dynamo_protocols::types::Choice;
+use dynamo_protocols::types::responses::{CountInputTokensRequest, CountInputTokensResponse};
 use tracing::Instrument;
 
 const X_REQUEST_ID_HEADER: &str = "x-request-id";
@@ -1827,6 +1828,38 @@ pub fn validate_completion_fields_generic(
     })
 }
 
+/// OpenAI Responses input-token counting handler.
+///
+/// Handles `POST /v1/responses/input_tokens` and returns an estimated input
+/// token count using a len/3 heuristic. Like the Anthropic
+/// `/v1/messages/count_tokens` handler, this deliberately performs neither a
+/// readiness nor a model-serving check: clients routinely send routing names
+/// this frontend does not serve, and a pre-flight estimate does not need a
+/// live model. Backport of upstream ai-dynamo/dynamo#13768.
+async fn handler_responses_input_tokens(
+    State((_state, _template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
+    RawJson { bytes, .. }: RawJson,
+) -> Result<Response, ErrorResponse> {
+    let request = deserialize_body::<CountInputTokensRequest>(bytes).map_err(|err| {
+        tracing::info!(
+            status_code = StatusCode::BAD_REQUEST.as_u16(),
+            reason = "request_body_deserialization_failed",
+            message = %err,
+            unified_model_logs = true,
+            "rejecting OpenAI request during JSON deserialization"
+        );
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorMessage {
+                message: format!("Failed to deserialize the JSON body into the target type: {err}"),
+                error_type: map_error_code_to_error_type(StatusCode::BAD_REQUEST),
+                code: StatusCode::BAD_REQUEST.as_u16(),
+            }),
+        )
+    })?;
+    Ok(Json(CountInputTokensResponse::new(request.estimate_tokens())).into_response())
+}
+
 /// OpenAI Responses Request Handler
 ///
 /// This method will handle the incoming request for the /v1/responses endpoint.
@@ -2592,19 +2625,32 @@ async fn get_model_openai(
 
 /// Create an Axum [`Router`] for the OpenAI API Responses endpoint
 /// If not path is provided, the default path is `/v1/responses`
+/// Create an Axum [`Router`] for the OpenAI API Responses endpoints
+/// (`/v1/responses` and `/v1/responses/input_tokens`).
+/// If not path is provided, the default path is `/v1/responses`
 pub fn responses_router(
     state: Arc<service_v2::State>,
     template: Option<RequestTemplate>,
     path: Option<String>,
 ) -> (Vec<RouteDoc>, Router) {
     let path = path.unwrap_or("/v1/responses".to_string());
+    // Derive the subroute from the parent with any trailing slash trimmed.
+    // `DYN_HTTP_SVC_RESPONSES_PATH=/custom/` is a working configuration for the
+    // parent — axum matches `POST /custom/` — but naively appending would
+    // register `/custom//input_tokens`, and axum does not treat that as
+    // equivalent to the `/custom/input_tokens` a client would actually call.
+    // The parent is registered verbatim, so trimming here changes only the
+    // derived path and leaves existing configurations behaving as they do now.
+    let input_tokens_path = format!("{}/input_tokens", path.trim_end_matches('/'));
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
+    let input_tokens_doc = RouteDoc::new(axum::http::Method::POST, &input_tokens_path);
     let router = Router::new()
         .route(&path, post(handler_responses))
+        .route(&input_tokens_path, post(handler_responses_input_tokens))
         .layer(middleware::from_fn(smart_json_error_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state((state, template));
-    (vec![doc], router)
+    (vec![doc, input_tokens_doc], router)
 }
 
 async fn images(

@@ -1442,6 +1442,22 @@ position stays the render placement (GLM template), not a wire shape.
 Baseten-specific; matches vendor API fields upstream Dynamo does not model
 yet.
 
+Responses input-token counting: `POST /v1/responses/input_tokens` is a
+backport of upstream ai-dynamo/dynamo#13768 (`d3e7ce20a9`), which landed
+after the v1.2.0 cut and on no Baseten line, so Codex/LiteLLM pre-flight
+CountTokens calls 404'd on every Model APIs frontend (MOD2-270). The fork
+already carries the Anthropic twin (`/v1/messages/count_tokens`), so the
+shape matches: a len/3 pre-flight estimate, no readiness or model-serving
+check, no engine dispatch. Scoring mirrors `translate_input_items` in
+`b10-dynamo-api-translation`, which forces deliberate deviations from
+upstream's estimator on the fork-only item kinds: `reasoning` scores
+`content` AND `summary` (the fork's converter folds both), `agent_message`
+scores its plaintext assistant render, `additional_tools` scores as tool
+declarations, `mcp_call` scores call + tool result, `compaction` is Skip.
+Status: upstream-sync with Baseten-owned scoring arms; on the next rebase
+onto an upstream cut that includes #13768, keep the upstream handler/route
+and reconcile the estimator arms against the fork converter.
+
 Reasoning effort is carried, not judged. `B10ReasoningEffort` types the seven
 canonical levels (`B10_REASONING_EFFORT_LEVELS`: `none`, `minimal`, `low`,
 `medium`, `high`, `xhigh`, `max`) and carries every other value — an unknown

@@ -169,6 +169,64 @@ async fn aiperf_multimodal_pre_pr931_payload_does_not_get_400() {
     );
 }
 
+/// `POST /v1/responses/input_tokens` (backport of upstream
+/// ai-dynamo/dynamo#13768): pre-flight estimate, no engine involvement.
+/// Codex/LiteLLM poll this endpoint and log a 404 per call when it is absent.
+#[tokio::test]
+async fn responses_input_tokens_returns_estimate() {
+    let body = serde_json::json!({
+        "model": "test-model",
+        "instructions": "be terse",
+        "input": [
+            {"role": "user", "content": "Hello, world!"},
+            {"role": "assistant", "content": "Hi!"},
+            {"role": "user", "content": "How are you?"}
+        ]
+    });
+
+    let (port, token) = boot_service_with_model("test-model").await;
+    let client = client_no_proxy();
+    let resp = client
+        .post(format!("http://localhost:{port}/v1/responses/input_tokens"))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST /v1/responses/input_tokens");
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    token.cancel();
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "input_tokens must answer 200, got {status}: {text}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&text).expect("input_tokens JSON body");
+    assert_eq!(body["object"], "response.input_tokens");
+    assert!(
+        body["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "expected a non-zero estimate: {text}"
+    );
+}
+
+#[tokio::test]
+async fn responses_input_tokens_rejects_malformed_body() {
+    let (port, token) = boot_service_with_model("test-model").await;
+    let client = client_no_proxy();
+    let resp = client
+        .post(format!("http://localhost:{port}/v1/responses/input_tokens"))
+        .body("not json")
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .expect("POST /v1/responses/input_tokens");
+
+    let status = resp.status();
+    token.cancel();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn aiperf_multimodal_with_type_message_still_works() {
     // Post-PR-931 shape — `type: "message"` present on every item. This
