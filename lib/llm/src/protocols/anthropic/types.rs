@@ -633,6 +633,7 @@ mod tests {
                 })),
                 cache_control: None,
                 defer_loading: None,
+                strict: None,
             }]),
             tool_choice: Some(AnthropicToolChoice::Simple(AnthropicToolChoiceSimple {
                 choice_type: AnthropicToolChoiceMode::Auto,
@@ -687,6 +688,7 @@ mod tests {
                 input_schema: None,
                 cache_control: None,
                 defer_loading: None,
+                strict: None,
             }]),
             tool_choice: Some(AnthropicToolChoice::Simple(AnthropicToolChoiceSimple {
                 choice_type: AnthropicToolChoiceMode::Any,
@@ -734,6 +736,7 @@ mod tests {
                     input_schema: None,
                     cache_control: None,
                     defer_loading: None,
+                    strict: None,
                 },
                 AnthropicTool {
                     name: "get_weather".into(),
@@ -742,6 +745,7 @@ mod tests {
                     input_schema: Some(serde_json::json!({"type": "object"})),
                     cache_control: None,
                     defer_loading: None,
+                    strict: None,
                 },
             ]),
             tool_choice: Some(AnthropicToolChoice::Named(AnthropicToolChoiceNamed {

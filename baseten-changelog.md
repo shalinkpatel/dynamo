@@ -1855,6 +1855,9 @@ or smoke-test the router and OpenAI service examples.
 
 ## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
 
+`/v1/messages` client tools carry Anthropic `strict` to the Chat Completions tool, as
+Responses already did, so strict tool arguments reach the serving grammar.
+
 Encoder `mm_kwargs` stay in Rust as `MediaEmbedding` handles; worker requests take
 their bytes by move, so embeddings no longer cross into Python and back as copies.
 

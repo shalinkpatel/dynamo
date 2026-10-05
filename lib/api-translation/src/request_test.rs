@@ -1438,6 +1438,20 @@ fn adapt_responses_client_tool_strict_flag_is_forwarded() {
 }
 
 #[test]
+fn b10_adapt_messages_client_tool_strict_flag_is_forwarded() {
+    for (strict, expected) in [(json!(true), Some(true)), (json!(false), Some(false))] {
+        let cc_tools = client_function_tool(json!({
+            "name": "f", "strict": strict, "input_schema": {"type": "object"},
+        }))
+        .unwrap();
+        assert_eq!(cc_tools[0].function.strict, expected);
+    }
+    let cc_tools =
+        client_function_tool(json!({"name": "f", "input_schema": {"type": "object"}})).unwrap();
+    assert_eq!(cc_tools[0].function.strict, None);
+}
+
+#[test]
 fn adapt_responses_client_function_tool_and_server_selection() {
     let body = serde_json::to_vec(&json!({
         "model": "m",

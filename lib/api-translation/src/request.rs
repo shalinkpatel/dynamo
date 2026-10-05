@@ -1035,11 +1035,13 @@ fn client_function_tool(tool_entry: Value) -> Result<Vec<ChatCompletionTool>, Re
             client_tool.name
         )));
     };
-    Ok(vec![function_tool(
+    let mut cc_tool = function_tool(
         &client_tool.name,
         client_tool.description.as_deref().unwrap_or_default(),
         input_schema,
-    )])
+    );
+    cc_tool.function.strict = client_tool.strict;
+    Ok(vec![cc_tool])
 }
 
 /// Anthropic `tool_choice` -> CC. `any`->`required`, `tool`->a named function choice; `auto`/`none`

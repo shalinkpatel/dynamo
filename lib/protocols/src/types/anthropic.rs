@@ -773,6 +773,9 @@ pub struct AnthropicTool {
     /// Modeled so it survives conversion instead of being silently dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defer_loading: Option<bool>,
+    /// Anthropic strict tool use: arguments must conform to `input_schema`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Tool choice specification.
