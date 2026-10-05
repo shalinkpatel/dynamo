@@ -1102,6 +1102,7 @@ fn deserialize_chat_tools<'de, D: serde::Deserializer<'de>>(
                                 parameters: parameters.or(input_schema),
                                 strict,
                             },
+                            defer_loading: None,
                         })
                     }
                 })
