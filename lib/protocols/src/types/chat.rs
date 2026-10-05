@@ -896,8 +896,31 @@ pub struct ChatCompletionRequestAssistantMessage {
 impl<'de> Deserialize<'de> for ChatCompletionRequestAssistantMessage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum TypedPart {
+            Text(ChatCompletionRequestMessageContentPartText),
+            Refusal(ChatCompletionRequestMessageContentPartRefusal),
+            Thinking { thinking: String },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Part {
+            Typed(TypedPart),
+            // Reject unknown tags instead of treating them as untyped text.
+            UntypedText { text: String },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Content {
+            Text(String),
+            Parts(Vec<Part>),
+        }
+
+        #[derive(Deserialize)]
         struct Input {
-            content: Option<ChatCompletionRequestAssistantMessageContent>,
+            content: Option<Content>,
             reasoning_content: Option<ReasoningContent>,
             reasoning: Option<ReasoningContent>,
             refusal: Option<String>,
@@ -909,12 +932,45 @@ impl<'de> Deserialize<'de> for ChatCompletionRequestAssistantMessage {
         }
 
         let input = Input::deserialize(deserializer)?;
+        let mut thoughts = Vec::new();
+        let content = match input.content {
+            None => None,
+            Some(Content::Text(text)) => {
+                Some(ChatCompletionRequestAssistantMessageContent::Text(text))
+            }
+            Some(Content::Parts(parts)) => {
+                let mut kept = Vec::with_capacity(parts.len());
+                for part in parts {
+                    match part {
+                        Part::Typed(TypedPart::Text(text)) => {
+                            kept.push(ChatCompletionRequestAssistantMessageContentPart::Text(text))
+                        }
+                        Part::Typed(TypedPart::Refusal(refusal)) => kept.push(
+                            ChatCompletionRequestAssistantMessageContentPart::Refusal(refusal),
+                        ),
+                        Part::Typed(TypedPart::Thinking { thinking }) => thoughts.push(thinking),
+                        Part::UntypedText { text } => {
+                            kept.push(ChatCompletionRequestAssistantMessageContentPart::Text(
+                                ChatCompletionRequestMessageContentPartText { text },
+                            ))
+                        }
+                    }
+                }
+                if kept.is_empty() && !thoughts.is_empty() {
+                    None
+                } else {
+                    Some(ChatCompletionRequestAssistantMessageContent::Array(kept))
+                }
+            }
+        };
         #[allow(deprecated)]
         Ok(Self {
-            content: input.content,
+            content,
             // A missing/null canonical value falls back; an empty string still wins.
             // Both fields are validated, even when the alias is not selected.
-            reasoning_content: input.reasoning_content.or(input.reasoning),
+            reasoning_content: input.reasoning_content.or(input.reasoning).or_else(|| {
+                (!thoughts.is_empty()).then(|| ReasoningContent::Text(thoughts.join("\n")))
+            }),
             refusal: input.refusal,
             name: input.name,
             audio: input.audio,
@@ -996,6 +1052,64 @@ pub struct ChatCompletionStreamOptions {
     pub continuous_usage_stats: bool,
 }
 
+// Flat and bare function tools are accepted by deployed GLM clients.
+fn deserialize_chat_tools<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<ChatCompletionTool>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged, deny_unknown_fields)]
+    enum Tool {
+        Nested(ChatCompletionTool),
+        Flat {
+            #[serde(default)]
+            r#type: ChatCompletionToolType,
+            name: String,
+            description: Option<String>,
+            parameters: Option<serde_json::Value>,
+            input_schema: Option<serde_json::Value>,
+            strict: Option<bool>,
+        },
+    }
+
+    let tools: Option<Vec<Tool>> = Option::deserialize(deserializer)?;
+    tools
+        .map(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| match tool {
+                    Tool::Nested(tool) => Ok(tool),
+                    Tool::Flat {
+                        r#type,
+                        name,
+                        description,
+                        parameters,
+                        input_schema,
+                        strict,
+                    } => {
+                        if parameters.is_some()
+                            && input_schema.is_some()
+                            && parameters != input_schema
+                        {
+                            return Err(serde::de::Error::custom(
+                                "tool parameters conflicts with input_schema",
+                            ));
+                        }
+                        Ok(ChatCompletionTool {
+                            r#type,
+                            function: FunctionObject {
+                                name,
+                                description,
+                                parameters: parameters.or(input_schema),
+                                strict,
+                            },
+                        })
+                    }
+                })
+                .collect()
+        })
+        .transpose()
+}
+
 /// Chat completion request with multimodal processor support.
 ///
 /// Extends upstream `CreateChatCompletionRequest` with:
@@ -1059,7 +1173,11 @@ pub struct CreateChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_chat_tools",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tools: Option<Vec<ChatCompletionTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ChatCompletionToolChoiceOption>,
@@ -1173,6 +1291,111 @@ pub struct CreateChatCompletionStreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployed_chat_shapes_normalize_without_weakening_validation() {
+        use serde_json::json;
+        let parse = |message, tools| {
+            serde_json::from_value::<CreateChatCompletionRequest>(json!({
+                "model": "m", "messages": [message], "tools": tools
+            }))
+        };
+        let user = json!({"role":"user","content":"hi"});
+        let nested =
+            json!({"type":"function","function":{"name":"weather","parameters":{"type":"object"}}});
+        let expected = parse(user.clone(), json!([nested.clone()])).unwrap();
+        for tool in [
+            json!({"type":"function","name":"weather","parameters":{"type":"object"}}),
+            json!({"name":"weather","input_schema":{"type":"object"}}),
+        ] {
+            assert_eq!(parse(user.clone(), json!([tool])).unwrap(), expected);
+        }
+        let parts = json!([
+            {"type":"thinking","thinking":"first"},
+            {"type":"thinking","thinking":"second"},
+            {"text":"hello"}
+        ]);
+        let actual = parse(json!({"role":"assistant","content":parts}), json!([nested])).unwrap();
+        let expected = parse(json!({"role":"assistant","content":[{"type":"text","text":"hello"}],"reasoning_content":"first\nsecond"}), serde_json::to_value(&actual.tools).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        for (extra, expected) in [
+            (json!({"reasoning_content":"explicit"}), "explicit"),
+            (json!({"reasoning":"alias"}), "alias"),
+            (json!({"reasoning_content":""}), ""),
+        ] {
+            let mut message =
+                json!({"role":"assistant","content":[{"type":"thinking","thinking":"part"}]});
+            message
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let request = parse(message, serde_json::Value::Null).unwrap();
+            let ChatCompletionRequestMessage::Assistant(assistant) = &request.messages[0] else {
+                panic!()
+            };
+            assert_eq!(
+                assistant.reasoning_content,
+                Some(ReasoningContent::Text(expected.into()))
+            );
+            assert!(assistant.content.is_none());
+        }
+        for tool in [
+            json!({"name":42}),
+            json!({"parameters":{}}),
+            json!({"type":"custom","name":"weather"}),
+            json!({"name":"weather","parameters":{},"input_schema":{"type":"object"}}),
+            json!({"type":"function","function":null,"name":"weather"}),
+        ] {
+            assert!(parse(user.clone(), json!([tool])).is_err(), "{tool}");
+        }
+        for content in [
+            json!(null),
+            json!(""),
+            json!([]),
+            json!([{"type":"refusal","refusal":"no"}]),
+        ] {
+            let request = parse(
+                json!({"role":"assistant","content":content}),
+                serde_json::Value::Null,
+            )
+            .unwrap();
+            let serialized = serde_json::to_value(&request.messages[0]).unwrap();
+            assert_eq!(
+                serialized
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                content
+            );
+        }
+        let function = json!({"name":"weather","description":"lookup","parameters":{"type":"object"},"strict":true});
+        let nested = json!({"type":"function","function":function});
+        assert_eq!(
+            parse(user.clone(), json!([function])).unwrap(),
+            parse(user.clone(), json!([nested])).unwrap()
+        );
+
+        for part in [
+            json!({"type":"thinking","thinking":42}),
+            json!({"type":"tool_use","name":"weather","input":{}}),
+            json!({"type":"unknown","text":"must not disappear"}),
+            json!({"type":null,"text":"invalid type"}),
+            json!({"text":42}),
+            json!(false),
+            json!(["hello"]),
+            json!({"text":"hello","unknown":"not an untyped text part"}),
+            json!({"type":"thinking","text":"not the required thinking field"}),
+        ] {
+            assert!(
+                parse(
+                    json!({"role":"assistant","content":[part]}),
+                    serde_json::Value::Null
+                )
+                .is_err(),
+                "{part}"
+            );
+        }
+    }
 
     #[test]
     fn assistant_replay_accepts_both_reasoning_keys_with_canonical_precedence() {

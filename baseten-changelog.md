@@ -1495,6 +1495,8 @@ keep the parser aligned with a prompt it never renders. Anthropic dialect-shape
 checks are unchanged (budget < `max_tokens`, budget only with
 `type: enabled`, unknown `type` refused).
 
+Chat requests also normalize deployed GLM flat/bare function tools (including `input_schema`) and assistant thinking/text content arrays. Explicit reasoning fields retain precedence. Unsupported content blocks and malformed function tools remain errors; conflicting schema aliases are rejected. This is a narrowed port of e709a8329e, which otherwise silently discarded unsupported assistant blocks.
+
 The request-side assistant message reads `reasoning` and `reasoning_content` separately so replaying both keys does not cause a serde alias collision (MP-1661). A non-null canonical value wins; otherwise the alias fills in. Reasoning may also be an object with string `text`, or an array of such objects, normalized to one flat string (MP-1671). Existing string arrays retain their tool-call-aligned segment representation. No message-wide duplicate-key normalization, summary fallback, mixed arrays, or silent dropping of text-less blocks is added. Serialization still emits only `reasoning_content`. These are fork protocol extensions; keep until the upstream wire types support the same replay contract.
 
 Messages egress preserves the caller's `stop_sequences` in request context and
