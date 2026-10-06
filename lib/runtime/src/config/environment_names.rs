@@ -198,6 +198,12 @@ pub mod etcd {
 
 /// Key-Value Block Manager (KVBM) environment variables
 pub mod kvbm {
+
+    /// Allow direct serving-worker G2-to-G2 onboarding to use cache owners in another row.
+    pub const DYN_KVBM_G2PB_ALLOW_CROSS_ROW: &str = "DYN_KVBM_G2PB_ALLOW_CROSS_ROW";
+
+    /// Stable identity shared by all tensor-parallel ranks in one G2 replica.
+    pub const DYN_KVBM_G2PB_REPLICA_ID: &str = "DYN_KVBM_G2PB_REPLICA_ID";
     /// Enable KVBM metrics endpoint
     pub const DYN_KVBM_METRICS: &str = "DYN_KVBM_METRICS";
 

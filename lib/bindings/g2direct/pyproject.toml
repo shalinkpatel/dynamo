@@ -1,0 +1,24 @@
+[project]
+name = "g2direct"
+version = "1.2.0"
+description = "Direct peer transport for engine-owned host KV caches"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["nixl==1.4.0"]
+
+[project.optional-dependencies]
+cu12 = ["nixl[cu12]==1.4.0"]
+cu13 = ["nixl[cu13]==1.4.0"]
+
+[tool.maturin]
+module-name = "g2direct._core"
+manifest-path = "Cargo.toml"
+features = ["python-extension"]
+python-packages = ["g2direct"]
+python-source = "python"
+skip-auditwheel = true
+
+[build-system]
+requires = ["maturin>=1.0,<2.0", "patchelf"]
+build-backend = "maturin"

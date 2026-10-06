@@ -624,7 +624,7 @@ impl Client {
 
         let discovery = drt.discovery();
         let discovery_query = crate::discovery::DiscoveryQuery::Endpoint {
-            namespace: endpoint.component.namespace.name.clone(),
+            namespace: endpoint.component.namespace.name(),
             component: endpoint.component.name.clone(),
             endpoint: endpoint.name.clone(),
         };
@@ -1227,6 +1227,30 @@ mod tests {
 
         assert_eq!(state.load(worker_id), 0);
 
+        rt.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_nested_namespace_endpoint_discovery() {
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let parent = drt.namespace("test_nested_discovery").unwrap();
+        let child = parent.namespace("child").unwrap();
+        let endpoint = child
+            .component("test_component")
+            .unwrap()
+            .endpoint("test_endpoint");
+
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), client.wait_for_instances())
+            .await
+            .expect("nested namespace endpoint was not discovered")
+            .unwrap();
+
+        assert_eq!(client.instance_ids_avail().len(), 1);
         rt.shutdown();
     }
 }

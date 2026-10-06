@@ -2630,6 +2630,42 @@ the default. Preserve the external-hash-to-canonical-sequence mapping: KVBM's
 published hash is the bridge to authoritative engine metadata and must not be
 used as the tracker's token-derived internal key.
 
+## PATCH-022: G2Direct HiCache peer KV transport and Python wheel
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: feat(g2direct): standalone G2Direct HiCache transport and Python wheel
+- Split from the G2PB branch (`mf/g2pb-main-v1.2.0`, #387), including the
+  resiliency fixes from #958.
+
+Purpose:
+
+`lib/g2direct` and `lib/bindings/g2direct` (the `g2direct` wheel) let SGLang
+HiCache replicas read each other's host-tier KV pages over RDMA (NIXL/UCX)
+instead of recomputing them. A per-replica index is fed by NATS replica events.
+Source-page leases pin pages while they are read, and the destination verifies
+the checksum of every page. Reads that are still in flight at the fetch
+deadline go to a reaper, and the engine holds their pages until a settlement
+ticket reports them done. Peers that discovery no longer lists are skipped, and
+index publishing is advisory. The SGLang adapter, the deferred host release
+patch, and MLA host dedup live in the monorepo.
+
+Shared pieces outside the crates: `dynamo-memory` registration chunking
+(`registration_chunk_bytes` / `registration_chunks`), the
+`DYN_KVBM_G2PB_REPLICA_ID` / `DYN_KVBM_G2PB_ALLOW_CROSS_ROW` names in
+`dynamo-runtime`, endpoint discovery in nested namespaces, and a wheel-builder
+loop that always builds `g2direct` and builds `kvbm` only with `ENABLE_KVBM`.
+
+Replay notes:
+
+The crate depends only on `dynamo-runtime`, `dynamo-memory`, and
+`dynamo-tokens`, not on `dynamo-llm` or KVBM. The KVBM G2-to-G2 onboarding path
+in #387 depends on this crate, so replay this patch first. Nested-namespace
+discovery is required at runtime: the serving-G2 endpoints live under
+`<model>.kvbm-serving-g2`.
+
 ## GWP Control Plane (global-routing)
 
 Status: `keep` — Baseten-specific control plane; not upstream.

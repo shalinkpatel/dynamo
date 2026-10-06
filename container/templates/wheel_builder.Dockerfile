@@ -693,11 +693,13 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     mkdir -p ${CARGO_TARGET_DIR} && \
     echo "cargo target cache: $(find ${CARGO_TARGET_DIR} -name '*.rlib' -o -name '*.rmeta' 2>/dev/null | wc -l) artifacts" && \
     source ${VIRTUAL_ENV}/bin/activate && \
-    if [ "$ENABLE_KVBM" = "true" ]; then \
-        cd /opt/dynamo/lib/bindings/kvbm && \
-        KVBM_FEATURES=""; \
-        if [ "$DEVICE" = "cuda" ]; then KVBM_FEATURES="--features nccl"; fi && \
-        maturin build --release ${KVBM_FEATURES} --out target/wheels && \
+    BINDING_PACKAGES="g2direct" && \
+    if [ "$ENABLE_KVBM" = "true" ]; then BINDING_PACKAGES="$BINDING_PACKAGES kvbm"; fi && \
+    for BINDING_PACKAGE in $BINDING_PACKAGES; do \
+        cd /opt/dynamo/lib/bindings/$BINDING_PACKAGE && \
+        BINDING_FEATURES="" && \
+        if [ "$BINDING_PACKAGE" = "kvbm" ] && [ "$DEVICE" = "cuda" ]; then BINDING_FEATURES="--features nccl"; fi && \
+        maturin build --release ${BINDING_FEATURES} --out target/wheels && \
         if [ "$DEVICE" = "cuda" ]; then \
             auditwheel repair \
                 --exclude libnixl.so \
@@ -709,9 +711,9 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
                 target/wheels/*.whl; \
         elif [ "$DEVICE" = "xpu" ] || [ "$DEVICE" = "cpu" ]; then \
             cp target/wheels/*.whl /opt/dynamo/dist/; \
-        fi; \
-    fi && \
-    /tmp/use-sccache.sh show-stats "Dynamo KVBM"
+        fi || exit 1; \
+    done && \
+    /tmp/use-sccache.sh show-stats "Dynamo G2Direct/KVBM"
 {% endif %}
 
 # Consolidate all wheels from the runtime wheel builder stage

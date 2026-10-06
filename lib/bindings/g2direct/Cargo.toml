@@ -1,0 +1,20 @@
+[package]
+name = "g2direct-py3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Python bindings for direct peer transport of engine-owned host KV caches"
+
+[lib]
+name = "g2direct_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python-extension = ["pyo3/extension-module"]
+
+[dependencies]
+dynamo-g2direct = { workspace = true }
+dynamo-runtime = { workspace = true }
+pyo3 = { version = "0.23.4", default-features = false, features = ["macros", "abi3-py310"] }
+tokio = { workspace = true }

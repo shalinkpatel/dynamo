@@ -394,6 +394,48 @@ impl NumaWorkerPool {
     }
 }
 
+/// Target size for one *registration* chunk, shared by the CUDA and RDMA paths.
+///
+/// Registering a TB-scale pool in one call holds the process `mmap_lock` for
+/// minutes inside `get_user_pages`. kubelet and containerd read
+/// `/proc/<pid>/maps` and `smaps` to collect container stats, block on that lock
+/// in uninterruptible sleep, and the node stops sending heartbeats -- which is
+/// how a healthy pod takes its node NotReady. Chunking releases the lock between
+/// chunks. Measured: g2direct lost a node on 3 of 3 deployments registering
+/// ~636 GiB/node in two calls per rank, and never at ~372 GiB/node.
+pub const REGISTRATION_CHUNK_TARGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// The largest multiple of `block_stride` that fits the 1 GiB target.
+///
+/// Only the stride alignment is load-bearing: an RDMA descriptor that spans two
+/// memory registrations fails, so no HiCache page or Mamba segment may straddle
+/// a chunk boundary. `ibv_reg_mr` itself takes a byte address and length with
+/// no alignment requirement (two MRs may share a host page). A stride of 0 or 1
+/// means "no block structure" and yields the plain target.
+pub fn registration_chunk_bytes(block_stride: usize) -> usize {
+    if block_stride <= 1 {
+        return REGISTRATION_CHUNK_TARGET_BYTES;
+    }
+    if block_stride >= REGISTRATION_CHUNK_TARGET_BYTES {
+        // A single stride already exceeds the target: one stride is the floor,
+        // because splitting it is what the alignment exists to prevent.
+        block_stride
+    } else {
+        (REGISTRATION_CHUNK_TARGET_BYTES / block_stride) * block_stride
+    }
+}
+
+/// The `(offset, len)` grid that registration and unregistration both walk.
+pub fn registration_chunks(
+    size: usize,
+    chunk_bytes: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    let step = chunk_bytes.max(1);
+    (0..size)
+        .step_by(step)
+        .map(move |offset| (offset, step.min(size - offset)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
