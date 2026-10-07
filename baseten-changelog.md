@@ -2028,6 +2028,19 @@ Validation:
 Test payloads near and above the expected TCP limit, warning-flag behavior, and
 failure modes for oversized payloads.
 
+SSE keep-alive: `DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS` is a backport of
+upstream ai-dynamo/dynamo#12453 (`00ceeec51a`), which landed after the v1.2.0
+cut. On this line `State::sse_keep_alive()` was a hardcoded `None` (`// TODO`),
+so a streaming response sent no bytes between its headers and the first token.
+Long uncached prefill (GLM-5.3: 0.43% of requests waited 60s or more for a first token in the
+week to 2026-10-04) therefore let idle-timeout proxies and clients close
+streams empty (MOD2-224, Opendoor via Claude Code). Same env name and parsing
+as upstream, with two fork deviations: unset defaults to 15000 ms (upstream
+leaves it off; `0` disables), and the interval is set on `State` after
+`State::new` because the fork has no `StateConfig`.
+Status: mixed; on the next rebase onto an upstream cut that includes #12453,
+take upstream and keep only the 15s default (`DEFAULT_SSE_KEEP_ALIVE`).
+
 ## PATCH-010: Logging Policy and Production Signal Cleanup
 
 Status: `keep`

@@ -323,6 +323,11 @@ pub mod llm {
     pub const DYN_ENABLE_STREAMING_REASONING_DISPATCH: &str =
         "DYN_ENABLE_STREAMING_REASONING_DISPATCH";
 
+    /// Emit an SSE comment at this interval while a streaming response has no
+    /// data. Unset defaults to 15000 (Baseten fork). `0`, invalid, or
+    /// unrepresentable values disable SSE comments.
+    pub const DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS: &str = "DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS";
+
     /// Backend stream inactivity timeout in seconds.
     ///
     /// When set to a positive integer, the frontend will kill the engine context
@@ -679,6 +684,7 @@ mod tests {
             llm::DYN_WAYPOINTS_PORT,
             llm::DYN_WAYPOINTS_DISABLE,
             llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
+            llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
             llm::DYN_CLIENT_DISCONNECT_BEHAVIOR,
             llm::DYN_LORA_ENABLED,
             llm::DYN_LORA_PATH,

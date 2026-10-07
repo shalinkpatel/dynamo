@@ -24,6 +24,7 @@ The Rust HTTP server also reads these environment variables (not exposed as CLI 
 |---------|---------|-------------|
 | `DYN_HTTP_BODY_LIMIT_MB` | `192` | Maximum request body size in MB |
 | `DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | `5` | Graceful shutdown timeout in seconds |
+| `DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS` | `15000` | Interval in milliseconds between SSE comment frames while a streaming response has no data. `0`, invalid, or unrepresentable values disable keep-alive comments |
 
 ## Router
 

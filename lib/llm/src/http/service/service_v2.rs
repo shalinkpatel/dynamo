@@ -61,6 +61,57 @@ pub struct State {
     discovery_client: Arc<dyn Discovery>,
     flags: StateFlags,
     cancel_token: CancellationToken,
+    sse_keep_alive: Option<Duration>,
+}
+
+/// Baseten fork: keep-alive is on by default (upstream #12453 leaves it off) so
+/// long prefill does not leave a stream silent until idle-timeout proxies drop it.
+/// 15s matches tool-bank's SSE heartbeat; set the env var to `0` to disable.
+const DEFAULT_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+fn parse_sse_keep_alive(value: Result<String, std::env::VarError>) -> Option<Duration> {
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Some(DEFAULT_SSE_KEEP_ALIVE),
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                env = env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+                %error,
+                "ignoring invalid SSE keep-alive interval"
+            );
+            return None;
+        }
+    };
+
+    match value.parse::<u64>() {
+        Ok(0) => None,
+        Ok(milliseconds) => {
+            let interval = Duration::from_millis(milliseconds);
+            if std::time::Instant::now().checked_add(interval).is_some() {
+                Some(interval)
+            } else {
+                tracing::warn!(
+                    env = env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+                    value,
+                    "ignoring SSE keep-alive interval outside the platform range"
+                );
+                None
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                env = env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+                value,
+                %error,
+                "ignoring invalid SSE keep-alive interval"
+            );
+            None
+        }
+    }
+}
+
+fn sse_keep_alive_from_env() -> Option<Duration> {
+    parse_sse_keep_alive(std::env::var(env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS))
 }
 
 #[derive(Default, Debug)]
@@ -148,6 +199,7 @@ impl State {
                 anthropic_endpoints_enabled: AtomicBool::new(false),
             },
             cancel_token,
+            sse_keep_alive: None,
         }
     }
 
@@ -178,9 +230,12 @@ impl State {
         &self.cancel_token
     }
 
-    // TODO
+    /// Interval for SSE comment frames while the response stream is idle.
+    ///
+    /// Defaults to 15s on this fork. Set `DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS=0`
+    /// for clients that do not ignore SSE comments.
     pub fn sse_keep_alive(&self) -> Option<Duration> {
-        None
+        self.sse_keep_alive
     }
 
     /// Returns true if streaming tool call dispatch is enabled via
@@ -272,6 +327,11 @@ pub struct HttpServiceConfig {
     /// are registered using discovery.instance_id() and exposed on /metrics.
     #[builder(default = "None")]
     drt_discovery: Option<Arc<dyn Discovery>>,
+
+    /// Interval for SSE comment frames while a streaming response is idle.
+    /// Defaults to `DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS` when not set explicitly.
+    #[builder(setter(strip_option), default = "sse_keep_alive_from_env()")]
+    sse_keep_alive: Option<Duration>,
 }
 
 impl HttpService {
@@ -530,7 +590,9 @@ impl HttpServiceConfigBuilder {
                 cancel_token.child_token(),
             )) as Arc<dyn Discovery>
         });
-        let state = Arc::new(State::new(model_manager, discovery_client, cancel_token));
+        let mut state = State::new(model_manager, discovery_client, cancel_token);
+        state.sse_keep_alive = config.sse_keep_alive;
+        let state = Arc::new(state);
         state
             .flags
             .set(&EndpointType::Chat, config.enable_chat_endpoints);
@@ -762,6 +824,39 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn test_sse_keep_alive_env_var() {
+        assert_eq!(
+            parse_sse_keep_alive(Err(std::env::VarError::NotPresent)),
+            Some(DEFAULT_SSE_KEEP_ALIVE)
+        );
+        assert_eq!(parse_sse_keep_alive(Ok("0".to_string())), None);
+        assert_eq!(
+            parse_sse_keep_alive(Ok("5000".to_string())),
+            Some(Duration::from_millis(5000))
+        );
+        assert_eq!(parse_sse_keep_alive(Ok("invalid".to_string())), None);
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            assert_eq!(
+                parse_sse_keep_alive(Err(std::env::VarError::NotUnicode(OsString::from_vec(
+                    vec![0xff]
+                ),))),
+                None
+            );
+        }
+
+        let interval = Duration::from_millis(u64::MAX);
+        let expected = std::time::Instant::now()
+            .checked_add(interval)
+            .map(|_| interval);
+        assert_eq!(parse_sse_keep_alive(Ok(u64::MAX.to_string())), expected);
+    }
 
     #[test]
     fn waypoints_listener_requires_a_supported_endpoint() {
