@@ -1370,7 +1370,7 @@ mod tests {
                 assert_eq!(tool.tool_call_id, "t1");
                 match &tool.content {
                     ChatCompletionRequestToolMessageContent::Text(text) => {
-                        assert_eq!(text, "line 1line 2");
+                        assert_eq!(text, "line 1\nline 2");
                     }
                     other => panic!("expected Text content, got {other:?}"),
                 }
@@ -1568,9 +1568,9 @@ mod tests {
                 "content": [{"type": "text", "text": "search hit text"}],
                 "citations": {"enabled": true},
             },
-            {"type": "text", "text": " and trailing text"},
+            {"type": "text", "text": "trailing text"},
         ]));
-        assert_eq!(text, "search hit text and trailing text");
+        assert_eq!(text, "search hit text\ntrailing text");
     }
 
     #[test]

@@ -1201,6 +1201,7 @@ fn translate_message(
     // Text keeps its place before a following tool_result (byte-identical CC replay). An image
     // switches the pending run to multimodal parts (CC data-URI image parts) — user role only.
     let mut text = String::new();
+    let mut first_text = true;
     let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
     let mut has_image = false;
     for (block_index, block) in blocks.iter().enumerate() {
@@ -1213,6 +1214,7 @@ fn translate_message(
                 flush_user_run(
                     &message.role,
                     &mut text,
+                    &mut first_text,
                     &mut parts,
                     &mut has_image,
                     cc_messages,
@@ -1227,7 +1229,9 @@ fn translate_message(
             AnthropicContentBlock::Text {
                 text: block_text, ..
             } => {
-                if !text.is_empty() {
+                // Same `"\n"` separator as the Responses collapses: an empty part still
+                // contributes its boundary, exactly as a per-part template render did.
+                if !std::mem::take(&mut first_text) {
                     text.push('\n');
                 }
                 text.push_str(block_text);
@@ -1275,6 +1279,7 @@ fn translate_message(
     flush_user_run(
         &message.role,
         &mut text,
+        &mut first_text,
         &mut parts,
         &mut has_image,
         cc_messages,
@@ -1299,10 +1304,14 @@ fn role_name(role: &AnthropicRole) -> &'static str {
 fn flush_user_run(
     role: &AnthropicRole,
     text: &mut String,
+    first_text: &mut bool,
     parts: &mut Vec<ChatCompletionRequestUserMessageContentPart>,
     has_image: &mut bool,
     cc_messages: &mut Vec<CcMessage>,
 ) -> Result<(), RequestRejection> {
+    // Each flushed run joins its own parts; a text block after the flush starts a new run, and
+    // its first part owes no separator.
+    *first_text = true;
     let run_parts = std::mem::take(parts);
     let run_text = std::mem::take(text);
     if std::mem::take(has_image) {
@@ -1432,13 +1441,13 @@ fn tool_result_content(
         }
         ToolResultContent::Blocks(blocks) => blocks,
     };
-    let mut text = String::new();
+    let mut text_parts: Vec<String> = Vec::new();
     let mut parts: Vec<ChatCompletionRequestToolMessageContentPart> = Vec::new();
     let mut has_image = false;
     for block in blocks {
         match block {
             ToolResultContentBlock::Text { text: block_text } => {
-                text.push_str(block_text);
+                text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
                         text: block_text.clone(),
@@ -1456,7 +1465,7 @@ fn tool_result_content(
                 // placeholder keeping the title/source pointer visible, never a request error —
                 // Claude Code replays these inside tool results.
                 let block_text = doc.text().unwrap_or_else(|| document_placeholder(doc));
-                text.push_str(&block_text);
+                text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText { text: block_text },
                 ));
@@ -1465,7 +1474,7 @@ fn tool_result_content(
                 let block_text = result
                     .text()
                     .unwrap_or_else(|| search_result_placeholder(result));
-                text.push_str(&block_text);
+                text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText { text: block_text },
                 ));
@@ -1475,7 +1484,7 @@ fn tool_result_content(
                 // as compact JSON so the model keeps the pointers, oversized ones become a
                 // one-line placeholder so base64 payloads can't balloon the prompt.
                 let block_text = coerce_unknown_block(value, field, losses);
-                text.push_str(&block_text);
+                text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText { text: block_text },
                 ));
@@ -1485,7 +1494,9 @@ fn tool_result_content(
     Ok(if has_image {
         ChatCompletionRequestToolMessageContent::Array(parts)
     } else {
-        ChatCompletionRequestToolMessageContent::Text(text)
+        // Separator between parts, not around them: the same adjacent-text ruling as every
+        // other collapse, so a flat tool result reads like the block array it came from.
+        ChatCompletionRequestToolMessageContent::Text(text_parts.join("\n"))
     })
 }
 

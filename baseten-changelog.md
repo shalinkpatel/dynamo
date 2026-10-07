@@ -2728,8 +2728,11 @@ unsupported tool shape degrades to `auto` with a warning
 (`IngressHooks::degrades_unsupported_tool_choice`, tool-bank keeps its 400),
 and nameless server-tool selection entries are recorded by type so the
 degrade catches them. Inherited tool-bank semantics carried as-is (decided
-2026-09-03): adjacent text blocks and system blocks join with "\n" — see D6
-— unknown user content blocks are skipped by default and 400 only behind
+2026-09-03): adjacent text blocks, system blocks, and the `tool_result` fold
+join with "\n" between parts, an empty part still contributing its boundary
+(the tool_result fold and the user-run empty guard joined late, #982, paired
+with monorepo baseten#32317; upstream `ToolResultContent::into_text`
+concatenates, a characterization not a ruling) — see D6 — unknown user content blocks are skipped by default and 400 only behind
 tool-bank's hooks (D4), and unmodeled passthrough keys are last-wins over
 the translated body. Nothing in lib/llm uses the crate yet (stack D6).
 Baseten-specific; not upstreamable.

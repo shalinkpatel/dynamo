@@ -270,8 +270,38 @@ fn tool_result_text_blocks_stay_flat_text() {
     let out = translated(&msg);
     assert_eq!(
         out,
-        vec![json!({"role": "tool", "tool_call_id": "t1", "content": "line 1line 2"})]
+        vec![json!({"role": "tool", "tool_call_id": "t1", "content": "line 1\nline 2"})]
     );
+}
+
+/// A text run after a mid-message tool_result flush starts fresh: its first part owes no
+/// separator, so the flag resets at the run boundary, not the message boundary.
+#[test]
+fn messages_text_after_tool_result_starts_a_new_run_without_a_separator() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "text", "text": "before"},
+        {"type": "tool_result", "tool_use_id": "u1", "content": "ok"},
+        {"type": "text", "text": "after"},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(out[0], json!({"role": "user", "content": "before"}));
+    assert_eq!(
+        out[1],
+        json!({"role": "tool", "tool_call_id": "u1", "content": "ok"})
+    );
+    assert_eq!(out[2], json!({"role": "user", "content": "after"}));
+}
+
+/// The separator sits between parts, not around them, so an empty leading text block still
+/// contributes its boundary — the user run and the tool_result fold share the Responses ruling.
+#[test]
+fn messages_empty_leading_text_block_keeps_its_boundary() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "text", "text": ""},
+        {"type": "text", "text": "body"},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(out, vec![json!({"role": "user", "content": "\nbody"})]);
 }
 
 #[test]
