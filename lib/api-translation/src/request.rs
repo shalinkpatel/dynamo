@@ -869,7 +869,13 @@ enum MessagesThinking {
 
 fn parse_messages_thinking(thinking: ThinkingConfig) -> Result<MessagesThinking, String> {
     match (thinking.thinking_type.as_str(), thinking.budget_tokens) {
-        ("enabled", budget_tokens) => Ok(MessagesThinking::Enabled { budget_tokens }),
+        ("enabled", budget_tokens) => {
+            // Downstream's budget contract is strictly positive (worker protocol `Field(ge=1)`); zero is `disabled`, not a budget.
+            if budget_tokens == Some(0) {
+                return Err("`thinking.budget_tokens` must be at least 1".to_string());
+            }
+            Ok(MessagesThinking::Enabled { budget_tokens })
+        }
         ("adaptive", None) => Ok(MessagesThinking::Adaptive),
         ("disabled", None) => Ok(MessagesThinking::Disabled),
         ("adaptive" | "disabled", Some(_)) => Err(format!(

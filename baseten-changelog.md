@@ -2765,7 +2765,12 @@ a fact about their models; the engines here cap reasoning at whatever token coun
 they are given, so a smaller budget is a request they can serve and refusing it
 turns a working parameter into a 400. The upper bound stays: a budget at or above
 `max_tokens` leaves no room for an answer, so reasoning consumes the completion
-and the client gets `content: null` with `finish_reason: "length"`.
+and the client gets `content: null` with `finish_reason: "length"`. A zero
+budget is refused at the edge (#981, paired with monorepo baseten#32317): the
+downstream worker contract is strictly positive (`Field(ge=1)` in the
+cache-aware-routing protocol; the chat processor's `_coerce_thinking_budget`
+silently discards sub-1 values), and thinking off is what `thinking: disabled`
+says directly.
 
 Ingress edges on the shared crate (stack D4) — the validation floor and
 parity fixes live agent traffic and the bx suites taught us, each with a test

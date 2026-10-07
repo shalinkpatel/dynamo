@@ -2276,6 +2276,15 @@ fn messages_thinking_budget_below_anthropics_floor_is_served() {
     }
 }
 
+/// Zero is not a budget: the worker protocol's `Field(ge=1)` would reject it downstream, and
+/// thinking off is what `disabled` says.
+#[test]
+fn messages_thinking_budget_zero_is_refused() {
+    let err = adapt_messages_body(json!({"thinking": {"type": "enabled", "budget_tokens": 0}}))
+        .expect_err("zero is not a budget");
+    assert!(err.detail().contains("at least 1"), "{err}");
+}
+
 #[test]
 fn messages_thinking_budget_at_or_above_max_tokens_is_refused() {
     // The fixture's max_tokens is 4096; the budget must be strictly below it.
