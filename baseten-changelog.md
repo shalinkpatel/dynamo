@@ -1611,6 +1611,9 @@ HTTP 200 with a terminal `error` artifact, original status/body and completed
 intermediates. Invalid diagnostic controls remain HTTP errors. Full response bounds,
 timeout cancellation, fused-renderer null artifacts, and source cleanup are tested.
 Limits and unsupported boundaries are documented in `docs/development/waypoints.md`.
+`grammar_replay: [<u32>]` is forwarded to the hook only when set; the Baseten SGLang
+worker replays that token context through its grammar on CPU instead of decoding
+(monorepo `engine/sglang/grammar_replay.py`).
 
 1.0 -> 1.1 behavior:
 

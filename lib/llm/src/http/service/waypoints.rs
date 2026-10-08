@@ -70,6 +70,7 @@ pub(crate) struct Inspection {
     engine_output: Option<Vec<Map<String, Value>>>,
     hook: Option<Hook>,
     preserve_intermediates: bool,
+    grammar_replay: Option<Vec<u32>>,
     /// Boundaries reached before `stop_after`. Cloning an `Inspection` shares this, so a checkpoint
     /// reached inside the handler is readable back in `inspect`.
     intermediates: Arc<Mutex<BTreeMap<Stage, Value>>>,
@@ -126,6 +127,10 @@ struct InspectRequest {
     /// Also return every boundary before `stop_after` that this run passed through.
     #[serde(default)]
     preserve_intermediates: bool,
+    /// Token context to replay through the worker's grammar on CPU instead of decoding.
+    /// The Python hook validates the value and owns the engine-side contract.
+    #[serde(default)]
+    grammar_replay: Option<Vec<u32>>,
     #[serde(default = "default_timeout")]
     timeout_ms: u64,
 }
@@ -152,6 +157,8 @@ struct HookRequest<'a> {
     engine_output: &'a Option<Vec<Map<String, Value>>>,
     max_bytes: usize,
     preserve_intermediates: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grammar_replay: Option<&'a [u32]>,
 }
 
 #[derive(Serialize)]
@@ -352,6 +359,7 @@ pub(crate) async fn generate(
         engine_output: &inspection.engine_output,
         max_bytes: MAX_BYTES,
         preserve_intermediates: inspection.preserve_intermediates,
+        grammar_replay: inspection.grammar_replay.as_deref(),
     })
     .map_err(|err| invalid_hook(format!("cannot serialize request: {err}")))?;
     let payload = request.map(|_| payload);
@@ -500,6 +508,7 @@ async fn inspect(
         engine_output: spec.engine_output,
         hook: hook.get().cloned(),
         preserve_intermediates: spec.preserve_intermediates,
+        grammar_replay: spec.grammar_replay,
         intermediates: Default::default(),
     };
     // Kept here too: the collector is shared with the clone the request carries, so boundaries

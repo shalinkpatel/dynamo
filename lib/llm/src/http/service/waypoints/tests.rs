@@ -1060,3 +1060,50 @@ async fn omitting_preserve_intermediates_keeps_the_single_artifact_shape() {
         assert!(artifact.get("intermediates").is_none(), "{stage}: {body}");
     }
 }
+
+/// The grammar-replay token context reaches the Python hook unchanged; runs that omit it send no
+/// key, so hooks that predate the control keep receiving the payload they expect.
+#[tokio::test]
+async fn grammar_replay_is_forwarded_to_the_hook_only_when_requested() {
+    for (extra, expected) in [
+        (json!({"grammar_replay": [5, 6, 7]}), Some(json!([5, 6, 7]))),
+        (json!({}), None),
+    ] {
+        let (_, inspection, _, hook) = setup();
+        let mut envelope = json!({
+            "protocol": "chat", "request": input("chat", false), "stop_after": "engine_output",
+        });
+        envelope
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, body) = send(inspection, "/v1/waypoints", envelope).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            hook.requests.lock().unwrap()[0]
+                .get("grammar_replay")
+                .cloned(),
+            expected,
+            "{body}"
+        );
+    }
+}
+
+/// Anything but a list of token ids is a malformed envelope, rejected before any run starts.
+#[tokio::test]
+async fn malformed_grammar_replay_is_rejected_before_the_run() {
+    for value in [json!(-1), json!([1, -1]), json!("1,2"), json!([1.5])] {
+        let (_, inspection, _, hook) = setup();
+        let (status, body) = send(
+            inspection,
+            "/v1/waypoints",
+            json!({
+                "protocol": "chat", "request": input("chat", false),
+                "stop_after": "engine_output", "grammar_replay": value,
+            }),
+        )
+        .await;
+        assert_eq!(status, 422, "{value}: {body}");
+        assert!(hook.requests.lock().unwrap().is_empty(), "{value}");
+    }
+}

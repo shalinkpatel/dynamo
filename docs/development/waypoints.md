@@ -76,6 +76,14 @@ including `stop_reason`, logprob precision, and absent versus null fields. The `
 stage still uses the ordinary Rust protocol writers and their normalization. Unsupported
 finish reasons fail typed validation in both normal serving and inspection.
 
+### Grammar replay
+
+Set `grammar_replay` to a list of output token ids to replay that token context through the
+worker's grammar on CPU instead of decoding. Rust forwards the list to the Python hook
+unchanged; the hook validates it and owns the engine-side contract (the Baseten SGLang image
+builds the request's grammar with its served grammar backend and returns the mask before each
+token on the `engine_output` chunk as `grammar_replay`). Omitting it sends no key to the hook.
+
 ### Failed runs
 
 ```json
