@@ -25,7 +25,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
+use dynamo_runtime::config::{environment_names::llm as env_llm, is_truthy};
 use dynamo_runtime::pipeline::{AsyncEngineContextProvider, Context, context::stamp_request_start};
 use futures::{StreamExt, stream};
 use tracing::Instrument;
@@ -295,7 +295,10 @@ async fn anthropic_messages(
     }
 
     // Strip Claude Code billing preamble from system prompt if enabled
-    if env_is_truthy(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE) {
+    if std::env::var(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE)
+        .map(|value| is_truthy(&value))
+        .unwrap_or(true)
+    {
         strip_billing_preamble(&mut request.request.system);
         strip_billing_preamble_json(request.body.get_mut("system"));
     }
@@ -634,7 +637,10 @@ async fn handler_count_tokens(
             &rate_limit_msg,
         ));
     }
-    if env_is_truthy(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE) {
+    if std::env::var(env_llm::DYN_STRIP_ANTHROPIC_PREAMBLE)
+        .map(|value| is_truthy(&value))
+        .unwrap_or(true)
+    {
         strip_billing_preamble(&mut request.system);
     }
     let tokens = request.estimate_tokens();

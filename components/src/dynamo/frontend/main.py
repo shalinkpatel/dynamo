@@ -274,7 +274,7 @@ async def async_main():
     if config.strip_anthropic_preamble:
         os.environ["DYN_STRIP_ANTHROPIC_PREAMBLE"] = "1"
     else:
-        os.environ.pop("DYN_STRIP_ANTHROPIC_PREAMBLE", None)
+        os.environ["DYN_STRIP_ANTHROPIC_PREAMBLE"] = "0"
 
     if config.enable_streaming_tool_dispatch:
         os.environ["DYN_ENABLE_STREAMING_TOOL_DISPATCH"] = "1"
