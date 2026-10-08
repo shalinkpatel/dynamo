@@ -2663,6 +2663,7 @@ Source commits:
 - Current PR: feat(g2direct): standalone G2Direct HiCache transport and Python wheel
 - Split from the G2PB branch (`mf/g2pb-main-v1.2.0`, #387), including the
   resiliency fixes from #958.
+- fix(g2direct): purge directory entries of peers that leave discovery
 
 Purpose:
 
@@ -2673,7 +2674,8 @@ Source-page leases pin pages while they are read, and the destination verifies
 the checksum of every page. Reads that are still in flight at the fetch
 deadline go to a reaper, and the engine holds their pages until a settlement
 ticket reports them done. Peers that discovery no longer lists are skipped, and
-index publishing is advisory. The SGLang adapter, the deferred host release
+their index entries are purged 30 s after they leave (purged instances are
+remembered, so late deltas from them are dropped). Index publishing is advisory. The SGLang adapter, the deferred host release
 patch, and MLA host dedup live in the monorepo.
 
 Shared pieces outside the crates: `dynamo-memory` registration chunking

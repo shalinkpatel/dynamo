@@ -442,6 +442,10 @@ impl SourceIndexState {
 pub struct ReplicaIndex {
     by_key: DashMap<SequenceHash, Vec<ReplicaLocation>>,
     by_source: DashMap<ReplicaSourceKey, SourceIndexState>,
+    /// Instances purged after leaving discovery. Instance ids are discovery
+    /// lease ids and are never reused, so a late delta from one is dropped
+    /// rather than re-creating entries nothing would purge again.
+    departed: DashMap<u64, ()>,
 }
 
 impl ReplicaIndex {
@@ -460,6 +464,9 @@ impl ReplicaIndex {
 
     pub fn apply(&self, event: ReplicaEvent) -> bool {
         let source_key = event.source.key;
+        if self.departed.contains_key(&source_key.instance_id) {
+            return false;
+        }
         let mut source = self
             .by_source
             .entry(source_key)
@@ -494,6 +501,12 @@ impl ReplicaIndex {
             }
         }
         source.revision = event.revision;
+        drop(source);
+        // The instance may have been purged while this event was applied.
+        if self.departed.contains_key(&source_key.instance_id) {
+            self.remove_source(source_key);
+            return false;
+        }
         true
     }
 
@@ -526,14 +539,36 @@ impl ReplicaIndex {
         }
     }
 
-    #[cfg(test)]
-    fn remove_source(&self, source: ReplicaSourceKey) {
+    /// Drop every entry one physical producer advertised. Returns how many.
+    fn remove_source(&self, source: ReplicaSourceKey) -> usize {
         let Some((_source, state)) = self.by_source.remove(&source) else {
-            return;
+            return 0;
         };
+        let removed = state.keys.len();
         for key in state.keys {
             self.remove_replica(key, source);
         }
+        removed
+    }
+
+    /// Forget an instance that has left discovery: drop every source (TP rank)
+    /// it published and ignore anything it still has in flight. Returns
+    /// (sources, entries) removed.
+    pub fn purge_instance(&self, instance_id: u64) -> (usize, usize) {
+        // Mark first: an event applied after this is dropped, and one already
+        // past the check is caught by the re-check at the end of `apply`.
+        self.departed.insert(instance_id, ());
+        let sources = self
+            .by_source
+            .iter()
+            .filter(|source| source.key().instance_id == instance_id)
+            .map(|source| *source.key())
+            .collect::<Vec<_>>();
+        let entries = sources
+            .iter()
+            .map(|source| self.remove_source(*source))
+            .sum();
+        (sources.len(), entries)
     }
 
     fn locations(&self, key: SequenceHash, block_size: Option<u32>) -> Vec<ReplicaLocation> {
@@ -899,6 +934,54 @@ mod tests {
         assert_eq!(index.locations(11, None).len(), 2);
         index.remove_source(source(7, 0, 7).key);
         assert_eq!(index.locations(11, None)[0].source.key.instance_id, 9);
+    }
+
+    fn upsert(index: &ReplicaIndex, instance: u64, rank: u32, keys: &[u64]) {
+        index.apply(ReplicaEvent {
+            source: source(instance, rank, instance as u128),
+            revision: 1,
+            kind: ReplicaEventKind::Upsert(keys.iter().copied().map(block).collect()),
+        });
+    }
+
+    #[test]
+    fn purge_instance_drops_every_rank_and_keeps_other_sources() {
+        let index = ReplicaIndex::new();
+        // 7 departs (both TP ranks); 9 shares key 11 and stays.
+        upsert(&index, 7, 0, &[11, 12]);
+        upsert(&index, 7, 1, &[11, 13]);
+        upsert(&index, 9, 0, &[11]);
+        assert_eq!(index.locations(11, None).len(), 3);
+
+        assert_eq!(index.purge_instance(7), (2, 4));
+        let at_11 = index.locations(11, None);
+        assert_eq!(at_11.len(), 1);
+        assert_eq!(at_11[0].source.key.instance_id, 9);
+        assert!(index.locations(12, None).is_empty());
+        assert!(index.locations(13, None).is_empty());
+        assert_eq!(index.entry_count(), 1);
+        // Purging again, or an instance never seen, is a no-op.
+        assert_eq!(index.purge_instance(7), (0, 0));
+        assert_eq!(index.purge_instance(42), (0, 0));
+    }
+
+    #[test]
+    fn purged_instance_late_events_are_dropped() {
+        let index = ReplicaIndex::new();
+        upsert(&index, 7, 0, &[11]);
+        index.purge_instance(7);
+        // A delta still in flight from the departed instance must not re-create
+        // entries nothing would purge again.
+        assert!(!index.apply(ReplicaEvent {
+            source: source(7, 0, 7),
+            revision: 2,
+            kind: ReplicaEventKind::Upsert(vec![block(12)]),
+        }));
+        assert!(index.locations(12, None).is_empty());
+        assert_eq!(index.entry_count(), 0);
+        // Other instances are unaffected.
+        upsert(&index, 9, 0, &[12]);
+        assert_eq!(index.locations(12, None).len(), 1);
     }
 
     #[test]

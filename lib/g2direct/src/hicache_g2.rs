@@ -508,6 +508,10 @@ pub struct HiCacheG2Metrics {
     /// Index candidates dropped because their source is no longer a live peer
     /// (it crashed without withdrawing its advertisements).
     pub dead_source_candidates: AtomicU64,
+    /// Sources (one per peer TP rank) whose entries the dead-source sweeper
+    /// purged from this process's directory, and how many entries that was.
+    pub purged_dead_sources: AtomicU64,
+    pub purged_dead_entries: AtomicU64,
     /// Index updates this replica failed to hand to the publisher. A dropped
     /// upsert costs peers a hit; a dropped removal costs them a failed lease.
     pub dropped_publications: AtomicU64,
@@ -561,6 +565,14 @@ impl HiCacheG2Metrics {
             (
                 "dead_source_candidates",
                 self.dead_source_candidates.load(Ordering::Relaxed),
+            ),
+            (
+                "purged_dead_sources",
+                self.purged_dead_sources.load(Ordering::Relaxed),
+            ),
+            (
+                "purged_dead_entries",
+                self.purged_dead_entries.load(Ordering::Relaxed),
             ),
             (
                 "dropped_publications",
@@ -1519,6 +1531,15 @@ impl HiCachePeerClient {
         self.router.client.instance_ids()
     }
 
+    /// Peer instance ids, updated as discovery adds and removes them.
+    fn membership(&self) -> tokio::sync::watch::Receiver<Vec<u64>> {
+        self.router.client.instance_avail_watcher()
+    }
+
+    fn is_live(&self, instance_id: u64) -> bool {
+        self.router.client.is_instance_live(instance_id)
+    }
+
     async fn request(
         &self,
         instance_id: u64,
@@ -1572,6 +1593,78 @@ impl HiCachePeerClient {
             other => anyhow::bail!("unexpected HiCache G2 release response: {other:?}"),
         }
     }
+}
+
+/// How long a peer must stay out of discovery before its directory entries are
+/// purged. Discovery can briefly drop a live instance (a lease renewal hiccup),
+/// and a purged instance is ignored for good, so this errs long.
+const DEPARTED_PEER_GRACE: Duration = Duration::from_secs(30);
+
+/// Purge the directory entries of peers that leave discovery. Lookups already
+/// skip them (`remote_live_candidates`); this frees them, so a scale-down or
+/// crash does not leave its advertisements in every surviving process for
+/// good. Event-driven: nothing runs while membership is stable, and each
+/// departure gets one delayed re-check. Stops when the transport is dropped.
+fn spawn_departed_peer_purger(
+    index: Weak<ReplicaIndex>,
+    peers: HiCachePeerClient,
+    state: Weak<HiCacheG2State>,
+) {
+    tokio::spawn(async move {
+        let mut membership = peers.membership();
+        let mut known = membership
+            .borrow_and_update()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        while membership.changed().await.is_ok() {
+            let current = membership
+                .borrow_and_update()
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            for departed in known.difference(&current).copied() {
+                let (index, peers, state) = (index.clone(), peers.clone(), state.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(DEPARTED_PEER_GRACE).await;
+                    if peers.is_live(departed) {
+                        return;
+                    }
+                    let (Some(index), Some(state)) = (index.upgrade(), state.upgrade()) else {
+                        return;
+                    };
+                    if departed == state.source.key.instance_id {
+                        return;
+                    }
+                    // A departed peer can own hundreds of thousands of entries;
+                    // keep the purge off the async workers.
+                    let Ok((sources, entries)) =
+                        tokio::task::spawn_blocking(move || index.purge_instance(departed)).await
+                    else {
+                        return;
+                    };
+                    state
+                        .metrics
+                        .purged_dead_sources
+                        .fetch_add(sources as u64, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .purged_dead_entries
+                        .fetch_add(entries as u64, Ordering::Relaxed);
+                    tracing::info!(
+                        instance_id = departed,
+                        sources,
+                        entries,
+                        "purged HiCache G2 directory entries of a peer that left discovery"
+                    );
+                });
+            }
+            known = current;
+            if index.strong_count() == 0 {
+                break;
+            }
+        }
+    });
 }
 
 struct HiCachePeerEngine {
@@ -1690,6 +1783,11 @@ impl HiCacheG2Direct {
         start_peer_service(&peer_component, Arc::clone(&state))?;
 
         let peers = HiCachePeerClient::new(peer_component).await?;
+        spawn_departed_peer_purger(
+            Arc::downgrade(&index),
+            peers.clone(),
+            Arc::downgrade(&state),
+        );
 
         Ok(Self {
             state,
