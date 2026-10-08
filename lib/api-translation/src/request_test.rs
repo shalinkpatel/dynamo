@@ -1164,9 +1164,38 @@ fn adapt_responses_missing_model_is_refused() {
 /// client stored it) is history, not a request defect — it must not 400 the whole turn.
 #[test]
 fn adapt_responses_non_json_echoed_arguments_pass_through_verbatim() {
-    let call = responses_echoed_tool_call("call_1", "get_weather", "{not json");
+    let mut losses = Losses::default();
+    let call = responses_echoed_tool_call(
+        "call_1",
+        "get_weather",
+        "{not json",
+        "input[1]",
+        &mut losses,
+    );
     assert_eq!(call.raw_args, "{not json");
     assert_eq!(call.args, json!("{not json"));
+    let losses = losses.into_vec();
+    let [loss] = losses.as_slice() else {
+        panic!("expected exactly one loss, got {losses:?}")
+    };
+    assert_eq!(loss.kind, LossKind::NonJsonEchoedArguments);
+    assert_eq!(loss.field, "input[1]");
+}
+
+/// The mcp_call arm takes the same verbatim replay as function_call.
+#[test]
+fn adapt_responses_non_json_mcp_call_arguments_pass_through_verbatim() {
+    let out = responses_input(json!([
+        {"type": "mcp_call", "id": "m1", "name": "mcp_f", "server_label": "srv", "arguments": "{not json", "output": "done"},
+    ]));
+    assert_eq!(
+        out[0]["tool_calls"][0]["function"]["arguments"],
+        "{not json"
+    );
+    assert_eq!(
+        out[1],
+        json!({"role": "tool", "tool_call_id": "m1", "content": "done"})
+    );
 }
 
 /// End to end on the Responses input: the malformed replayed call and its output still split the

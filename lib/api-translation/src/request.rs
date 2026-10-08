@@ -2046,6 +2046,8 @@ fn translate_input_items(
                     &call.call_id,
                     &chat_name,
                     &call.arguments,
+                    &format!("input[{item_index}]"),
+                    losses,
                 ));
             }
             InputItem::Item(Item::McpCall(call)) => {
@@ -2054,6 +2056,8 @@ fn translate_input_items(
                     &call.id,
                     &call.name,
                     &call.arguments,
+                    &format!("input[{item_index}]"),
+                    losses,
                 ));
                 turn.flush_into(cc_messages);
                 let result = if let Some(error) = &call.error {
@@ -2350,14 +2354,20 @@ fn function_call_output_text(output: &FunctionCallOutput) -> Result<String, Stri
 ///
 /// Non-JSON `arguments` are not refused: a model can emit them (MP-1612), the client stores the
 /// call, and a 400 here wedges every later turn of the thread (MP-1657). Like OpenAI, the string
-/// is opaque history — replayed verbatim, with `args` carrying it as a JSON string so the
-/// downstream chat processor decides how to render it.
-fn responses_echoed_tool_call(id: &str, name: &str, raw_args: &str) -> ToolCall {
+/// is opaque history: history forwards `raw_args` as `function.arguments` byte-exact, and `args`
+/// carries it as a JSON string only for in-process consumers.
+fn responses_echoed_tool_call(
+    id: &str,
+    name: &str,
+    raw_args: &str,
+    field: &str,
+    losses: &mut Losses,
+) -> ToolCall {
     let args = serde_json::from_str(raw_args).unwrap_or_else(|error| {
-        tracing::warn!(
-            call_id = id,
-            %error,
-            "echoed tool call has non-JSON `arguments`; replaying verbatim"
+        losses.record(
+            LossKind::NonJsonEchoedArguments,
+            field,
+            format!("echoed call `{id}` has non-JSON `arguments`; replaying verbatim ({error})"),
         );
         Value::String(raw_args.to_string())
     });

@@ -36,11 +36,13 @@ pub enum LossKind {
     IncludeIgnored,
     /// A duplicate tool declaration was dropped (first declaration kept).
     DuplicateToolDropped,
+    /// A replayed function_call/mcp_call with non-JSON `arguments` was carried verbatim, not parsed.
+    NonJsonEchoedArguments,
 }
 
 impl LossKind {
     /// Every kind, for consumers that pre-register one metric series per label.
-    pub const ALL: [LossKind; 11] = [
+    pub const ALL: [LossKind; 12] = [
         Self::ServerToolDropped,
         Self::ToolChoiceDegraded,
         Self::RequestFieldDropped,
@@ -52,6 +54,7 @@ impl LossKind {
         Self::AgentMessageDropped,
         Self::IncludeIgnored,
         Self::DuplicateToolDropped,
+        Self::NonJsonEchoedArguments,
     ];
 
     /// snake_case label, `&'static` so it can be a metric label.
@@ -68,6 +71,7 @@ impl LossKind {
             Self::AgentMessageDropped => "agent_message_dropped",
             Self::IncludeIgnored => "include_ignored",
             Self::DuplicateToolDropped => "duplicate_tool_dropped",
+            Self::NonJsonEchoedArguments => "non_json_echoed_arguments",
         }
     }
 }

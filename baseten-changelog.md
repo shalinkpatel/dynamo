@@ -2868,8 +2868,11 @@ request defect (MP-1657, #784, paired with monorepo baseten#27877):
 but GLM-5.x does produce them (MP-1612), clients persist the call, and the
 400 then wedged every later turn of the thread. The string is now replayed
 verbatim (`raw_args`, what `history.rs` forwards as `function.arguments`),
-`args` carries it as a JSON string, and a `tracing::warn!` records the call
-id; structural malformation is still refused by the surrounding serde. The
+`args` carries it as a JSON string, and the fallback records a
+`non_json_echoed_arguments` loss (field = the input path) so the
+400s-to-successful-but-degraded shift stays countable in the ingress
+stage line; structural malformation is still refused by the surrounding
+serde. The
 chat processor on the monorepo side wraps such strings for dict-iterating
 templates. Baseten-specific; not upstreamable.
 
