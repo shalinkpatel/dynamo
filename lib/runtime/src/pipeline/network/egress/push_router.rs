@@ -24,6 +24,7 @@ use futures::Stream;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Borrow,
     collections::HashMap,
     marker::PhantomData,
     pin::Pin,
@@ -523,7 +524,10 @@ where
     }
 
     /// Issue a request to the next available instance in a round-robin fashion
-    pub async fn round_robin(&self, request: SingleIn<T>) -> anyhow::Result<ManyOut<U>> {
+    pub async fn round_robin<P>(&self, request: SingleIn<P>) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         let counter = self.round_robin_counter.fetch_add(1, Ordering::Relaxed) as usize;
 
         let instance_id = {
@@ -541,7 +545,10 @@ where
     }
 
     /// Issue a request to a random endpoint
-    pub async fn random(&self, request: SingleIn<T>) -> anyhow::Result<ManyOut<U>> {
+    pub async fn random<P>(&self, request: SingleIn<P>) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         let instance_id = {
             let routing_instances = self.client.routing_instances();
             let count = routing_instances.free_ids().len();
@@ -580,12 +587,19 @@ where
         }
     }
 
-    /// Issue a request to a specific endpoint
-    pub async fn direct(
+    /// Issue a request to a specific endpoint.
+    ///
+    /// Use `SingleIn::new(&payload)` to reuse a payload across retries without
+    /// cloning. Owned payloads are also accepted. The returned stream does not
+    /// borrow the payload.
+    pub async fn direct<P>(
         &self,
-        request: SingleIn<T>,
+        request: SingleIn<P>,
         instance_id: u64,
-    ) -> anyhow::Result<ManyOut<U>> {
+    ) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         // When fault detection is disabled, check the raw discovery list
         // (not filtered by report_instance_down) so transient failures
         // don't poison the instance for subsequent retries.
@@ -785,11 +799,14 @@ where
     }
     */
 
-    async fn generate_with_fault_detection(
+    async fn generate_with_fault_detection<P>(
         &self,
         mut instance_id: u64,
-        request: SingleIn<T>,
-    ) -> anyhow::Result<ManyOut<U>> {
+        request: SingleIn<P>,
+    ) -> anyhow::Result<ManyOut<U>>
+    where
+        P: Borrow<T> + Send + Sync,
+    {
         let route_start = Instant::now();
         let request_id = request.id().to_string();
         let route_span = if matches!(self.router_mode, RouterMode::KV) {
@@ -911,16 +928,18 @@ where
             }
         };
 
-        let request = request.map(|req| AddressedRequest::with_instance(req, address, instance));
+        let (payload, context) = request.into_parts();
+        let request =
+            context.map(|()| AddressedRequest::with_instance(payload.borrow(), address, instance));
 
         STAGE_DURATION_SECONDS
             .with_label_values(&[STAGE_ROUTE])
             .observe(route_start.elapsed().as_secs_f64());
 
         let _nvtx_transport = dynamo_nvtx_range!(_transport_kind);
-        let stream: anyhow::Result<ManyOut<U>> = self
-            .addressed
-            .generate(request)
+        // Preserve the heap boundary of the owned AsyncEngine transport so nested
+        // prefill routing futures do not grow excessively on the stack.
+        let stream: anyhow::Result<ManyOut<U>> = Box::pin(self.addressed.generate_unary(request))
             .instrument(route_span)
             .await;
         match stream {
@@ -1146,6 +1165,160 @@ mod tests {
         fn err(&self) -> Option<DynamoError> {
             self.error.clone()
         }
+    }
+
+    #[tokio::test]
+    async fn routing_retries_borrow_payload_and_preserve_context() {
+        use crate::pipeline::network::egress::unified_client::{Headers, RequestPlaneClient};
+        use crate::pipeline::network::{RequestControlMessage, TwoPartCodec};
+
+        #[derive(Serialize)]
+        struct Payload {
+            tokens: Vec<u64>,
+        }
+
+        #[derive(Default)]
+        struct RejectingClient {
+            requests: std::sync::Mutex<Vec<(RequestControlMessage, Vec<u8>)>>,
+            succeed: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl RequestPlaneClient for RejectingClient {
+            async fn send_request(
+                &self,
+                _address: String,
+                payload: bytes::Bytes,
+                _headers: Headers,
+            ) -> anyhow::Result<bytes::Bytes> {
+                let message = TwoPartCodec::default().decode_message(payload)?;
+                let control: RequestControlMessage = serde_json::from_slice(&message.header)?;
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((control.clone(), message.data.to_vec()));
+                if !self.succeed.load(Ordering::Relaxed) {
+                    anyhow::bail!("retry this request");
+                }
+                let context = crate::pipeline::context::Context::with_id_and_metadata(
+                    (),
+                    control.id,
+                    control.metadata,
+                );
+                let mut sender =
+                    crate::pipeline::network::tcp::client::TcpClient::create_response_stream(
+                        context.context(),
+                        control.connection_info,
+                        None,
+                    )
+                    .await?;
+                sender
+                    .send_prologue(None)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                sender
+                    .send(
+                        control
+                            .payload_codec
+                            .encode(&crate::pipeline::network::NetworkStreamWrapper {
+                                data: Some(TestResponse { error: None }),
+                                complete_final: true,
+                            })?
+                            .into(),
+                    )
+                    .await?;
+                Ok(bytes::Bytes::new())
+            }
+
+            fn transport_name(&self) -> &'static str {
+                "test"
+            }
+            fn is_healthy(&self) -> bool {
+                true
+            }
+        }
+
+        let rt = Runtime::from_current().unwrap();
+        let drt = DistributedRuntime::new(rt.clone(), DistributedConfig::process_local())
+            .await
+            .unwrap();
+        let endpoint = drt
+            .namespace("borrow-direct".to_string())
+            .unwrap()
+            .component("worker".to_string())
+            .unwrap()
+            .endpoint("generate".to_string());
+        let client = endpoint.client().await.unwrap();
+        endpoint.register_endpoint_instance().await.unwrap();
+        let worker_id = client.wait_for_instances().await.unwrap()[0].id();
+        let transport = Arc::new(RejectingClient::default());
+        let dispatch =
+            AddressedPushRouter::new(transport.clone(), drt.tcp_server().await.unwrap()).unwrap();
+        let mut router =
+            PushRouter::<Payload, TestResponse>::from_client(client, RouterMode::Direct)
+                .await
+                .unwrap();
+        router.addressed = dispatch;
+        let payload = Payload {
+            tokens: vec![1, 2, 3],
+        };
+        let expected = serde_json::to_value(&payload).unwrap();
+        for attempt in 0..6 {
+            let mut context = SingleIn::with_id_and_metadata(
+                &payload,
+                format!("attempt-{attempt}"),
+                Default::default(),
+            );
+            context.insert_metadata("attempt", attempt.to_string());
+            let error = match attempt / 2 {
+                0 => router.direct(context, worker_id).await,
+                1 => router.random(context).await,
+                _ => router.round_robin(context).await,
+            }
+            .unwrap_err();
+            assert!(error.to_string().contains("retry this request"));
+        }
+        transport.succeed.store(true, Ordering::Relaxed);
+        for mode in [
+            RouterMode::Direct,
+            RouterMode::Random,
+            RouterMode::RoundRobin,
+        ] {
+            let mut response = {
+                let payload = Payload {
+                    tokens: vec![4, 5, 6],
+                };
+                let request = SingleIn::new(&payload);
+                match mode {
+                    RouterMode::Direct => router.direct(request, worker_id).await,
+                    RouterMode::Random => router.random(request).await,
+                    RouterMode::RoundRobin => router.round_robin(request).await,
+                    _ => unreachable!(),
+                }
+                .unwrap()
+            };
+            let item = tokio::time::timeout(std::time::Duration::from_secs(5), response.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(item.err().is_none());
+            assert!(response.next().await.is_none());
+        }
+        drop(payload);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 9);
+        for (attempt, (control, data)) in requests.iter().take(6).enumerate() {
+            assert_eq!(
+                control
+                    .payload_codec
+                    .decode::<serde_json::Value>(data)
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(control.id, format!("attempt-{attempt}"));
+            assert_eq!(control.metadata["attempt"], attempt.to_string());
+        }
+        rt.shutdown();
     }
 
     #[test]
@@ -1395,6 +1568,19 @@ mod tests {
 
     #[tokio::test]
     async fn selected_overloaded_worker_is_rejected_before_dispatch() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Count serialization, as in upstream's saturated retained-dispatch test.
+        // This branch rejects overload in PushRouter before reaching the transport.
+        struct CountingPayload(Arc<AtomicUsize>);
+
+        impl Serialize for CountingPayload {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                serializer.serialize_u64(42)
+            }
+        }
+
         const TEST_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
         let rt = Runtime::from_current().unwrap();
@@ -1426,22 +1612,39 @@ mod tests {
         );
 
         client.set_overloaded_instances(&[worker_id]);
-        let router = PushRouter::<u64, TestResponse>::from_client(client, RouterMode::RoundRobin)
-            .await
-            .unwrap();
+        let router = PushRouter::<CountingPayload, TestResponse>::from_client(
+            client,
+            RouterMode::RoundRobin,
+        )
+        .await
+        .unwrap();
+        let serialization_count = Arc::new(AtomicUsize::new(0));
+        let payload = CountingPayload(serialization_count.clone());
 
-        let result = router.generate(SingleIn::new(42u64)).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        // With pre-selection filtering on free_ids, the single-overloaded-worker
-        // case is now caught before selection rather than after — the chosen
-        // worker is never overloaded because the candidate pool excludes it.
-        // The post-selection check in route() remains as a race-condition
-        // backstop.
-        assert!(
-            msg.contains("All workers are busy"),
-            "expected empty-free-pool rejection, got: {msg}"
-        );
+        // Cover both owned engine calls and borrowed dispatch through each selector.
+        for mode in 0..4 {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                match mode {
+                    0 => {
+                        router
+                            .generate(SingleIn::new(CountingPayload(serialization_count.clone())))
+                            .await
+                    }
+                    1 => router.direct(SingleIn::new(&payload), worker_id).await,
+                    2 => router.random(SingleIn::new(&payload)).await,
+                    _ => router.round_robin(SingleIn::new(&payload)).await,
+                }
+            })
+            .await
+            .expect("overload should be rejected promptly");
+            let error = result.unwrap_err();
+            assert!(match_error_chain(
+                error.as_ref(),
+                &[ErrorType::ResourceExhausted],
+                &[]
+            ));
+            assert_eq!(serialization_count.load(Ordering::Relaxed), 0);
+        }
 
         rt.shutdown();
     }

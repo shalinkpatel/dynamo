@@ -198,6 +198,21 @@ where
     U: Data + for<'de> Deserialize<'de> + MaybeError,
 {
     async fn generate(&self, request: SingleIn<AddressedRequest<T>>) -> Result<ManyOut<U>, Error> {
+        self.generate_unary(request).await
+    }
+}
+
+impl AddressedPushRouter {
+    /// Dispatch an owned or borrowed unary payload. The response stream owns its state
+    /// and does not borrow the payload; serialization and sending finish before return.
+    pub async fn generate_unary<T, U>(
+        &self,
+        request: SingleIn<AddressedRequest<T>>,
+    ) -> Result<ManyOut<U>, Error>
+    where
+        T: Send + Sync + Serialize,
+        U: Data + for<'de> Deserialize<'de> + MaybeError,
+    {
         let queue_start = Instant::now();
         REQUEST_PLANE_INFLIGHT.inc();
         let inflight_guard = InflightGuard::new();

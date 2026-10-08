@@ -523,6 +523,16 @@ pub trait RouterGuardClient: Send + Sync {
         request: RsContext<rmpv::Value>,
         instance_id: u64,
     ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>>;
+
+    /// Reuse a callback payload across attempts. Implementations with borrowed
+    /// dispatch can override this; the default preserves owned-client compatibility.
+    async fn direct_borrowed(
+        &self,
+        request: RsContext<&rmpv::Value>,
+        instance_id: u64,
+    ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>> {
+        self.direct(request.map(Clone::clone), instance_id).await
+    }
 }
 
 #[derive(Clone)]
@@ -593,6 +603,14 @@ impl RouterGuardClient for JsonRouterGuardClient {
     async fn direct(
         &self,
         request: RsContext<rmpv::Value>,
+        instance_id: u64,
+    ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>> {
+        self.router.direct(request, instance_id).await
+    }
+
+    async fn direct_borrowed(
+        &self,
+        request: RsContext<&rmpv::Value>,
         instance_id: u64,
     ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>> {
         self.router.direct(request, instance_id).await

@@ -6,7 +6,7 @@ use axum::{http::Method, response::IntoResponse, routing::post, Json, Router};
 use serde_json::json;
 use std::sync::Arc;
 
-use dynamo_runtime::{discovery::DiscoveryQuery, pipeline::PushRouter, stream::StreamExt};
+use dynamo_runtime::{discovery::DiscoveryQuery, pipeline::{PushRouter, SingleIn}, stream::StreamExt};
 
 pub const CLEAR_KV_ENDPOINT: &str = "clear_kv_blocks";
 
@@ -194,7 +194,7 @@ async fn clear_kv_blocks_handler(
 
         for instance in &instances_filtered {
             let instance_name = format!("{}-instance-{}", entry.name, instance.id());
-            match router.direct(().into(), instance.id()).await {
+            match router.direct(SingleIn::new(()), instance.id()).await {
                 Ok(mut stream) => match stream.next().await {
                     Some(response) => {
                         add_worker_result(

@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use super::{AsyncEngineContext, AsyncEngineContextProvider, Data};
+use super::{AsyncEngineContext, AsyncEngineContextProvider};
 use crate::engine::AsyncEngineController;
 use async_trait::async_trait;
 
@@ -24,7 +24,8 @@ pub fn stamp_request_start(metadata: &mut BTreeMap<String, String>) -> Result<()
     Ok(())
 }
 
-pub struct Context<T: Data> {
+/// Request state with an owned or borrowed payload. Registry entries remain `'static`.
+pub struct Context<T: Send + Sync> {
     current: T,
     controller: Arc<Controller>, //todo: hold this as an arc
     registry: Registry,
@@ -32,7 +33,7 @@ pub struct Context<T: Data> {
     metadata: BTreeMap<String, String>,
 }
 
-impl<T: Send + Sync + 'static> Context<T> {
+impl<T: Send + Sync> Context<T> {
     // Create a new context with initial data
     pub fn new(current: T) -> Self {
         Context {
@@ -44,7 +45,7 @@ impl<T: Send + Sync + 'static> Context<T> {
         }
     }
 
-    pub fn rejoin<U: Send + Sync + 'static>(current: T, context: Context<U>) -> Self {
+    pub fn rejoin<U: Send + Sync>(current: T, context: Context<U>) -> Self {
         Context {
             current,
             controller: context.controller,
@@ -158,7 +159,7 @@ impl<T: Send + Sync + 'static> Context<T> {
 
     /// Transfer the Context to a new Object without updating the registry
     /// This returns a tuple of the previous object and the new Context
-    pub fn transfer<U: Send + Sync + 'static>(self, new_current: U) -> (T, Context<U>) {
+    pub fn transfer<U: Send + Sync>(self, new_current: U) -> (T, Context<U>) {
         (
             self.current,
             Context {
@@ -185,7 +186,7 @@ impl<T: Send + Sync + 'static> Context<T> {
     }
 
     /// Transforms the current context to another type using a provided function.
-    pub fn map<U: Send + Sync + 'static, F>(self, f: F) -> Context<U>
+    pub fn map<U: Send + Sync, F>(self, f: F) -> Context<U>
     where
         F: FnOnce(T) -> U,
     {
@@ -202,7 +203,7 @@ impl<T: Send + Sync + 'static> Context<T> {
     pub fn try_map<U, F, E>(self, f: F) -> Result<Context<U>, E>
     where
         F: FnOnce(T) -> Result<U, E>,
-        U: Send + Sync + 'static,
+        U: Send + Sync,
     {
         // Use the transfer method to move the current value out
         let (current, temp_context) = self.transfer(());
@@ -215,7 +216,7 @@ impl<T: Send + Sync + 'static> Context<T> {
     }
 }
 
-impl<T: Data> std::fmt::Debug for Context<T> {
+impl<T: Send + Sync> std::fmt::Debug for Context<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Context")
             .field("id", &self.controller.id())
@@ -224,7 +225,7 @@ impl<T: Data> std::fmt::Debug for Context<T> {
 }
 
 // Implement Deref to allow Context<T> to act like &T
-impl<T: Data> Deref for Context<T> {
+impl<T: Send + Sync> Deref for Context<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -233,7 +234,7 @@ impl<T: Data> Deref for Context<T> {
 }
 
 // Implement DerefMut to allow Context<T> to act like &mut T
-impl<T: Data> DerefMut for Context<T> {
+impl<T: Send + Sync> DerefMut for Context<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.current
     }
@@ -242,7 +243,7 @@ impl<T: Data> DerefMut for Context<T> {
 // Implement the custom trait for Context<T>
 impl<T> From<T> for Context<T>
 where
-    T: Send + Sync + 'static,
+    T: Send + Sync,
 {
     fn from(current: T) -> Self {
         Context::new(current)
@@ -250,22 +251,22 @@ where
 }
 
 // Define a custom trait for conversion from Context<T> to Context<U>
-pub trait IntoContext<U: Data> {
+pub trait IntoContext<U: Send + Sync> {
     fn into_context(self) -> Context<U>;
 }
 
 // Implement the custom trait for converting Context<T> to Context<U>
 impl<T, U> IntoContext<U> for Context<T>
 where
-    T: Send + Sync + 'static + Into<U>,
-    U: Send + Sync + 'static,
+    T: Send + Sync + Into<U>,
+    U: Send + Sync,
 {
     fn into_context(self) -> Context<U> {
         self.map(|current| current.into())
     }
 }
 
-impl<T: Data> AsyncEngineContextProvider for Context<T> {
+impl<T: Send + Sync> AsyncEngineContextProvider for Context<T> {
     fn context(&self) -> Arc<dyn AsyncEngineContext> {
         self.controller.clone()
     }
@@ -377,7 +378,7 @@ impl AsyncEngineContextProvider for StreamContext {
     }
 }
 
-impl<T: Send + Sync + 'static> From<Context<T>> for StreamContext {
+impl<T: Send + Sync> From<Context<T>> for StreamContext {
     fn from(value: Context<T>) -> Self {
         StreamContext::new(value.controller, value.registry, value.metadata)
     }
@@ -646,16 +647,23 @@ mod tests {
 
     #[test]
     fn test_metadata_preserved_in_stream_context() {
-        let mut ctx = Context::new(Input {
+        let input = Input {
             value: "Hello".to_string(),
-        });
+        };
+        let mut ctx = Context::new(&input);
         ctx.insert_metadata("tenant", "alpha");
-
+        ctx.insert("retained", 42u64);
+        let controller = ctx.context();
+        let ctx = ctx.map(|input| input.value.as_str());
+        assert_eq!(*ctx, "Hello");
         let stream_ctx = StreamContext::from(ctx);
+        drop(input);
+        assert!(Arc::ptr_eq(&controller, &stream_ctx.context()));
         assert_eq!(
             stream_ctx.metadata().get("tenant").map(String::as_str),
             Some("alpha")
         );
+        assert_eq!(*stream_ctx.get::<u64>("retained").unwrap(), 42);
     }
 
     #[test]

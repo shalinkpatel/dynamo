@@ -517,7 +517,7 @@ async fn send_router_guard_mark(
             let mut metadata = std::collections::BTreeMap::new();
             metadata.insert("request-id".to_string(), state.request_id.clone());
             let request_ctx = RsContext::with_id_and_metadata(
-                request.clone(),
+                &request,
                 state.router_unique_request_id.clone(),
                 metadata,
             );
@@ -533,7 +533,10 @@ async fn send_router_guard_mark(
             );
 
             let result = async {
-                let stream = state.router.direct(request_ctx, instance_id).await?;
+                let stream = state
+                    .router
+                    .direct_borrowed(request_ctx, instance_id)
+                    .await?;
                 let router_response = first_stream_response(stream).await?;
                 match mark.success_from(&router_response.response) {
                     Some(true) => Ok(()),

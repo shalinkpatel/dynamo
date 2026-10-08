@@ -274,6 +274,16 @@ the target container stack.
 
 Status: `keep`
 
+Borrowed unary payloads ([#991](https://github.com/basetenlabs/dynamo/pull/991)):
+adapted backport of upstream
+[ai-dynamo/dynamo#14829](https://github.com/ai-dynamo/dynamo/pull/14829).
+`direct`, `random`, and `round_robin` accept borrowed payloads while preserving
+request context and owned-call compatibility. B10 guard callback retries avoid
+payload clones; returned response streams do not borrow the payload. Regression
+coverage verifies overload rejection before serialization. Drop the runtime
+backport once upstream supplies equivalent borrowing support; retain the B10
+callback integration.
+
 Ingress pump cancellation escape: `pump_response_stream` in
 `lib/runtime/src/pipeline/network/ingress/push_handler.rs` now selects on the
 request context's `stopped()`/`killed()` futures alongside `stream.next()`.
