@@ -492,6 +492,12 @@ impl GeneratedRequest {
         self.admission.decode_dp_rank
     }
 
+    fn prefill_duration_seconds(&self) -> Option<f64> {
+        self.admission
+            .prefill_duration
+            .map(|duration| duration.as_secs_f64())
+    }
+
     /// The coordinated response stream. May be called only once.
     fn response_stream<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let stream = self.stream.lock().unwrap().take().ok_or_else(|| {

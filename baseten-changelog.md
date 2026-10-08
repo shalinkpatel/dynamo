@@ -1773,6 +1773,8 @@ decode, merges topology constraints, suppresses the decode bootstrap, and keeps
 both router guards alive through the returned stream. The Python extension
 only converts serialized worker maps, exposes admission metadata, and adapts
 the response stream.
+Admission carries `prefill_duration` (worker send to first prefill-leg response,
+no routing; wire field `prefill_duration_ms`), read by per-request metrics.
 
 SGLang empty-token handoffs retain the prefill stream until decode connects,
 then emit the final prefill completion with cache metrics before decode tokens.

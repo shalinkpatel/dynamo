@@ -23,6 +23,7 @@ use futures::future::BoxFuture;
 use rmpv::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MIN_GLOBAL_DISAGG_REQUEST_ID: u64 = 1 << 42;
@@ -79,6 +80,9 @@ pub struct GenerationAdmission {
     /// `None` when a terminal/error prefill response does not open decode.
     pub decode_worker_id: Option<u64>,
     pub decode_dp_rank: Option<u32>,
+    /// Worker send to first prefill-leg response (excludes routing). `None`
+    /// when the first event was a swallowed sentinel; our workers send none.
+    pub prefill_duration: Option<Duration>,
 }
 
 /// A successfully connected generation stream.
@@ -238,7 +242,7 @@ impl GenerationCoordinator {
             guard,
             worker_id,
             stream,
-            ..
+            timings,
         } = outcome
         else {
             let RouteAndConnectOutcome::Denied(denied) = outcome else {
@@ -250,7 +254,8 @@ impl GenerationCoordinator {
             }));
         };
 
-        let admission = admission_from_guard(&guard, self.primary.block_size(), worker_id, true);
+        let admission =
+            admission_from_guard(&guard, self.primary.block_size(), worker_id, true, &timings);
         let guard = Arc::new(guard);
         let stream = stream_with_optional_prefill_mark(stream, Arc::clone(&guard), true);
         let output = async_stream::stream! {
@@ -303,7 +308,7 @@ impl GenerationCoordinator {
             guard: prefill_guard,
             worker_id: prefill_worker_id,
             mut stream,
-            ..
+            timings: prefill_timings,
         } = prefill
         else {
             let RouteAndConnectOutcome::Denied(denied) = prefill else {
@@ -321,6 +326,7 @@ impl GenerationCoordinator {
             self.primary.block_size(),
             prefill_worker_id,
             false,
+            &prefill_timings,
         );
         if self.prefill_mark_timing == PrefillMarkTiming::AfterPrefillCompute {
             prefill_guard.mark_prefill();
@@ -589,6 +595,7 @@ fn admission_from_guard(
     block_size: u32,
     fallback_worker_id: u64,
     aggregated: bool,
+    timings: &crate::AdmittedRequestTimings,
 ) -> GenerationAdmission {
     let (worker_id, dp_rank) = guard
         .routed_worker_info()
@@ -600,6 +607,9 @@ fn admission_from_guard(
         prefill_dp_rank: dp_rank,
         decode_worker_id: aggregated.then_some(worker_id),
         decode_dp_rank: aggregated.then_some(dp_rank),
+        prefill_duration: timings
+            .worker_first_response_duration
+            .map(|first| timings.worker_stream_connect_duration + first),
     }
 }
 

@@ -398,6 +398,9 @@ impl From<crate::GenerationAdmission> for AdmissionV1 {
             prefill_dp_rank: value.prefill_dp_rank,
             decode_worker_id: value.decode_worker_id,
             decode_dp_rank: value.decode_dp_rank,
+            prefill_duration_ms: value
+                .prefill_duration
+                .map(|duration| duration.as_millis() as u64),
         }
     }
 }
@@ -460,6 +463,9 @@ impl From<AdmissionV1> for GenerationAdmission {
             prefill_dp_rank: value.prefill_dp_rank,
             decode_worker_id: value.decode_worker_id,
             decode_dp_rank: value.decode_dp_rank,
+            prefill_duration: value
+                .prefill_duration_ms
+                .map(std::time::Duration::from_millis),
         }
     }
 }

@@ -3952,16 +3952,19 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
             denied.denied,
             DeniedRequest::RouterBackpressure { .. }
         ));
+        let admission = denied.admission.expect("prefill admission");
+        assert!(admission.prefill_duration.is_some());
         assert_eq!(
-            denied.admission,
-            Some(crate::GenerationAdmission {
+            admission,
+            crate::GenerationAdmission {
                 estimated_overlap_tokens: 2 * u64::from(TEST_BLOCK_SIZE),
                 best_overlap_blocks: 5,
                 prefill_worker_id: 1,
                 prefill_dp_rank: 3,
                 decode_worker_id: None,
                 decode_dp_rank: None,
-            })
+                prefill_duration: admission.prefill_duration,
+            }
         );
         wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
         if let Some(server) = server {

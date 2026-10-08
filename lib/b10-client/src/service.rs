@@ -292,6 +292,7 @@ mod tests {
                         prefill_dp_rank: 1,
                         decode_worker_id: None,
                         decode_dp_rank: None,
+                        prefill_duration: Some(std::time::Duration::from_millis(12)),
                     },
                 }))
             })
@@ -357,6 +358,10 @@ mod tests {
             panic!("expected connected generation")
         };
         assert_eq!(generated.admission.prefill_worker_id, 7);
+        assert_eq!(
+            generated.admission.prefill_duration,
+            Some(std::time::Duration::from_millis(12))
+        );
         assert_eq!(
             map_value(
                 generated

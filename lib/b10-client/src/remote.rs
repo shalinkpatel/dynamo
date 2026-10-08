@@ -435,6 +435,8 @@ mod tests {
                         prefill_dp_rank: 1,
                         decode_worker_id: Some(20),
                         decode_dp_rank: Some(2),
+                        // Servers that predate the field omit it.
+                        prefill_duration_ms: None,
                     },
                 )),
             },
@@ -539,6 +541,7 @@ mod tests {
         };
         assert_eq!(generated.admission.prefill_worker_id, 10);
         assert_eq!(generated.admission.decode_worker_id, Some(20));
+        assert_eq!(generated.admission.prefill_duration, None);
         assert_eq!(
             generated.stream.next().await.unwrap().data,
             first_chunk.data
