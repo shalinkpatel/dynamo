@@ -11,7 +11,6 @@ mod context;
 mod coordinator;
 mod generation;
 mod guard;
-mod payload_copy;
 pub mod protocol;
 mod remote;
 mod runtime;

@@ -64,7 +64,6 @@ use super::guard::{
     ROUTER_GUARD_ATTEMPTS, ROUTER_GUARD_CALLBACK_TIMEOUT, ROUTER_GUARD_CLEANUP_GRACE_PERIOD,
     RouterRequestGuard, router_guard_notify_timeout,
 };
-use super::payload_copy::PayloadCopy;
 use super::types::{
     AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, RouteOptions, RouterRequestNew,
 };
@@ -432,11 +431,11 @@ fn cancellation_denial_for_optional_context(
         .and_then(|ctx| cancellation_denial_for_context(ctx, allow))
 }
 
-fn create_worker_request_context(
-    request: rmpv::Value,
+fn create_worker_request_context<T: Send + Sync>(
+    request: T,
     parent_ctx: &RequestContext,
     follow_parent_during_setup: bool,
-) -> RsContext<rmpv::Value> {
+) -> RsContext<T> {
     if follow_parent_during_setup {
         let child_ctx = RsContext::with_id_and_metadata(
             request,
@@ -1272,9 +1271,8 @@ enum OpenResult {
         timings: WorkerConnectTimings,
     },
     Stale {
-        /// `Some` on the proactive pre-check (staged copy never resolved,
-        /// reusable by the retry); `None` post-open (consumed by `direct()`).
-        payload: Option<PayloadCopy>,
+        /// Reuse the same owned payload after either stale-worker check.
+        payload: rmpv::Value,
     },
     Denied(DeniedRequest),
     Other(anyhow::Error),
@@ -1411,11 +1409,10 @@ fn prepend_first_worker_event(
 /// both proactively (before the open, to skip the network round-trip) and
 /// reactively (when `.direct()` returns an error and the worker has since
 /// vanished). A stale route returns [`OpenResult::Stale`] so the loop
-/// re-routes, carrying the staged `payload` back when the pre-check fired
-/// before it was resolved. A non-stale connection-class open error returns
-/// `Denied(FirstWorkerEventFailed)`; deterministic or untyped open errors and
-/// setup errors before the open (payload resolution, non-object
-/// `worker_args`) return [`OpenResult::Other`] so they are raised. The armed
+/// re-routes with the same owned payload. A non-stale connection-class open
+/// error returns `Denied(FirstWorkerEventFailed)`; deterministic or untyped
+/// open errors and non-object `worker_args` return [`OpenResult::Other`] so
+/// they are raised. The armed
 /// `guard` is moved INTO `open_fut` (the proactive pre-check alone does not
 /// move the guard because it returns before `open_fut` is constructed) so an
 /// outer cancellation during a shielded open drops the
@@ -1428,18 +1425,15 @@ fn prepend_first_worker_event(
 ///
 /// When `allow_cancel_setup` is false the open is detached via
 /// [`shield_to_completion`] so a Python cancellation cannot abort the setup,
-/// payload-copy resolution and `router_response` injection included.
+/// including `router_response` injection and borrowed payload dispatch.
 /// When `wait_for_first_response` is true, setup includes waiting for the first
 /// non-error worker stream event. The event is dropped only when it carries the
 /// drop-message sentinel; otherwise it is prepended back onto the returned stream.
-#[allow(clippy::too_many_arguments)]
 async fn connect_worker(
     worker_guard_client: Arc<dyn RouterGuardClient>,
     worker_id: u64,
     guard: RouterRequestGuard,
-    payload: PayloadCopy,
-    request_id: String,
-    phase: Option<String>,
+    mut worker_request: rmpv::Value,
     context: RequestContext,
     allow_cancel_setup: bool,
     wait_for_first_response: bool,
@@ -1451,12 +1445,12 @@ async fn connect_worker(
         );
         // Stale pre-check (before any open): free the guard now and wait for
         // the cleanup task to finish so the subsequent re-route does not race
-        // the prior mark_free. The unresolved copy goes back for the retry.
+        // the prior mark_free. The owned payload goes back for the retry.
         guard.mark_free();
         guard.wait_for_cleanup(ROUTER_GUARD_CALLBACK_TIMEOUT).await;
         drop(guard);
         return OpenResult::Stale {
-            payload: Some(payload),
+            payload: worker_request,
         };
     }
 
@@ -1468,16 +1462,7 @@ async fn connect_worker(
     // future resolves. The proactive stale pre-check above returns before
     // `open_fut` is constructed, so it does not move the guard.
     let open_fut = async move {
-        // Payload resolution is part of setup: it must sit inside the shield
-        // so a detached-setup policy admits no cancellation point between
-        // route admission and the worker open.
-        let mut worker_request = match payload.finish(&request_id, phase.as_deref()).await {
-            Ok(value) => value,
-            Err(err) => {
-                drop(guard);
-                return OpenResult::Other(err);
-            }
-        };
+        // The detached task owns the payload and borrows it only during dispatch.
         // Inject the per-route `RouterResponse::New` so the worker (or a
         // further forwarder) sees the routing decision.
         match &mut worker_request {
@@ -1496,10 +1481,10 @@ async fn connect_worker(
             }
         }
         let worker_request_ctx =
-            create_worker_request_context(worker_request, &open_ctx, allow_cancel_setup);
+            create_worker_request_context(&worker_request, &open_ctx, allow_cancel_setup);
         let stream_connect_started = Instant::now();
         let stream_result = wgc
-            .direct(worker_request_ctx, worker_id)
+            .direct_borrowed(worker_request_ctx, worker_id)
             .instrument(span)
             .await;
         let mut timings = WorkerConnectTimings {
@@ -1509,6 +1494,9 @@ async fn connect_worker(
         };
         match stream_result {
             Ok(mut stream) => {
+                // Dispatch has finished encoding/sending; the stream owns its state.
+                // Release large payload buffers before waiting for the first event.
+                drop(worker_request);
                 if wait_for_first_response {
                     let first_response_started = Instant::now();
                     let first = match wait_for_first_worker_event(&mut stream, worker_id).await {
@@ -1580,12 +1568,14 @@ async fn connect_worker(
                         error = %err,
                         "connect_worker: open failed and worker now absent (stale route)"
                     );
-                    // Stale post-open: free + wait as above. The resolved
-                    // copy is gone; the retry stages afresh.
+                    // Stale post-open: free + wait as above, then return the
+                    // payload. The next attempt replaces its router_response.
                     guard.mark_free();
                     guard.wait_for_cleanup(ROUTER_GUARD_CALLBACK_TIMEOUT).await;
                     drop(guard);
-                    OpenResult::Stale { payload: None }
+                    OpenResult::Stale {
+                        payload: worker_request,
+                    }
                 }
             }
         }
@@ -1682,12 +1672,11 @@ where
 /// bounded by `max_reroutes` (the initial attempt plus up to `max_reroutes`
 /// reroutes); exhausting the bound returns
 /// `DeniedRequest::NextRouterUnreachable { "stale route loop exhausted" }`.
-/// Each attempt sends a copy of
-/// `worker_request` with the per-route `RouterResponse::New` injected under
-/// the `router_response` field so the worker sees `worker_id` / `dp_rank` /
-/// `overlap_blocks` / `dp_strict_rank`; see `payload_copy.rs` for when that
-/// copy runs and what a denied route costs. `block_size` must match the routed KV
-/// router so the admitted log can derive token-level overlap estimates from
+/// Each attempt replaces the owned `worker_request`'s `router_response` with
+/// the per-route `RouterResponse::New` so the worker sees `worker_id` / `dp_rank` /
+/// `overlap_blocks` / `dp_strict_rank`. Dispatch borrows the payload, allowing
+/// stale retries to reuse it without a deep copy. `block_size` must match the
+/// routed KV router so the admitted log can derive token-level overlap estimates from
 /// `overlap_blocks`. The whole loop is run under the routing cancellation shield
 /// by the caller.
 #[allow(clippy::too_many_arguments)]
@@ -1698,7 +1687,7 @@ pub async fn route_and_connect(
     request_id: String,
     context: RequestContext,
     require: Vec<MinReplicaAvailable>,
-    worker_request: rmpv::Value,
+    mut worker_request: rmpv::Value,
     block_size: u32,
     max_reroutes: u64,
     allow_cancel_routing: bool,
@@ -1710,17 +1699,7 @@ pub async fn route_and_connect(
 ) -> Result<RouteAndConnectOutcome> {
     let started = Instant::now();
     let mut attempt: u64 = 0;
-    // The base payload is never mutated; `spare` holds a staged copy handed
-    // back by a stale pre-check so that retry does not stage again.
-    let worker_request = Arc::new(worker_request);
-    let mut spare: Option<PayloadCopy> = None;
     loop {
-        // Stage the payload copy, then route; it resolves inside
-        // `connect_worker`'s setup once the route is usable, and a denial
-        // abandons it without waiting (policy in payload_copy.rs).
-        let copy = spare
-            .take()
-            .unwrap_or_else(|| PayloadCopy::stage(Arc::clone(&worker_request)));
         let route_outcome = route_once(
             router_guard_client.clone(),
             routing_request.clone(),
@@ -1736,7 +1715,6 @@ pub async fn route_and_connect(
 
         let (guard, worker_id, route_timings) = match route_outcome {
             RouteOnceOutcome::Denied(denied) => {
-                copy.abandon();
                 log_route_and_connect_denied(&request_id, phase.as_deref(), None, attempt, &denied);
                 return Ok(RouteAndConnectOutcome::Denied(denied));
             }
@@ -1751,9 +1729,7 @@ pub async fn route_and_connect(
             worker_guard_client.clone(),
             worker_id,
             guard,
-            copy,
-            request_id.clone(),
-            phase.clone(),
+            worker_request,
             context.clone(),
             allow_cancel_setup,
             wait_for_first_response,
@@ -1850,9 +1826,7 @@ pub async fn route_and_connect(
                     );
                     return Ok(RouteAndConnectOutcome::Denied(denied));
                 }
-                // Pre-check stale hands the staged copy back; post-open
-                // stale consumed it and the retry stages afresh.
-                spare = returned;
+                worker_request = returned;
                 // The guard cleanup wait above observes the mark_free task reaching
                 // terminal state. Keep a short grace period before reusing the
                 // request id for a fresh route so router-side free processing is

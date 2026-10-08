@@ -108,6 +108,7 @@ struct RouterGuardClientForTesting {
     route_request_id_headers: Mutex<Vec<Option<String>>>,
     callback_request_id_headers: Mutex<Vec<Option<String>>>,
     calls: Mutex<Vec<(u64, rmpv::Value)>>,
+    borrowed_binary_buffers: Mutex<Vec<usize>>,
     load_query_sessions: Mutex<Vec<Option<String>>>,
     detailed_calls: Mutex<Vec<DetailedCall>>,
     shutdown_token: CancellationToken,
@@ -143,6 +144,7 @@ impl RouterGuardClientForTesting {
             route_request_id_headers: Mutex::new(Vec::new()),
             callback_request_id_headers: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
+            borrowed_binary_buffers: Mutex::new(Vec::new()),
             load_query_sessions: Mutex::new(Vec::new()),
             detailed_calls: Mutex::new(Vec::new()),
             shutdown_token: CancellationToken::new(),
@@ -271,6 +273,31 @@ impl RouterGuardClient for RouterGuardClientForTesting {
 
     fn stable_routing_id(&self, _worker_id: u64) -> Option<String> {
         None
+    }
+
+    async fn direct_borrowed(
+        &self,
+        request: RsContext<&rmpv::Value>,
+        instance_id: u64,
+    ) -> Result<EngineStream<RsAnnotated<rmpv::Value>>> {
+        let (value, context) = request.into_parts();
+        if let Some(bytes) = value["binary_payload"].as_slice() {
+            self.borrowed_binary_buffers
+                .lock()
+                .unwrap()
+                .push(bytes.as_ptr() as usize);
+        }
+        // Owned snapshots are only for the fake's call log. Production dispatch
+        // serializes the borrowed value directly without this clone.
+        let result = self
+            .direct(context.map(|()| value.clone()), instance_id)
+            .await;
+        // Keep reading the borrowed data after the open's cancellation/delay
+        // points, including when its caller was aborted during shielded setup.
+        if let Some(bytes) = value["binary_payload"].as_slice() {
+            assert!(bytes.iter().all(|&byte| byte == 7));
+        }
+        result
     }
 
     async fn direct(
@@ -844,6 +871,22 @@ fn make_routing_request() -> Arc<rmpv::Value> {
 
 fn make_worker_request() -> rmpv::Value {
     jv!({"method": "generate", "prompt": "hello"})
+}
+
+fn worker_request_with_binary() -> (rmpv::Value, usize) {
+    // Above the removed 8 MiB eager-copy threshold.
+    let bytes = vec![7; 9 << 20];
+    let address = bytes.as_ptr() as usize;
+    let mut request = make_worker_request();
+    let rmpv::Value::Map(map) = &mut request else {
+        unreachable!()
+    };
+    map.push(("binary_payload".into(), rmpv::Value::Binary(bytes)));
+    // Both old values must be replaced by exactly one response for this attempt.
+    for worker_id in [99, 100] {
+        map.push(("router_response".into(), jv!({"worker_id": worker_id})));
+    }
+    (request, address)
 }
 
 fn route_response_new(worker_id: u64) -> Result<RsRouterResponse, String> {
@@ -1560,6 +1603,7 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
     let worker = RouterGuardClientForTesting::new(vec![], vec![2], vec![route_response_new(2)]);
     let context = build_test_context("test-proactive-stale");
 
+    let (worker_request, binary_address) = worker_request_with_binary();
     let started = Instant::now();
     let outcome = connect(
         router.clone(),
@@ -1568,7 +1612,7 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
         "req-proactive-stale",
         context,
         Vec::new(),
-        make_worker_request(),
+        worker_request,
         1,
         true,
         true,
@@ -1613,6 +1657,10 @@ async fn route_and_connect_proactive_stale_reroutes_then_connects() {
         _ => panic!("worker request should be a map"),
     };
     assert_eq!(router_response_entries, 1);
+    assert_eq!(
+        *worker.borrowed_binary_buffers.lock().unwrap(),
+        vec![binary_address; 1]
+    );
     drop(outcome);
     wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 2);
@@ -1670,8 +1718,7 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     // {1, 2} so the proactive check passes; but the worker's first direct
     // returns Err and auto-removes worker 1 -- so the reactive stale
     // check inside connect_worker fires (worker now absent) and the loop
-    // reroutes. The first attempt's payload copy was consumed by the
-    // failed open, so the retry copies the base payload again. Second
+    // reroutes with the same payload returned by the failed borrowed open. Second
     // route returns worker 2 and (since worker 2 is still in the
     // instance set) connect succeeds.
     let router = RouterGuardClientForTesting::new(
@@ -1687,6 +1734,7 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     worker.set_auto_remove_on_error(true);
     let context = build_test_context("test-reactive-stale");
 
+    let (worker_request, binary_address) = worker_request_with_binary();
     let started = Instant::now();
     let outcome = connect(
         router.clone(),
@@ -1695,7 +1743,7 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
         "req-reactive-stale",
         context,
         Vec::new(),
-        make_worker_request(),
+        worker_request,
         1,
         true,
         true,
@@ -1720,9 +1768,11 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
     assert_eq!(router.method_call_count("new"), 2);
     // First worker direct errored (incomplete); second succeeded.
     assert_eq!(worker.completed_direct_count(), 1);
-    // The retry's payload is a fresh copy of the untouched base: original
-    // fields intact, exactly one `router_response` entry, attempt 2's id.
-    let retry_call = &worker.calls()[1];
+    // The retry reuses the original binary allocation and replaces the prior
+    // attempt's router_response, preserving all other fields.
+    let calls = worker.calls();
+    assert_eq!(calls[0].1["router_response"]["worker_id"].as_i64(), Some(1));
+    let retry_call = &calls[1];
     assert_eq!(retry_call.1["prompt"].as_str(), Some("hello"));
     assert_eq!(
         retry_call.1["router_response"]["worker_id"].as_i64(),
@@ -1736,6 +1786,10 @@ async fn route_and_connect_reactive_stale_reroutes_then_connects() {
         _ => panic!("worker request should be a map"),
     };
     assert_eq!(router_response_entries, 1);
+    assert_eq!(
+        *worker.borrowed_binary_buffers.lock().unwrap(),
+        vec![binary_address; 2]
+    );
     drop(outcome);
     wait_for_method_call_count(&router, "mark_free", 2, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 2);
@@ -2757,9 +2811,8 @@ async fn route_and_connect_detached_setup_completes_after_outer_abort() {
     // await is on the oneshot Receiver; when we abort the outer task
     // the Receiver is dropped, but the spawned open_fut keeps running
     // (its 200ms open_delay) and then completes -- pushing to
-    // detailed_calls with completed=true. Meanwhile the guard (still
-    // in connect_worker's frame) is dropped along with the outer task,
-    // its Drop fires mark_free on the router fake.
+    // detailed_calls with completed=true. The detached task owns both the
+    // borrowed payload and guard until setup finishes, then frees the booking.
     let router = RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
     let worker = RouterGuardClientForTesting::new(vec![], vec![1], vec![route_response_new(1)]);
     worker.set_open_delay(Duration::from_millis(200));
@@ -2768,7 +2821,7 @@ async fn route_and_connect_detached_setup_completes_after_outer_abort() {
     let router_for_task = router.clone();
     let worker_for_task = worker.clone();
     let routing_request = make_routing_request();
-    let worker_request = make_worker_request();
+    let (worker_request, binary_address) = worker_request_with_binary();
     let context_for_task = context.clone();
     let task = tokio::spawn(async move {
         connect(
@@ -2802,12 +2855,13 @@ async fn route_and_connect_detached_setup_completes_after_outer_abort() {
     wait_for_completion_count(&worker, 1, Duration::from_secs(2)).await;
     assert_eq!(worker.method_call_count("generate"), 1);
     assert_eq!(worker.completed_direct_count(), 1);
+    assert_eq!(
+        *worker.borrowed_binary_buffers.lock().unwrap(),
+        vec![binary_address]
+    );
 
-    // Guard drop fired (synchronously with the outer task drop) and the
-    // always-detached cleanup task then sent mark_free on the router
-    // fake. The worker's generation stream was wrapped by the shielded
-    // inner's oneshot Sender; once the inner finishes the stream is
-    // dropped (no consumer) and the guard is already gone.
+    // Once the shielded setup finishes, its output has no receiver. Dropping
+    // that output releases the guard and schedules mark_free on the router.
     wait_for_method_call_count(&router, "mark_free", 1, Duration::from_secs(2)).await;
     assert_eq!(router.method_call_count("mark_free"), 1);
 }

@@ -1712,19 +1712,20 @@ and
 `route_and_connect_unexpected_response_variant_fires_mark_free_then_denies_protocol_error`
 guard the invariant.
 
-v1.2 worker payload copy staging (PRs #511/#512/#513): the reroute loop no
-longer deep-copies the worker payload per attempt. `#511` builds the routing
-wire via msgpack instead of a `serde_json` round-trip, `#512` passes the
-routing request as `Arc<rmpv::Value>`, and `#513` adds
-`b10_client/payload_copy.rs`: each attempt's payload copy is a plain
-`rmpv::Value::clone` on the blocking pool, staged before the routing RPC for
-small payloads (hidden behind the round-trip) and after admission for large
-ones (rejected large-multimodal requests do no copy work), resolved inside
-`connect_worker`'s setup shield so `DetachSetupOnly` gains no new
-cancellation point, handed back unresolved on a proactive stale for the
-retry to reuse, and logged (`unhidden_ms` / `copy_ms` / `payload_mb`) when
-it keeps the critical path waiting beyond 40ms. Replay as part of the 1:1
-module copy; the eager cutoff lives in `EAGER_COPY_MAX_BYTES`.
+v1.2 worker payload ownership (PRs #511/#512/#513 and #991): `#511`
+builds the routing wire via msgpack instead of a `serde_json` round-trip,
+and `#512` passes the routing request as `Arc<rmpv::Value>`. The background
+worker-payload copy staging introduced by `#513` is superseded by payload
+reuse after the borrowed unary dispatch backport in `#991` (upstream
+ai-dynamo/dynamo#14829). `route_and_connect` owns one worker payload and
+moves it into each setup attempt; dispatch borrows it and both proactive
+and reactive stale failures return it for reuse. Each attempt replaces
+`router_response`, preserving the other fields and binary allocations.
+Detached setup owns the payload and guard through dispatch, retaining the
+existing cancellation and cleanup contract. Successful dispatch releases
+the payload before waiting for the first response. `payload_copy.rs`, its
+eager/deferred threshold, blocking copy tasks, and copy timing logs are
+removed; do not restore them when replaying this module.
 
 v1.2 packed routing tokens (`DYN_ROUTER_SEND_PACKED_TOKENS`): the `tokens`
 field of `RouterRequest::New` / `PotentialLoads` (kv-router `protocols.rs`,
