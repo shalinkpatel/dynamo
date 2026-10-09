@@ -1847,6 +1847,19 @@ endpoints reload without restarting the client. Replay config validation and
 request-local scoring together, retaining exact integer score, overflow, and
 config validation regression tests.
 
+Remote coordinator header forwarding:
+
+The HTTP service captures each request's incoming headers as JSON in the
+`baseten.forwarded_headers` context metadata key (`http::service::forwarded_headers`),
+excluding `Host`, `Accept`, `Content-Type` and connection-specific headers while
+keeping `Authorization`, repeated values and opaque bytes. The remote coordinator
+client consumes the key and sends the headers with the protobuf request; router and
+worker `.direct()` calls drop it, so it never reaches them or the protobuf metadata.
+Remote URLs stay exact coordinator URLs. Baseten-only: it lets a global frontend
+carry the client's auth to Alyx. When replaying, keep the capture in the OpenAI
+context builder (`context_from_headers_with_body_session`) and the Anthropic
+messages handler together with the `.direct()` drop.
+
 v1.2 read-only coordinator bids (#803):
 
 Coordinator bids use dedicated `RouterRequest::Bid` / `RouterResponse::Bid`
