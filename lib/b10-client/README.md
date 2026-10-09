@@ -56,6 +56,13 @@ result = await coordinator.generate(
 )
 ```
 
+Incoming HTTP headers are captured as JSON in `baseten.forwarded_headers` context
+metadata, excluding `Host`, `Accept`, and `Content-Type` while preserving
+`Authorization`, repeated values, and opaque bytes. Remote coordinators consume
+that key and forward the headers over HTTP; the protobuf client sets its own
+`Content-Type`, `Accept`, body framing, and response compression. Router/worker `.direct()` calls drop the
+key. Remote URLs remain exact coordinator URLs; no path rewriting is performed.
+
 The matching server is also implemented in Rust and merely lifecycle-managed
 through PyO3. Python starts it during normal container initialization; it does
 not decode protobufs or handle generation requests:

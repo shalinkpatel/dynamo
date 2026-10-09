@@ -27,6 +27,7 @@ pub mod b10_rate_limiter;
 pub mod busy_threshold;
 pub mod disconnect;
 pub mod error;
+pub mod forwarded_headers;
 pub mod health;
 pub mod health_b10;
 pub mod metrics;

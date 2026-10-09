@@ -10,6 +10,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use baseten_configmap::ConfigReader;
+use dynamo_llm::http::service::forwarded_headers;
 use dynamo_llm::session_affinity::{AffinityLease, AffinityTarget};
 use dynamo_runtime::pipeline::{EngineStream, ResponseStream};
 use dynamo_runtime::protocols::annotated::Annotated;
@@ -79,7 +80,8 @@ impl RemoteGenerationCoordinator {
         options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
         validate_remote_options(&options)?;
-        let wire_request = encode_request(&context, request)?;
+        let mut wire_request = encode_request(&context, request)?;
+        let headers = forwarded_headers::take(&mut wire_request.metadata)?;
         let request_context = context.inner();
         let session = wire_request
             .metadata
@@ -118,6 +120,7 @@ impl RemoteGenerationCoordinator {
         let send = self
             .client
             .post(endpoint)
+            .headers(headers)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 protocol::REQUEST_CONTENT_TYPE,

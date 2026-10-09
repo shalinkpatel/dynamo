@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use dynamo_llm::http::service::forwarded_headers::FORWARDED_HEADERS_METADATA_KEY;
 use dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY;
 use dynamo_runtime::logging::{self, DistributedTraceContext};
 use dynamo_runtime::pipeline::AsyncEngineContext;
@@ -42,6 +43,13 @@ impl RequestContext {
 
     pub fn metadata_snapshot(&self) -> BTreeMap<String, String> {
         self.metadata.clone()
+    }
+
+    /// Metadata for router/worker `.direct()` calls, excluding the HTTP envelope.
+    pub(crate) fn direct_metadata_snapshot(&self) -> BTreeMap<String, String> {
+        let mut metadata = self.metadata_snapshot();
+        metadata.remove(FORWARDED_HEADERS_METADATA_KEY);
+        metadata
     }
 
     /// Log the resolved session affinity ID and the configured metadata values.

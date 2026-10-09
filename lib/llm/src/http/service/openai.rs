@@ -465,6 +465,7 @@ fn context_from_headers_with_body_session<T: Send + Sync + 'static>(
     let mut metadata = extract_metadata_from_http(headers)
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
     insert_baseten_context_metadata(&mut metadata, headers);
+    super::forwarded_headers::capture(&mut metadata, headers);
     stamp_request_start(&mut metadata).map_err(|err| {
         ErrorMessage::internal_server_error(&format!(
             "system clock is before the Unix epoch: {err}"

@@ -227,6 +227,7 @@ async fn handler_anthropic_messages(
         )
     })?;
     insert_baseten_context_metadata(&mut metadata, &headers);
+    super::forwarded_headers::capture(&mut metadata, &headers);
     stamp_request_start(&mut metadata).map_err(|err| {
         anthropic_error(
             StatusCode::INTERNAL_SERVER_ERROR,

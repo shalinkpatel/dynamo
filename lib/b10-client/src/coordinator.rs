@@ -329,7 +329,7 @@ fn create_detached_router_request_context(
 ) -> (RsContext<rmpv::Value>, Option<tokio::task::JoinHandle<()>>) {
     let mut metadata = parent_ctx
         .as_ref()
-        .map(|ctx| ctx.metadata_snapshot())
+        .map(|ctx| ctx.direct_metadata_snapshot())
         .unwrap_or_default();
     // The router logs and spans `request-id` from this header, which the
     // egress otherwise derives from the context id. That is now the
@@ -440,7 +440,7 @@ fn create_worker_request_context<T: Send + Sync>(
         let child_ctx = RsContext::with_id_and_metadata(
             request,
             parent_ctx.id().to_string(),
-            parent_ctx.metadata_snapshot(),
+            parent_ctx.direct_metadata_snapshot(),
         );
         parent_ctx.inner().link_child(child_ctx.context());
         if parent_ctx.inner().is_stopped() || parent_ctx.inner().is_killed() {
@@ -453,7 +453,7 @@ fn create_worker_request_context<T: Send + Sync>(
         RsContext::with_id_and_metadata(
             request,
             parent_ctx.inner().id().to_string(),
-            parent_ctx.metadata_snapshot(),
+            parent_ctx.direct_metadata_snapshot(),
         )
     }
 }
