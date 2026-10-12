@@ -3695,6 +3695,7 @@ async fn generation_coordinator_empty_prefill_handoff_preserves_completion() {
                             yield RsAnnotated::from_annotation("metrics", &"ignored").unwrap();
                         }
                         yield RsAnnotated::from_data(completion);
+                        std::future::pending::<()>().await;
                     }));
                 *decode_worker.stream_override.lock().unwrap() = Some(Box::pin(
                     async_stream::stream! {
@@ -3754,6 +3755,128 @@ async fn generation_coordinator_empty_prefill_handoff_preserves_completion() {
                     server.shutdown().await.unwrap();
                 }
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn generation_coordinator_empty_prefill_handoff_waits_for_completion_without_eof() {
+    for remote in [false, true] {
+        let prefill_router =
+            RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
+        let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+        let decode_router =
+            RouterGuardClientForTesting::new(vec![8], vec![8], vec![route_response_new(2)]);
+        let decode_worker = RouterGuardClientForTesting::new(vec![2], vec![2], vec![]);
+        let release_prefill = Arc::new(tokio::sync::Notify::new());
+        let prefill_gate = release_prefill.clone();
+        let handoff = jv!({
+            "request_id": "sglang",
+            "finished": false,
+            "outputs": [{
+                "token_ids_diff": [],
+                "finish_reason": "length",
+                "disaggregated_params": {"request_type": "context_only"}
+            }]
+        });
+        let completion = jv!({
+            "request_id": "sglang",
+            "finished": true,
+            "cached_tokens": 2,
+            "kv_cache_metrics": {"num_reused_blocks": 2},
+            "outputs": [{
+                "token_ids_diff": [],
+                "finish_reason": "length",
+                "disaggregated_params": {"request_type": "context_only"}
+            }]
+        });
+        *prefill_worker.stream_override.lock().unwrap() = Some(Box::pin(async_stream::stream! {
+            yield RsAnnotated::from_data(handoff);
+            prefill_gate.notified().await;
+            yield RsAnnotated::from_data(completion);
+            std::future::pending::<()>().await;
+        }));
+        decode_worker.set_stream_chunks(vec![vec![
+            jv!({"outputs": [{"token_ids_diff": []}]}),
+            jv!({"cached_tokens": 0, "kv_cache_metrics": {"num_reused_blocks": 0},
+                 "outputs": [{"token_ids_diff": [10, 11]}]}),
+            jv!({"cached_tokens": 0, "outputs": [{"token_ids_diff": [12], "finish_reason": "stop"}]}),
+        ]]);
+        let coordinator = generation_coordinator(
+            prefill_router.clone(),
+            prefill_worker,
+            Some(decode_router.clone()),
+            Some(decode_worker),
+            DisaggregationStrategy::PrefillFirst,
+        );
+        let (coordinator, server) = generation_transport(coordinator, remote).await;
+        let outcome = coordinator
+            .generate(
+                build_test_context("sglang-stream"),
+                GenerationRequest {
+                    routing_request: RouterRequestNew {
+                        tokens: vec![1, 2, 3],
+                        ..Default::default()
+                    },
+                    primary_worker_request: make_worker_request(),
+                    decode_worker_request: Some(make_worker_request()),
+                },
+                GenerationOptions::default(),
+            )
+            .await
+            .unwrap();
+        let GenerationOutcome::Connected(generated) = outcome else {
+            panic!("expected connected")
+        };
+        let mut stream = generated.stream;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "decode tokens must wait for prefill completion"
+        );
+        release_prefill.notify_one();
+        let prefill = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(prefill["cached_tokens"].as_i64(), Some(2));
+        assert_eq!(prefill["kv_cache_metrics"], jv!({"num_reused_blocks": 2}));
+        assert!(prefill["outputs"][0]["finish_reason"].is_nil());
+        let first_decode = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("decode must not wait for prefill EOF")
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(first_decode["outputs"][0]["token_ids_diff"], jv!([10, 11]));
+        assert_eq!(first_decode["cached_tokens"].as_i64(), Some(0));
+        assert_eq!(
+            first_decode["kv_cache_metrics"],
+            jv!({"num_reused_blocks": 0})
+        );
+        let last = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(last["outputs"][0]["token_ids_diff"], jv!([12]));
+        assert_eq!(last["outputs"][0]["finish_reason"].as_str(), Some("stop"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
+        wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
+        assert_eq!(prefill_router.method_call_count("mark_free"), 1);
+        assert_eq!(decode_router.method_call_count("mark_free"), 1);
+        if let Some(server) = server {
+            server.shutdown().await.unwrap();
         }
     }
 }

@@ -1779,8 +1779,9 @@ the response stream.
 Admission carries `prefill_duration` (worker send to first prefill-leg response,
 no routing; wire field `prefill_duration_ms`), read by per-request metrics.
 
-SGLang empty-token handoffs retain the prefill stream until decode connects,
-then emit the final prefill completion with cache metrics before decode tokens.
+SGLang empty-token handoffs connect decode, then emit the final prefill
+completion with cache metrics before decode tokens. Retain the prefill stream
+through decode, but wait for explicit completion, not stream EOF (MOD2-335).
 Token-bearing TRT handoffs still emit immediately. Preserve late-prefill error
 and cancellation cleanup, DP-rank handoff metadata, and the local/remote
 regression tests when replaying.

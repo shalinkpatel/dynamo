@@ -409,7 +409,7 @@ impl GenerationCoordinator {
             map_get(first_output_mut(&mut prefill_response)?, "token_ids_diff")
                 .and_then(Value::as_array)
                 .is_some_and(Vec::is_empty);
-        let prefill_stream = empty_prefill_handoff.then_some(stream);
+        let mut prefill_stream = empty_prefill_handoff.then_some(stream);
         let machine_id = self.disagg_request_id_machine_id;
         let request_context = context.inner();
         let output = async_stream::stream! {
@@ -442,23 +442,20 @@ impl GenerationCoordinator {
                 }
             }
 
-            if let Some(mut stream) = prefill_stream {
+            if let Some(stream) = prefill_stream.as_mut() {
                 // SGLang cannot complete prefill until decode connects for KV transfer.
-                loop {
+                while prefill_response["finished"].as_bool() != Some(true) {
                     let item = tokio::select! {
                         biased;
                         _ = request_context.stopped() => return,
                         _ = request_context.killed() => return,
-                        item = next_visible_annotated(&mut stream) => item,
+                        item = next_visible_annotated(stream) => item,
                     };
                     let Some(item) = item else {
-                        if prefill_response["finished"].as_bool() == Some(false) {
-                            yield Annotated::from_error(
-                                "prefill stream ended before a completion response was produced",
-                            );
-                            return;
-                        }
-                        break;
+                        yield Annotated::from_error(
+                            "prefill stream ended before a completion response was produced",
+                        );
+                        return;
                     };
                     if item.is_error() {
                         yield item;
@@ -489,6 +486,9 @@ impl GenerationCoordinator {
                     return;
                 }
             }
+            // Hold prefill until decode ends so its worker never sees a Kill, matching
+            // the old drain-to-EOF behavior. SGLang has already released KV by `finished: true`.
+            drop(prefill_stream);
         };
         Ok(GenerationOutcome::Connected(GeneratedRequest {
             stream: ResponseStream::new(Box::pin(output), context.inner()),
