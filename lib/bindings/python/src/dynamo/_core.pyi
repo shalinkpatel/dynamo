@@ -103,6 +103,29 @@ class MediaEmbedding:
     def __repr__(self) -> str: ...
     def to_bytes(self) -> bytes: ...
 
+class MediaPreprocessor:
+    def __init__(
+        self,
+        *,
+        proxy: Optional[str] = None,
+        max_media_bytes: int = 67108864,
+        max_total_media_bytes: int = 268435456,
+        max_media_items: int = 256,
+        max_image_pixels: int = 64000000,
+        max_concurrent_resolutions: int = 64,
+    ) -> None: ...
+    async def resolve_image(self, source: str) -> Dict[str, Any]: ...
+    async def pre_resolve(
+        self,
+        input_ids: TokenIds,
+        requests: List[Dict[str, Any]],
+        *,
+        max_tokens: int,
+        model_config: Optional[Dict[str, Any]] = None,
+        preprocessor_config: Optional[Dict[str, Any]] = None,
+        tokenizer: Optional[Any] = None,
+    ) -> Dict[str, Any]: ...
+
 class MultiModalEncoderClient:
     def __init__(
         self,
@@ -129,6 +152,7 @@ class MultiModalEncoderClient:
         max_tokens: int,
         model_config: Optional[Dict[str, Any]] = None,
         preprocessor_config: Optional[Dict[str, Any]] = None,
+        tokenizer: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Return token_plan for both workers and base64 prefill_media for prefill only."""
         ...

@@ -37,6 +37,9 @@ pub enum TokenPlannerSpec {
     Kimi {
         config: serde_json::Value,
     },
+    Kimi3 {
+        config: serde_json::Value,
+    },
 }
 
 impl TokenPlannerSpec {
@@ -63,14 +66,20 @@ impl TokenPlannerSpec {
         preprocessor_config: serde_json::Value,
     ) -> Result<Self> {
         match config["model_type"].as_str() {
-            Some("kimi_k25" | "kimi_k26" | "kimi_k27" | "kimi_k3" | "kimi_k3_flash") => {
+            Some("kimi_k25" | "kimi_k26" | "kimi_k27") => {
                 KimiImageConfig::from_preprocessor_config(&preprocessor_config)?;
                 Ok(Self::Kimi {
                     config: preprocessor_config,
                 })
             }
-            Some("deepseek_v4") if config.get("vision_patch_size").is_some() => Ok(Self::Dsv41 {
-                config: serde_json::from_value(config)?,
+            Some("kimi_k3" | "kimi_k3_flash") => {
+                KimiImageConfig::from_preprocessor_config(&preprocessor_config)?;
+                Ok(Self::Kimi3 {
+                    config: preprocessor_config,
+                })
+            }
+            Some("deepseek_v4" | "deepseek_v41") => Ok(Self::Dsv41 {
+                config: Dsv41ImageConfig::from_hf_config(&config)?,
             }),
             Some(
                 "qwen2_vl" | "qwen2_5_vl" | "qwen3_vl" | "qwen3_vl_moe" | "qwen3_5" | "qwen3_5_moe",
@@ -129,6 +138,12 @@ pub struct MropePlan {
     pub delta: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Kimi3ImageFraming {
+    pub prefix_ids: Vec<i32>,
+    pub suffix_ids: Vec<i32>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PlannedMedia {
     pub request: EncodeRequest,
@@ -140,6 +155,8 @@ pub struct PlannedMedia {
     pub image_geometry: Option<Dsv41ImagePlan>,
     pub kimi_geometry: Option<KimiImagePlan>,
     pub qwen_geometry: Option<QwenImagePlan>,
+    #[serde(default)]
+    pub kimi3_framing: Option<Kimi3ImageFraming>,
 }
 
 impl PlannedMedia {
@@ -207,6 +224,13 @@ impl MediaResolver {
             requests.len() <= self.max_media_items,
             "Prompt exceeds media item limit"
         );
+        ensure!(
+            self.media_tokenizer.is_some()
+                || requests
+                    .iter()
+                    .all(|request| !matches!(request.planner, TokenPlannerSpec::Kimi3 { .. })),
+            "Native Kimi K3 planning requires a checkpoint media tokenizer"
+        );
         let budget = crate::media::MediaBudget::new(self.max_total_bytes);
         let budget = &budget;
         let positions = placeholder_positions(input_ids, &requests)?;
@@ -242,13 +266,23 @@ impl MediaResolver {
             item.request.media = resolved.media;
             let mut kimi_geometry = None;
             let mut qwen_geometry = None;
+            let mut kimi3_framing = None;
             let (length, feature_token_count, image_geometry) = match &item.planner {
-                TokenPlannerSpec::Kimi { config } => {
+                TokenPlannerSpec::Kimi { config } | TokenPlannerSpec::Kimi3 { config } => {
                     let image = resolved
                         .image
                         .context("Kimi native planning requires image media")?;
                     let geometry = KimiImageConfig::from_preprocessor_config(config)?
                         .plan(image.width, image.height)?;
+                    if matches!(item.planner, TokenPlannerSpec::Kimi3 { .. }) {
+                        let tokenizer = self.media_tokenizer.as_ref().context("Kimi K3 requires a media tokenizer")?;
+                        let prefix_ids = tokenizer(&format!("<|media_begin|>image {}x{}<|media_content|>", image.width, image.height))?;
+                        let suffix_ids = tokenizer("<|media_end|>")?;
+                        ensure!(!prefix_ids.is_empty() && !suffix_ids.is_empty()
+                            && prefix_ids.iter().chain(&suffix_ids).all(|&id| id >= 0 && id != item.placeholder_token_id),
+                            "Kimi K3 framing must contain nonnegative control/text IDs without image placeholders");
+                        kimi3_framing = Some(Kimi3ImageFraming { prefix_ids, suffix_ids });
+                    }
                     let length = geometry.num_tokens;
                     kimi_geometry = Some(geometry);
                     (length, length as usize, None)
@@ -299,6 +333,7 @@ impl MediaResolver {
                 image_geometry,
                 kimi_geometry,
                 qwen_geometry,
+                kimi3_framing,
             })
         }))
         .await?;
@@ -355,6 +390,15 @@ impl MediaResolver {
                 }
                 parts.push(ExpansionPart::Literal(vec![id]));
                 parts
+            } else if let Some(framing) = &item.kimi3_framing {
+                vec![
+                    ExpansionPart::Literal(framing.prefix_ids.clone()),
+                    ExpansionPart::Feature {
+                        id,
+                        n: item.feature_token_count,
+                    },
+                    ExpansionPart::Literal(framing.suffix_ids.clone()),
+                ]
             } else {
                 vec![ExpansionPart::Feature {
                     id,
@@ -398,11 +442,26 @@ impl MediaResolver {
         } else {
             None
         };
+        // K3 control framing is ordinary text; SGLang's image offsets cover
+        // only the feature-token run. DSV4.1 still includes its learned types.
+        let offsets: Vec<_> = media
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                if item.kimi3_framing.is_some() {
+                    let range = expanded.feature_ranges[index]
+                        .first()
+                        .context("Kimi K3 feature range is missing")?;
+                    Ok((range.start, range.end - 1))
+                } else {
+                    Ok(expanded.offsets[index])
+                }
+            })
+            .collect::<Result<_>>()?;
         let token_plan = TokenPlan {
             input_ids: expanded.input_ids,
-            mm_positions: expanded.offsets.iter().map(|&(start, _)| start).collect(),
-            mm_lengths: expanded
-                .offsets
+            mm_positions: offsets.iter().map(|&(start, _)| start).collect(),
+            mm_lengths: offsets
                 .iter()
                 .map(|&(start, end)| end - start + 1)
                 .collect(),
@@ -583,6 +642,113 @@ mod tests {
         }
     }
 
+    fn kimi3() -> TokenPlannerSpec {
+        let TokenPlannerSpec::Kimi { config } = kimi() else {
+            unreachable!()
+        };
+        TokenPlannerSpec::Kimi3 { config }
+    }
+
+    // Synthetic tokenizer: verify the exact framing text, not checkpoint vocab IDs.
+    fn k3_tokenizer(text: &str) -> Result<Vec<i32>> {
+        if text == "<|media_end|>" {
+            return Ok(vec![903]);
+        }
+        let dimensions = text
+            .strip_prefix("<|media_begin|>image ")
+            .and_then(|text| text.strip_suffix("<|media_content|>"))
+            .context("Unexpected K3 framing text")?;
+        let (width, height) = dimensions
+            .split_once('x')
+            .context("Missing K3 dimensions")?;
+        Ok(vec![901, width.parse()?, height.parse()?, 902])
+    }
+
+    #[tokio::test]
+    async fn kimi3_frames_original_dimensions_and_records_feature_only_spans() -> Result<()> {
+        let resolver = MediaResolver::new(MediaResolverConfig::default())?
+            .with_media_tokenizer(std::sync::Arc::new(k3_tokenizer));
+        let mut planner = kimi3();
+        if let TokenPlannerSpec::Kimi3 { config } = &mut planner {
+            config["media_proc_cfg"]["in_patch_limit"] = 4.into();
+        }
+        let inputs = vec![image("k3", 100, planner.clone()), image("k3", 100, planner)];
+        let plan = resolver
+            .pre_resolve(&[1, 100, 2, 100, 3], inputs.clone(), 17, None)
+            .await?;
+        assert_eq!(
+            plan.token_plan.input_ids,
+            [
+                1, 901, 84, 56, 902, 100, 100, 903, 2, 901, 84, 56, 902, 100, 100, 903, 3
+            ]
+        );
+        assert_eq!(plan.token_plan.mm_positions, [5, 13]);
+        assert_eq!(plan.token_plan.mm_lengths, [2, 2]);
+        assert_eq!(plan.token_plan.feature_ranges[0].len(), 1);
+        assert_eq!(plan.token_plan.feature_ranges[0][0], 5..7);
+        assert_eq!(plan.token_plan.feature_ranges[1].len(), 1);
+        assert_eq!(plan.token_plan.feature_ranges[1][0], 13..15);
+        assert_eq!(
+            plan.prefill_media[0]
+                .kimi_geometry
+                .as_ref()
+                .unwrap()
+                .new_width,
+            34
+        );
+        assert_eq!(plan.prefill_media[0].length, 2);
+        assert_eq!(
+            plan.prefill_media[0]
+                .kimi3_framing
+                .as_ref()
+                .unwrap()
+                .prefix_ids,
+            [901, 84, 56, 902]
+        );
+        let roundtrip: PreResolvedRequest = serde_json::from_str(&serde_json::to_string(&plan)?)?;
+        assert_eq!(roundtrip.token_plan.input_ids, plan.token_plan.input_ids);
+        assert!(
+            resolver
+                .pre_resolve(&[1, 100, 2, 100, 3], inputs, 16, None)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kimi3_requires_a_tokenizer_and_rejects_invalid_framing() -> Result<()> {
+        let resolver = MediaResolver::new(MediaResolverConfig::default())?;
+        let mut item = image("k3", 100, kimi3());
+        item.request
+            .media
+            .set_url("http://localhost:1/never-fetch".into());
+        assert!(
+            resolver
+                .pre_resolve(&[100], vec![item], 100, None)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("checkpoint media tokenizer")
+        );
+        for ids in [vec![], vec![-1], vec![100]] {
+            let resolver = resolver
+                .clone()
+                .with_media_tokenizer(std::sync::Arc::new(move |_| Ok(ids.clone())));
+            assert!(
+                resolver
+                    .pre_resolve(&[100], vec![image("k3", 100, kimi3())], 100, None)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("framing must contain")
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn rejects_mixed_qwen_plans_before_resolving_or_encoding() -> Result<()> {
         let resolver = MediaResolver::new(MediaResolverConfig::default())?;
@@ -758,7 +924,7 @@ mod tests {
                     serde_json::json!({"model_type":model}),
                     processor
                 )?,
-                TokenPlannerSpec::Kimi { .. }
+                TokenPlannerSpec::Kimi { .. } | TokenPlannerSpec::Kimi3 { .. }
             ));
             assert!(
                 TokenPlannerSpec::from_hf_configs(
@@ -948,7 +1114,8 @@ mod tests {
                     ..Default::default()
                 },
                 ..Default::default()
-            })?;
+            })?
+            .with_media_tokenizer(std::sync::Arc::new(k3_tokenizer));
             let kimi = TokenPlannerSpec::Kimi {
                 config: serde_json::json!({"media_proc_cfg":{
                     "patch_size":14,"merge_kernel_size":2,"in_patch_limit":65536,
@@ -957,7 +1124,7 @@ mod tests {
             };
             for (model, planner) in [
                 ("kimi-k27", kimi.clone()),
-                ("kimi-k3", kimi),
+                ("kimi-k3", kimi3()),
                 ("dsv4.1", dsv41()),
                 ("qwen", qwen()),
             ] {

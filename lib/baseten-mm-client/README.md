@@ -43,10 +43,30 @@ unexpanded token IDs. It returns `PreResolvedRequest` with:
 
 | Image family | Planner | Checkpoint settings |
 | --- | --- | --- |
-| Kimi K2.7 / K3 (also K2.5, K2.6, K3 Flash aliases) | Baseten NaViT adapter | `media_proc_cfg`: patch size, merger, patch and side budgets, optional fixed output length |
-| DSV4.1 (`deepseek_v4`) | Baseten resize adapter | `vision_*` geometry and token budget |
+| Kimi K2.7 (also K2.5, K2.6) | Baseten NaViT adapter | `media_proc_cfg`: patch size, merger, patch and side budgets, optional fixed output length |
+| Kimi K3 / K3 Flash | NaViT plus checkpoint-tokenized media framing | Same geometry config and the serving checkpoint tokenizer |
+| DSV4.1 (`deepseek_v4`, `deepseek_v41`) | Baseten resize adapter | `vision_*` geometry and token budget |
 | Qwen VL / 3.5 | Pinned upstream processor | HF model and preprocessor configs |
 | Other models, audio and video | Configured encoder metadata | Encoder-reported exact hash and length |
+
+Kimi K3/K3 Flash adds the tokenized prefix
+`<|media_begin|>image WIDTHxHEIGHT<|media_content|>` and suffix `<|media_end|>`
+around each feature run, matching the
+[pinned SGLang processor](https://github.com/sgl-project/sglang/blob/ffac53d779c08dcdab2d07e5e2a41dba83f0e65c/python/sglang/srt/multimodal/processors/kimi_k3.py).
+The dimensions are the original image dimensions after EXIF orientation, even when NaViT resizes the
+image. These control/text IDs are part of the expanded context limit;
+`mm_positions`, `mm_lengths` and `feature_ranges` cover only the feature tokens,
+as SGLang image offsets do. Kimi K2.7 retains its existing template framing.
+
+Pass the checkpoint tokenizer as Python `pre_resolve(..., tokenizer=tokenizer)`
+for native K3 planning. The binding uses `encode(text, allowed_special="all")`,
+with the pinned processor's `encode(text)` fallback for tokenizers without that
+keyword. Rust callers attach an existing serving tokenizer with
+`resolver.with_media_tokenizer(Arc::new(...))`; the callback returns `Vec<i32>`
+and must preserve media special tokens without adding unrelated BOS/EOS tokens.
+The tokenizer is never serialized to workers. Missing tokenizers fail before
+fetching/encoding rather than producing an incomplete K3 prompt. The prefill
+record retains the framing IDs in `kimi3_framing`.
 
 The native Kimi and DSV4.1 geometry matches SGLang revision
 `ffac53d779c08dcdab2d07e5e2a41dba83f0e65c`. Native image planning inspects compressed
@@ -58,7 +78,20 @@ IMAGE, NEW_LINE and END (0/1/2/3); SGLang repeats `image_token_id` throughout th
 span and uses these types to attach learned boundary/row features. Placeholder counts/order and the expanded
 context limit are validated before returning a plan.
 
-Python exposes this through the existing encoder client:
+Python native-only callers can use `MediaPreprocessor()` without configuring an
+encoder URL or API key. Its `pre_resolve` has the same planning arguments shown
+below, and `resolve_image(source)` returns canonical base64, content hash and
+EXIF-oriented dimensions. Reuse one instance across requests: resolver clones
+share the HTTP pool and resolution semaphore. BDN provides download caching;
+this API does not add a separate content or URL cache. Native-only planning
+errors raise `ValueError`; unsupported families need an encoder client.
+
+DSV4.1 accepts flat `vision_*` fields or nested `vision_config` fields
+(`patch_size`, `downsample_ratio`, `max_image_tokens`, `min_pixels`,
+`max_wh_ratio`). Header inspection honors JPEG, PNG and WebP EXIF orientation
+without changing compressed bytes, content hashes or canonical media.
+
+Python also exposes planning through the existing encoder client:
 
 ```python
 from dynamo._core import MultiModalEncoderClient

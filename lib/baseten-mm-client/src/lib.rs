@@ -13,12 +13,13 @@ pub use dsv41::{Dsv41ImageConfig, Dsv41ImagePlan};
 pub use dynamo_multimodal as multimodal;
 pub use kimi::{KimiImageConfig, KimiImagePlan};
 pub use media::{
-    ImageDimensions, MediaResolver, MediaResolverConfig, ResolvedImage, ResolvedMedia,
+    ImageDimensions, MediaResolver, MediaResolverConfig, MediaTokenizer, ResolvedImage,
+    ResolvedMedia,
 };
 pub use media_fetcher::MediaFetcher;
 pub use planning::{
-    MropePlan, PlannedMedia, PlanningRequest, PreResolvedRequest, QwenImagePlan, TokenPlan,
-    TokenPlannerSpec,
+    Kimi3ImageFraming, MropePlan, PlannedMedia, PlanningRequest, PreResolvedRequest, QwenImagePlan,
+    TokenPlan, TokenPlannerSpec,
 };
 pub use types::{
     Detail, EmbeddingPayload, EncodeRequest, EncoderMetadata, EncoderRejection, Media,
@@ -33,6 +34,7 @@ pub const NATIVE_IMAGE_FAMILIES: &[&str] = &[
     "kimi_k3",
     "kimi_k3_flash",
     "deepseek_v4",
+    "deepseek_v41",
     "qwen2_vl",
     "qwen2_5_vl",
     "qwen3_vl",

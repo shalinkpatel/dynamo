@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use baseten_mm_client::{
     HttpEncoderConfig, Media, MediaResolver, MediaResolverConfig, MultiModalClient, PlannedMedia,
     PlanningRequest, ProductionBdnProxyRequired, TokenPlannerSpec,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
@@ -274,7 +274,8 @@ impl MultiModalEncoderClient {
         })
     }
 
-    #[pyo3(signature = (input_ids, requests, *, max_tokens, model_config=None, preprocessor_config=None))]
+    #[pyo3(signature = (input_ids, requests, *, max_tokens, model_config=None, preprocessor_config=None, tokenizer=None))]
+    #[allow(clippy::too_many_arguments)]
     fn pre_resolve<'py>(
         &self,
         py: Python<'py>,
@@ -283,39 +284,19 @@ impl MultiModalEncoderClient {
         max_tokens: usize,
         model_config: Option<&Bound<'py, PyAny>>,
         preprocessor_config: Option<&Bound<'py, PyAny>>,
+        tokenizer: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let input_ids: Vec<i32> = crate::tokens::extract_list_or_numpy_u32(input_ids)?
-            .into_iter()
-            .map(|id| {
-                i32::try_from(id).map_err(|_| PyValueError::new_err("Token IDs must fit i32"))
-            })
-            .collect::<PyResult<_>>()?;
-        let mut requests: Vec<PlanningRequest> = pythonize::depythonize(requests)?;
-        if let Some(config) = model_config {
-            let config = pythonize::depythonize(config)?;
-            let preprocessor = match preprocessor_config {
-                Some(value) => pythonize::depythonize(value)?,
-                None => serde_json::Value::Object(Default::default()),
-            };
-            let planner =
-                TokenPlannerSpec::from_hf_configs(config, preprocessor).map_err(to_pyerr)?;
-            for request in &mut requests {
-                if matches!(request.request.media, Media::Image { .. })
-                    && matches!(request.planner, TokenPlannerSpec::Encoder)
-                {
-                    request.planner = planner.clone();
-                }
-            }
-        }
-        let transport = self.transport.clone();
-        let resolver = self.resolver.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let resolved = transport
-                .pre_resolve(&resolver, &input_ids, requests, max_tokens)
-                .await
-                .map_err(encoder_error)?;
-            Python::with_gil(|py| Ok(pythonize::pythonize(py, &resolved)?.unbind()))
-        })
+        pre_resolve_python(
+            py,
+            self.resolver.clone(),
+            Some(self.transport.clone()),
+            input_ids,
+            requests,
+            max_tokens,
+            model_config,
+            preprocessor_config,
+            tokenizer,
+        )
     }
 
     fn call_batch<'py>(
@@ -425,5 +406,150 @@ mod tests {
         );
         assert!(fill_mm_kwargs(&mut request, vec![(3, vec![3])]).is_err());
         assert!(fill_mm_kwargs(&mut map(vec![]), vec![(0, vec![1])]).is_err());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pre_resolve_python<'py>(
+    py: Python<'py>,
+    resolver: MediaResolver,
+    transport: Option<MultiModalClient>,
+    input_ids: &Bound<'py, PyAny>,
+    requests: &Bound<'py, PyAny>,
+    max_tokens: usize,
+    model_config: Option<&Bound<'py, PyAny>>,
+    preprocessor_config: Option<&Bound<'py, PyAny>>,
+    tokenizer: Option<Py<PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let native_only = transport.is_none();
+    let input_ids: Vec<i32> = crate::tokens::extract_list_or_numpy_u32(input_ids)?
+        .into_iter()
+        .map(|id| i32::try_from(id).map_err(|_| PyValueError::new_err("Token IDs must fit i32")))
+        .collect::<PyResult<_>>()?;
+    let mut requests: Vec<PlanningRequest> = pythonize::depythonize(requests)?;
+    if let Some(config) = model_config {
+        let config = pythonize::depythonize(config)?;
+        let preprocessor = match preprocessor_config {
+            Some(value) => pythonize::depythonize(value)?,
+            None => serde_json::Value::Object(Default::default()),
+        };
+        let planner = TokenPlannerSpec::from_hf_configs(config, preprocessor).map_err(|error| {
+            if native_only {
+                PyValueError::new_err(error.to_string())
+            } else {
+                to_pyerr(error)
+            }
+        })?;
+        for request in &mut requests {
+            if matches!(request.request.media, Media::Image { .. })
+                && matches!(request.planner, TokenPlannerSpec::Encoder)
+            {
+                request.planner = planner.clone();
+            }
+        }
+    }
+    let mut resolver = resolver;
+    if let Some(tokenizer) = tokenizer {
+        resolver = resolver.with_media_tokenizer(Arc::new(move |text| {
+            Python::with_gil(|py| {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("allowed_special", "all")?;
+                let result = match tokenizer.call_method(py, "encode", (text,), Some(&kwargs)) {
+                    Ok(result) => result,
+                    Err(error) if error.is_instance_of::<PyTypeError>(py) => {
+                        tokenizer.call_method1(py, "encode", (text,))?
+                    }
+                    Err(error) => return Err(error),
+                };
+                crate::tokens::extract_list_or_numpy_u32(result.bind(py))?
+                    .into_iter()
+                    .map(|id| {
+                        i32::try_from(id)
+                            .map_err(|_| PyValueError::new_err("Media framing IDs must fit i32"))
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .map_err(|error| anyhow::anyhow!("Kimi K3 media tokenization failed: {error}"))
+        }));
+    }
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let resolved = resolver
+            .pre_resolve(&input_ids, requests, max_tokens, transport.as_ref())
+            .await
+            .map_err(|error| {
+                if native_only {
+                    PyValueError::new_err(error.to_string())
+                } else {
+                    encoder_error(error)
+                }
+            })?;
+        Python::with_gil(|py| Ok(pythonize::pythonize(py, &resolved)?.unbind()))
+    })
+}
+
+#[pyclass(frozen, name = "MediaPreprocessor")]
+pub(crate) struct MediaPreprocessor {
+    resolver: MediaResolver,
+}
+
+#[pymethods]
+impl MediaPreprocessor {
+    #[new]
+    #[pyo3(signature = (*, proxy=None, max_media_bytes=67108864, max_total_media_bytes=268435456, max_media_items=256, max_image_pixels=64000000, max_concurrent_resolutions=64))]
+    fn new(
+        proxy: Option<String>,
+        max_media_bytes: usize,
+        max_total_media_bytes: usize,
+        max_media_items: usize,
+        max_image_pixels: u64,
+        max_concurrent_resolutions: usize,
+    ) -> PyResult<Self> {
+        let resolver = MediaResolver::new(MediaResolverConfig {
+            proxy,
+            max_bytes: max_media_bytes,
+            max_total_bytes: max_total_media_bytes,
+            max_media_items,
+            max_image_pixels,
+            max_concurrent_resolutions,
+            ..Default::default()
+        })
+        .map_err(to_pyerr)?;
+        Ok(Self { resolver })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (input_ids, requests, *, max_tokens, model_config=None, preprocessor_config=None, tokenizer=None))]
+    fn pre_resolve<'py>(
+        &self,
+        py: Python<'py>,
+        input_ids: &Bound<'py, PyAny>,
+        requests: &Bound<'py, PyAny>,
+        max_tokens: usize,
+        model_config: Option<&Bound<'py, PyAny>>,
+        preprocessor_config: Option<&Bound<'py, PyAny>>,
+        tokenizer: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        pre_resolve_python(
+            py,
+            self.resolver.clone(),
+            None,
+            input_ids,
+            requests,
+            max_tokens,
+            model_config,
+            preprocessor_config,
+            tokenizer,
+        )
+    }
+
+    fn resolve_image<'py>(&self, py: Python<'py>, source: String) -> PyResult<Bound<'py, PyAny>> {
+        let resolver = self.resolver.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let image = resolver
+                .resolve_image(&source)
+                .await
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            Python::with_gil(|py| Ok(pythonize::pythonize(py, &image)?.unbind()))
+        })
     }
 }

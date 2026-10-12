@@ -9,6 +9,7 @@ use std::sync::{
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use dynamo_multimodal::processor::{MediaMetadata, MmFamilyProcessor};
+use image::ImageDecoder;
 use serde::{Deserialize, Serialize};
 
 use crate::{Dsv41ImageConfig, Dsv41ImagePlan, Media, MediaFetcher, bdn_proxy};
@@ -80,6 +81,10 @@ impl ResolvedImage {
     }
 }
 
+/// Checkpoint tokenizer for model-specific media control text. Must preserve
+/// special tokens and omit unrelated BOS/EOS tokens.
+pub type MediaTokenizer = Arc<dyn Fn(&str) -> Result<Vec<i32>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct MediaResolver {
     client: reqwest::Client,
@@ -89,6 +94,7 @@ pub struct MediaResolver {
     pub(crate) max_media_items: usize,
     max_image_pixels: u64,
     slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) media_tokenizer: Option<MediaTokenizer>,
 }
 
 pub(crate) struct MediaBudget {
@@ -139,10 +145,17 @@ impl MediaResolver {
             max_total_bytes: config.max_total_bytes,
             max_media_items: config.max_media_items,
             max_image_pixels: config.max_image_pixels,
+            media_tokenizer: None,
             slots: Arc::new(tokio::sync::Semaphore::new(
                 config.max_concurrent_resolutions,
             )),
         })
+    }
+
+    /// Supply a tokenizer without placing it in serializable media plans.
+    pub fn with_media_tokenizer(mut self, tokenizer: MediaTokenizer) -> Self {
+        self.media_tokenizer = Some(tokenizer);
+        self
     }
 
     /// Resolve HTTP(S), a base64 data URI, or bare base64 to canonical media.
@@ -158,7 +171,7 @@ impl MediaResolver {
         budget: Option<&MediaBudget>,
     ) -> Result<ResolvedImage> {
         let bytes = self.resolve_bytes(source, budget).await?;
-        let (height, width) = dynamo_multimodal::image::decode::dimensions(&bytes)?;
+        let (mut height, mut width) = dynamo_multimodal::image::decode::dimensions(&bytes)?;
         ensure!(width > 0 && height > 0, "Image dimensions must be positive");
         ensure!(
             (width as u64)
@@ -166,7 +179,39 @@ impl MediaResolver {
                 .is_some_and(|pixels| pixels <= self.max_image_pixels),
             "Image exceeds original pixel limit"
         );
-        let mime = image::guess_format(&bytes)?.to_mime_type();
+        let format = image::guess_format(&bytes)?;
+        // Preserve formats supported by the upstream dimension reader even
+        // when image does not enable a corresponding pixel decoder (e.g. GIF).
+        let orientation = if matches!(
+            format,
+            image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::WebP
+        ) {
+            let mut decoder = image::ImageReader::new(std::io::Cursor::new(&bytes))
+                .with_guessed_format()?
+                .into_decoder()?;
+            // WebP encoders may retain the JPEG-style Exif prefix; Pillow accepts
+            // both representations. image's orientation helper only accepts TIFF.
+            let exif = decoder.exif_metadata()?;
+            exif.as_deref()
+                .and_then(|bytes| {
+                    image::metadata::Orientation::from_exif_chunk(
+                        bytes.strip_prefix(b"Exif\0\0").unwrap_or(bytes),
+                    )
+                })
+                .unwrap_or(image::metadata::Orientation::NoTransforms)
+        } else {
+            image::metadata::Orientation::NoTransforms
+        };
+        if matches!(
+            orientation,
+            image::metadata::Orientation::Rotate90
+                | image::metadata::Orientation::Rotate270
+                | image::metadata::Orientation::Rotate90FlipH
+                | image::metadata::Orientation::Rotate270FlipH
+        ) {
+            std::mem::swap(&mut width, &mut height);
+        }
+        let mime = format.to_mime_type();
         Ok(ResolvedImage {
             data_url: format!("data:{mime};base64,{}", STANDARD.encode(&bytes)),
             content_hash: blake3::hash(&bytes).to_hex().to_string(),
@@ -291,8 +336,154 @@ impl MediaResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder;
 
     use crate::TEST_IMAGE_BASE64 as PNG;
+
+    // Minimal TIFF IFD with one SHORT Orientation entry. Both byte orders are
+    // accepted by Pillow's EXIF reader and by image's header-only reader.
+    fn orientation_exif(orientation: u16, big_endian: bool) -> Vec<u8> {
+        if big_endian {
+            let mut exif = b"MM\0*\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01".to_vec();
+            exif.extend_from_slice(&orientation.to_be_bytes());
+            exif.extend_from_slice(&[0; 6]);
+            exif
+        } else {
+            let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+            exif.extend_from_slice(&orientation.to_le_bytes());
+            exif.extend_from_slice(&[0; 6]);
+            exif
+        }
+    }
+
+    fn image_with_exif(format: image::ImageFormat, exif: Vec<u8>) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let pixels = vec![127; 84 * 56 * 3];
+        match format {
+            image::ImageFormat::Jpeg => {
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut bytes);
+                encoder.set_exif_metadata(exif)?;
+                encoder.write_image(&pixels, 84, 56, image::ExtendedColorType::Rgb8)?;
+            }
+            image::ImageFormat::Png => {
+                let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+                encoder.set_exif_metadata(exif)?;
+                encoder.write_image(&pixels, 84, 56, image::ExtendedColorType::Rgb8)?;
+            }
+            image::ImageFormat::WebP => {
+                let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+                encoder.set_exif_metadata(exif)?;
+                encoder.write_image(&pixels, 84, 56, image::ExtendedColorType::Rgb8)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(bytes)
+    }
+
+    #[tokio::test]
+    async fn gif_inputs_do_not_require_an_exif_decoder() -> Result<()> {
+        let resolver = local_resolver(64 << 10)?;
+        let gif = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+        let resolved = resolver.resolve_image(gif).await?;
+        assert_eq!((resolved.width, resolved.height), (1, 1));
+        assert_eq!(resolved.data_url, format!("data:image/gif;base64,{gif}"));
+        assert_eq!(
+            resolved.content_hash,
+            blake3::hash(&STANDARD.decode(gif)?).to_hex().to_string()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exif_geometry_matches_worker_transpose_and_preserves_payload() -> Result<()> {
+        let resolver = local_resolver(64 << 10)?;
+        let config = Dsv41ImageConfig {
+            vision_patch_size: 14,
+            vision_downsample_ratio: 3,
+            vision_max_n_token: 1024,
+            vision_min_pixels: 295936,
+            vision_max_wh_ratio: None,
+        };
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Png,
+            image::ImageFormat::WebP,
+        ] {
+            for big_endian in [false, true] {
+                // Invalid values are ignored, as in Pillow ImageOps.exif_transpose.
+                for orientation in 0..=9 {
+                    let bytes = image_with_exif(format, orientation_exif(orientation, big_endian))?;
+                    let base64 = STANDARD.encode(&bytes);
+                    let resolved = resolver.resolve_image(&base64).await?;
+                    let rotated = (5..=8).contains(&orientation);
+                    let expected = if rotated { (56, 84) } else { (84, 56) };
+                    assert_eq!(
+                        (resolved.width, resolved.height),
+                        expected,
+                        "{format:?}, EXIF={orientation}, big_endian={big_endian}"
+                    );
+                    assert_eq!(
+                        resolved.content_hash,
+                        blake3::hash(&bytes).to_hex().as_str()
+                    );
+                    assert_eq!(
+                        resolved.data_url,
+                        format!("data:{};base64,{base64}", format.to_mime_type())
+                    );
+                    // DSV includes row separators: the two views have different
+                    // lengths, even though their pixel and feature counts agree.
+                    assert_eq!(
+                        resolved.dsv41_plan(&config)?.num_tokens,
+                        if rotated { 194 } else { 189 }
+                    );
+                }
+            }
+        }
+        // Pillow writes an Exif\0\0 prefix into WebP's EXIF chunk. It must
+        // produce the same geometry as the TIFF-only WebP representation.
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend(orientation_exif(6, false));
+        let bytes = image_with_exif(image::ImageFormat::WebP, exif)?;
+        let resolved = resolver.resolve_image(&STANDARD.encode(bytes)).await?;
+        assert_eq!((resolved.width, resolved.height), (56, 84));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_exif_is_ignored_without_decoding_pixels() -> Result<()> {
+        let resolver = local_resolver(64 << 10)?;
+        let mut bad_offset = orientation_exif(6, false);
+        bad_offset[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Png,
+            image::ImageFormat::WebP,
+        ] {
+            for exif in [vec![], b"not a TIFF header".to_vec(), bad_offset.clone()] {
+                let bytes = image_with_exif(format, exif)?;
+                let resolved = resolver.resolve_image(&STANDARD.encode(bytes)).await?;
+                assert_eq!((resolved.width, resolved.height), (84, 56));
+            }
+        }
+        let mut bytes = image_with_exif(image::ImageFormat::Png, orientation_exif(6, false))?;
+        let idat = bytes.windows(4).position(|chunk| chunk == b"IDAT").unwrap();
+        // Break the compressed pixel stream. Header probing must still succeed.
+        bytes[idat + 4] = 0;
+        assert!(image::load_from_memory(&bytes).is_err());
+        let resolved = resolver.resolve_image(&STANDARD.encode(&bytes)).await?;
+        assert_eq!((resolved.width, resolved.height), (56, 84));
+        let limited = MediaResolver::new(MediaResolverConfig {
+            max_image_pixels: 4703,
+            ..Default::default()
+        })?;
+        assert!(
+            limited
+                .resolve_image(&STANDARD.encode(&bytes))
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn rejects_large_original_geometry_and_streaming_aggregate_budget() -> Result<()> {
@@ -326,6 +517,7 @@ mod tests {
             max_media_items: 256,
             max_image_pixels: 64_000_000,
             slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            media_tokenizer: None,
         })
     }
 

@@ -1906,6 +1906,17 @@ may use private addresses without allowing private media destinations. Add
 request-wide media-count/streaming-byte budgets and an original-image pixel cap;
 rely on BDN's independent internal-destination blocking to prevent proxy-side
 DNS rebinding. Actual decoders still need resource limits and isolation.
+Native K3/K3 Flash planning now uses a separate planner and requires the serving
+checkpoint tokenizer to add original-dimension media framing around feature IDs.
+Include framing in the expanded context limit, but report feature-only offsets
+and lengths. Keep the tokenizer out of serialized worker plans; missing or invalid
+framing fails rather than returning an incomplete prompt. K2.7 remains unframed
+by this planner because its existing template supplies that framing.
+Expose native-only Python `MediaPreprocessor` without encoder credentials, sharing
+resolver connection pools and concurrency limits across requests; leave caching
+to BDN. Accept DSV4.1's nested vision config and model-type alias. Inspect JPEG,
+PNG and WebP EXIF orientation so frontend spans match worker geometry while
+preserving original compressed media and identity hashes.
 Native Qwen planning rejects mixed native/encoder media before I/O so required
 M-RoPE is never silently omitted. Python `MultiModalEncoderClient.pre_resolve`
 selects planners from checkpoint configs. Other families and audio/video use

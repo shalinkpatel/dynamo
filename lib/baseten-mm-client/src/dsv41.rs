@@ -4,16 +4,21 @@
 //! CPU-only geometry matching SGLang's `deepseek_v41_image_processing.py` at
 //! ffac53d779c08dcdab2d07e5e2a41dba83f0e65c. No pixel decoding or model execution.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 /// Geometry settings from the checkpoint's config.json; no serving defaults.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Dsv41ImageConfig {
+    #[serde(alias = "patch_size")]
     pub vision_patch_size: u32,
+    #[serde(alias = "downsample_ratio")]
     pub vision_downsample_ratio: u32,
+    #[serde(alias = "max_image_tokens")]
     pub vision_max_n_token: u32,
+    #[serde(alias = "min_pixels")]
     pub vision_min_pixels: u64,
+    #[serde(alias = "max_wh_ratio")]
     pub vision_max_wh_ratio: Option<f64>,
 }
 
@@ -46,6 +51,20 @@ impl Dsv41ImagePlan {
 }
 
 impl Dsv41ImageConfig {
+    pub fn from_hf_config(config: &serde_json::Value) -> Result<Self> {
+        let mut vision = if config.get("vision_patch_size").is_some() {
+            config
+        } else {
+            config.get("vision_config").unwrap_or(config)
+        }
+        .clone();
+        ensure!(vision.is_object(), "DSV4.1 vision config must be an object");
+        if vision.get("vision_min_pixels").is_none() && vision.get("min_pixels").is_none() {
+            vision["vision_min_pixels"] = 0.into();
+        }
+        serde_json::from_value(vision).context("Invalid DSV4.1 vision config")
+    }
+
     /// Matches SGLang deepseek_v41_image_processing.plan_image_grid.
     pub fn plan(&self, width: u32, height: u32) -> Result<Dsv41ImagePlan> {
         ensure!(width > 0 && height > 0, "Image dimensions must be positive");
@@ -186,6 +205,34 @@ mod tests {
         let plan = config.plan(10000, 100)?;
         assert_eq!((plan.resized_width, plan.resized_height), (1092, 280));
         assert_eq!((plan.n_llm_w, plan.n_llm_h, plan.num_tokens), (26, 7, 191));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_checkpoint_aliases_match_flat_geometry() -> Result<()> {
+        let flat = serde_json::to_value(config())?;
+        let nested = serde_json::json!({"vision_config": {
+            "patch_size": 14, "downsample_ratio": 3,
+            "max_image_tokens": 1024, "min_pixels": 295936,
+            "max_wh_ratio": null
+        }});
+        for (width, height) in [(84, 56), (1920, 1080), (1080, 1920)] {
+            assert_eq!(
+                Dsv41ImageConfig::from_hf_config(&nested)?.plan(width, height)?,
+                Dsv41ImageConfig::from_hf_config(&flat)?.plan(width, height)?
+            );
+        }
+        let no_min = serde_json::json!({"vision_config": {
+            "patch_size": 14, "downsample_ratio": 3, "max_image_tokens": 1024
+        }});
+        assert_eq!(
+            Dsv41ImageConfig::from_hf_config(&no_min)?.vision_min_pixels,
+            0
+        );
+        assert!(
+            Dsv41ImageConfig::from_hf_config(&serde_json::json!({"vision_config": "invalid"}))
+                .is_err()
+        );
         Ok(())
     }
 

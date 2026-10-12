@@ -62,6 +62,17 @@ def image_request():
     }
 
 
+class K3TokenizerStub:
+    """Synthetic IDs; check the pinned processor's framing text and encode options."""
+
+    def encode(self, text, *, allowed_special):
+        assert allowed_special == "all"
+        if text == "<|media_end|>":
+            return [94]
+        assert text == "<|media_begin|>image 84x56<|media_content|>"
+        return [91, 92, 93]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("family", ["kimi_k27", "kimi_k3", "deepseek_v4", "qwen3_vl"])
 async def test_native_pre_resolution_expands_without_encoder(encoder_client, family):
@@ -101,16 +112,23 @@ async def test_native_pre_resolution_expands_without_encoder(encoder_client, fam
         }
     client = encoder_client()  # Unreachable encoder: native planning must stay local.
     arguments = {"model_config": config, "preprocessor_config": processor}
+    prefix, suffix = [], []
+    if family == "kimi_k3":
+        arguments["tokenizer"] = K3TokenizerStub()
+        prefix, suffix = [91, 92, 93], [94]
+    frame_length = length + len(prefix) + len(suffix)
     result = await client.pre_resolve(
         np.array([1, 100, 2, 100, 3], dtype=np.uint32),
         [image_request(), image_request()],
-        max_tokens=2 * length + 3,
+        max_tokens=2 * frame_length + 3,
         **arguments,
     )
     plan = result["token_plan"]
     assert plan["mm_lengths"] == [length, length]
-    assert plan["mm_positions"] == [1, length + 2]
-    assert plan["input_ids"] == [1] + [100] * length + [2] + [100] * length + [3]
+    assert plan["mm_positions"] == [1 + len(prefix), frame_length + 2 + len(prefix)]
+    assert plan["input_ids"] == [1] + prefix + [100] * length + suffix + [
+        2
+    ] + prefix + [100] * length + suffix + [3]
     assert "data:" not in json.dumps(plan)
     assert IMAGE_BASE64 not in json.dumps(plan)
     assert all(
@@ -269,4 +287,89 @@ async def test_native_qwen_rejects_mixed_media_before_network(encoder_client, ki
                 "image_mean": [0.48145466, 0.4578275, 0.40821073],
                 "image_std": [0.26862954, 0.26130258, 0.27577711],
             },
+        )
+
+
+@pytest.mark.asyncio
+async def test_kimi3_framing_requires_checkpoint_tokenizer(encoder_client):
+    client = encoder_client()
+    with pytest.raises(Exception, match="checkpoint media tokenizer"):
+        await client.pre_resolve(
+            [100],
+            [image_request()],
+            max_tokens=100,
+            model_config={"model_type": "kimi_k3_flash"},
+            preprocessor_config={
+                "media_proc_cfg": {
+                    "patch_size": 14,
+                    "merge_kernel_size": 2,
+                    "in_patch_limit": 65536,
+                    "patch_limit_on_one_side": 512,
+                }
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_kimi3_tokenizer_without_allowed_special_keyword(encoder_client):
+    class Tokenizer:
+        def encode(self, text):
+            return K3TokenizerStub().encode(text, allowed_special="all")
+
+    result = await encoder_client().pre_resolve(
+        [1, 100, 2],
+        [image_request()],
+        max_tokens=12,
+        model_config={"model_type": "kimi_k3"},
+        preprocessor_config={
+            "media_proc_cfg": {
+                "patch_size": 14,
+                "merge_kernel_size": 2,
+                "in_patch_limit": 65536,
+                "patch_limit_on_one_side": 512,
+            }
+        },
+        tokenizer=Tokenizer(),
+    )
+    assert result["token_plan"]["input_ids"] == [1, 91, 92, 93] + [100] * 6 + [94, 2]
+    assert result["token_plan"]["mm_positions"] == [4]
+    assert result["token_plan"]["mm_lengths"] == [6]
+
+
+@pytest.mark.asyncio
+async def test_standalone_preprocessor_supports_nested_dsv41_without_encoder(
+    monkeypatch,
+):
+    from dynamo._core import MediaPreprocessor
+
+    monkeypatch.delenv("BDN_PROXY", raising=False)
+    monkeypatch.setenv("ETCD_ENDPOINTS", "etcd.svc.localnet")
+    preprocessor = MediaPreprocessor()
+    config = {
+        "model_type": "deepseek_v41",
+        "image_token_id": 100,
+        "vision_config": {
+            "patch_size": 14,
+            "downsample_ratio": 3,
+            "max_image_tokens": 1024,
+            "min_pixels": 295936,
+            "max_wh_ratio": None,
+        },
+    }
+    result = await preprocessor.pre_resolve(
+        [1, 100, 2], [image_request()], max_tokens=191, model_config=config
+    )
+    assert result["token_plan"]["mm_lengths"] == [189]
+    assert result["token_plan"]["mm_positions"] == [1]
+    assert result["prefill_media"][0]["request"]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+    resolved = await preprocessor.resolve_image(IMAGE_BASE64)
+    assert (resolved["width"], resolved["height"]) == (84, 56)
+    with pytest.raises(ValueError, match="encoder client"):
+        await preprocessor.pre_resolve([100], [image_request()], max_tokens=1000)
+    config["vision_config"] = "invalid"
+    with pytest.raises(ValueError, match="must be an object"):
+        await preprocessor.pre_resolve(
+            [100], [image_request()], max_tokens=1000, model_config=config
         )
