@@ -2783,7 +2783,39 @@ resets another's baseline; the reflector polls each endpoint on its own cadence
 ending in `/v1`; `api_key` is ascii-validated (CRLF guard) and, when empty,
 client `authorization` is explicitly removed rather than inherited.
 
-How to replay: copy the lib/gwp-* crates and the design docs.
+The Alyx locator contract is defined alongside the generation messages in
+`lib/b10-client/proto/generation_coordinator.proto`. `KVLocatorService` defines
+`Locate`, `CommitIntend`, `ResponseOpenOutcome`, and `ResponseFinish`, reusing bid,
+admission, and denial messages. It specifies read-only placement lookup,
+idempotent attempt accounting, and reconciliation of out-of-order notifications.
+`ResponseFinish` closes only admitted responses; denial and opening failure are
+terminal in `ResponseOpenOutcome`. Every terminal path releases remaining load
+once and retains a tombstone to suppress late bookings, even if notifications
+arrive before the commit or admission event. Opening requires an `Admission`
+frame; receiving an HTTP response alone does not count.
+`LocateResponse.placements_v1` wraps every eligible endpoint/worker/DP-rank
+candidate with its ranking cost, load estimates, affinity flag, and estimated
+cache overlap. Lower scores rank first, with deterministic identity ordering for
+ties. Version requests default to V1; independent result fields allow future
+versions to coexist in one response. A present empty result means no candidates,
+while absence means the version was not returned. Scores are comparable within
+one version's result. `CommitIntend.chosen_placement` selects exactly one version
+to book and preserves the V1 `chosen` field number.
+This adds the schema only; transport exposure and runtime handlers remain to be
+implemented, and existing generation message definitions are unchanged.
+`dynamo_b10_client::protocol` re-exports the generated locator messages, enums, and
+oneof modules so they are available to Rust callers and pass strict dead-code
+checks before runtime integration.
+Go bindings already live in the monorepo's `go/generation-coordinator-proto`
+module (basetenlabs/baseten#32902). After this schema lands, copy it verbatim to
+that module's `dynamo/b10/generation/v1/generation_coordinator.proto`, update the
+source commit in its README, and run
+`moon run generation-coordinator-proto:buf_generate`. Dynamo remains the source
+of truth; reuse the existing module and its wire-compatibility checks for the
+locator additions.
+
+How to replay: copy the lib/gwp-* crates, the shared generation coordinator
+schema, and the design docs.
 
 
 ## Document Guidelines Reminder

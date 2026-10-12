@@ -28,6 +28,16 @@ pub use wire::{
     generation_response_frame as generation_response_frame_v1, mm_kwarg as mm_kwarg_v1,
 };
 pub use wire::{BidRequest as BidRequestV1, BidResponse as BidResponseV1};
+pub use wire::{
+    CommitIntendRequest as CommitIntendRequestV1, LocateCandidate as LocateCandidateV1,
+    LocateRequest as LocateRequestV1, LocateResponse as LocateResponseV1,
+    OpenFailure as OpenFailureV1, Placement as PlacementV1, PlacementResultV1,
+    PlacementVersion as PlacementVersionV1, ResponseFinishRequest as ResponseFinishRequestV1,
+    ResponseOpenOutcomeRequest as ResponseOpenOutcomeRequestV1,
+    commit_intend_request as commit_intend_request_v1, open_failure as open_failure_v1,
+    response_finish_request as response_finish_request_v1,
+    response_open_outcome_request as response_open_outcome_request_v1,
+};
 
 pub const REQUEST_CONTENT_TYPE: &str = "application/x-protobuf";
 pub const RESPONSE_CONTENT_TYPE: &str = "application/x-protobuf-stream";
