@@ -7,6 +7,11 @@ import "google/protobuf/empty.proto";
 // Source of truth for generated Rust messages and cross-language clients.
 // Generation HTTP responses are a sequence of messages prefixed by a
 // four-byte big-endian message length.
+//
+// This compact numbering is the initial production baseline. Once deployed,
+// preserve field numbers and types and enum values. Add new fields and values
+// with unused numbers; reserve removed numbers and names. Incompatible changes
+// require a new protocol version.
 
 // POST /v1/bid is unary protobuf in both directions, without stream framing.
 message BidRequest
@@ -158,7 +163,7 @@ message CommitIntendRequest
   // choices return an error. Servers must support a version before Alyx commits it.
   oneof chosen_placement
   {
-    // V1 dispatch choice; retains the existing field name and number.
+    // V1 dispatch choice.
     Placement chosen = 4;
     // Future versions add their own choice fields here.
   }
@@ -202,13 +207,10 @@ message OpenFailure
 message ResponseFinishRequest
 {
   enum Reason {
-    // Denial terminates the attempt through ResponseOpenOutcome instead.
-    reserved 2;
-    reserved "DENIED";
     REASON_UNSPECIFIED = 0;
     COMPLETED = 1;
-    CANCELLED = 3;
-    FAILED = 4;
+    CANCELLED = 2;
+    FAILED = 3;
   }
   // Same UUID string as CommitIntendRequest.attempt_id.
   string attempt_id = 1;
@@ -224,11 +226,10 @@ message NewRequest
   optional MmPayloads mm_payloads = 4;
   // Opaque worker map excluding tokens and mm_args. Preserve backend fields,
   // including unknown fields and MessagePack binary values, without projection.
-  // Breaking change: clients and coordinators must be upgraded together.
-  bytes worker_msgpack = 6;
-  string request_id = 7;
-  optional TraceContext trace_context = 8;
-  map<string, string> metadata = 9;
+  bytes worker_msgpack = 5;
+  string request_id = 6;
+  optional TraceContext trace_context = 7;
+  map<string, string> metadata = 8;
 }
 
 message Routing
@@ -337,17 +338,15 @@ message DeniedGeneration
 
 message DeniedRequest
 {
-  reserved 8 to 11;
   enum Kind {
     KIND_UNSPECIFIED = 0;
     ROUTER_BACKPRESSURE = 1;
     REQUIRED_COMPONENTS_DOWN = 2;
-    reserved 3;
-    NEXT_ROUTER_UNREACHABLE = 4;
-    PROTOCOL_ERROR = 5;
-    CANCELLED = 6;
-    FIRST_WORKER_EVENT_FAILED = 7;
-    WORKER_ERROR_RESPONSE = 8;
+    NEXT_ROUTER_UNREACHABLE = 3;
+    PROTOCOL_ERROR = 4;
+    CANCELLED = 5;
+    FIRST_WORKER_EVENT_FAILED = 6;
+    WORKER_ERROR_RESPONSE = 7;
   }
   Kind kind = 1;
   optional string reason = 2;
