@@ -18,7 +18,7 @@
 
 use super::lease::{G2pbFetchLeaseId, release_fetch_lease_bounded, unix_time_ms};
 use super::nixl::create_worker_ucx_backend;
-use super::nixl::{g2pb_nixl_agent_name, new_hicache_g2_nixl_agent};
+use super::nixl::new_hicache_g2_nixl_agent;
 use super::peer_index::{
     ReplicaBlock, ReplicaIndex, ReplicaLocation, ReplicaPublisher, ReplicaSource, ReplicaSourceKey,
     SERVING_G2_INDEX_COMPONENT, SERVING_G2_PEER_COMPONENT, baseten_row_from_env,
@@ -66,6 +66,12 @@ pub const HICACHE_G2_VERIFY_ENV: &str = "DYN_HICACHE_G2_VERIFY";
 /// Threads used to hash a batch of pages. Hashing a multi-GiB prefix on one
 /// core costs an order of magnitude more than the wire transfer does.
 pub const HICACHE_G2_HASH_THREADS_ENV: &str = "DYN_HICACHE_G2_HASH_THREADS";
+/// TEST ONLY. The TP rank set here keeps exporting its first pool's NIXL
+/// metadata after registering later pools, while still bumping its generation:
+/// peers then fail `create_xfer_req` on every page of those pools, which is
+/// how an unaddressable peer looks in production. Never set in a deployment.
+pub const HICACHE_G2_TEST_FREEZE_METADATA_RANK_ENV: &str =
+    "DYN_HICACHE_G2_TEST_FREEZE_METADATA_RANK";
 const HICACHE_G2_DEFAULT_HASH_THREADS: usize = 8;
 const HICACHE_G2_DEFAULT_PROGRESS_DELAY_US: u64 = 1_000;
 const HICACHE_G2_KEY_DOMAIN: &[u8] = b"b10-hicache-g2-v1";
@@ -252,12 +258,26 @@ impl RegisteredRegions {
     }
 }
 
-/// The three NIXL agent calls the metadata cache makes, so the cache's
+/// This process's NIXL agent name. Readers key every peer map by it, so two
+/// processes sharing a name are indistinguishable: a reader holds one of their
+/// maps and fails every read of the other's pages, forever.
+///
+/// It used to be `instance_id ^ tp_rank`. Instance ids are allocated close
+/// together (consecutive even numbers in practice), so with TP ranks 1..3 that
+/// collided across processes: in prod one agent name carried two processes'
+/// pages. The pair below is unique because the instance id is unique per process.
+fn hicache_g2_agent_name(instance_id: u64, tp_rank: u32) -> String {
+    format!("{instance_id}-{tp_rank}")
+}
+
+/// The two NIXL agent calls the metadata cache makes, so the cache's
 /// decisions can be tested without an agent.
 trait RemoteMetadataImporter {
     /// Import a peer's exported metadata; returns the agent name it describes.
+    /// Over a map NIXL already holds for the agent, NIXL 1.4 merges the new
+    /// descriptors in, or, if one conflicts with what it holds, rejects the
+    /// import and erases that agent's map.
     fn import(&self, metadata: &[u8]) -> Result<String>;
-    fn invalidate(&self, agent_name: &str) -> Result<()>;
     /// Whether the backend currently holds any metadata for the agent. Cheap:
     /// a lookup in the agent's local remote-section map.
     fn is_loaded(&self, agent_name: &str) -> bool;
@@ -267,11 +287,6 @@ impl RemoteMetadataImporter for NixlAgent {
     fn import(&self, metadata: &[u8]) -> Result<String> {
         self.load_remote_md(metadata)
             .map_err(|error| anyhow::anyhow!("load_remote_md: {error}"))
-    }
-
-    fn invalidate(&self, agent_name: &str) -> Result<()> {
-        self.invalidate_remote_md(agent_name)
-            .map_err(|error| anyhow::anyhow!("invalidate_remote_md: {error}"))
     }
 
     fn is_loaded(&self, agent_name: &str) -> bool {
@@ -295,6 +310,14 @@ enum RemoteMetadataLoad {
 /// address the pools registered afterwards. The generation is the only reload
 /// trigger: `get_local_md()` is not byte-stable, so a digest of the bytes would
 /// reload on noise.
+///
+/// A newer map is imported over the one NIXL holds, never after invalidating
+/// it. Invalidation also disconnects the agent's UCX endpoints, which this
+/// agent's progress thread and other reads to the same peer may be using; doing
+/// it under load corrupted the heap (a double free) in testing. It also failed
+/// outright, on every fetch, once nixl-sys's own set of loaded agents had
+/// drifted from NIXL's (NIXL invalidates internally on a remote disconnect, and
+/// nixl-sys refuses to invalidate an agent it does not list).
 #[derive(Default)]
 struct RemoteMetadataCache {
     loaded: HashMap<String, u64>,
@@ -304,10 +327,10 @@ impl RemoteMetadataCache {
     /// Make NIXL hold metadata for `agent_name` covering `generation`.
     ///
     /// INVARIANT: `loaded` names a generation only while NIXL holds it. The
-    /// marker is cleared before any invalidation and written only after a
-    /// successful import, so a failed refresh leaves the next load to import
-    /// again instead of reporting `AlreadyCurrent` over an empty backend. A
-    /// lower generation than the one loaded never walks the cache backwards.
+    /// marker is cleared before any import and written only after a successful
+    /// one, so a failed refresh leaves the next load to import again instead of
+    /// reporting `AlreadyCurrent` over an empty backend. A lower generation than
+    /// the one loaded never walks the cache backwards.
     fn load(
         &mut self,
         importer: &impl RemoteMetadataImporter,
@@ -316,9 +339,8 @@ impl RemoteMetadataCache {
         generation: u64,
     ) -> Result<RemoteMetadataLoad> {
         let previous_generation = self.loaded.get(agent_name).copied();
-        let backend_holds = importer.is_loaded(agent_name);
         if previous_generation.is_some_and(|loaded| loaded >= generation) {
-            if backend_holds {
+            if importer.is_loaded(agent_name) {
                 return Ok(RemoteMetadataLoad::AlreadyCurrent);
             }
             // The backend dropped the map behind our back; reconcile by reloading.
@@ -330,16 +352,8 @@ impl RemoteMetadataCache {
         }
         // Nothing below may report the old generation as loaded.
         self.loaded.remove(agent_name);
-        if backend_holds {
-            // NIXL rejects a re-import of an agent it already knows; the map it
-            // kept describes the previous generation and has to go first.
-            importer.invalidate(agent_name).with_context(|| {
-                format!(
-                    "peer NIXL metadata for {agent_name} (generation {generation}) could not \
-                     replace the previous map"
-                )
-            })?;
-        }
+        // A conflicting import erases the agent's map in NIXL, so the next load
+        // imports into an empty slot.
         let loaded_name = importer.import(metadata).with_context(|| {
             format!("peer NIXL metadata for {agent_name} (generation {generation}) was rejected")
         })?;
@@ -351,6 +365,12 @@ impl RemoteMetadataCache {
         Ok(RemoteMetadataLoad::Imported {
             previous_generation,
         })
+    }
+
+    /// Make the next `load` import whatever the peer sends, whatever its
+    /// generation. The map NIXL holds stays in place until then.
+    fn forget(&mut self, agent_name: &str) {
+        self.loaded.remove(agent_name);
     }
 }
 
@@ -381,6 +401,148 @@ impl std::fmt::Display for VerificationFailure {
 }
 
 impl std::error::Error for VerificationFailure {}
+
+/// The reader could not address the peer's memory: its metadata failed to load,
+/// or NIXL refused to build a read against it with every local descriptor
+/// inside a registration. Names no page because no page is at fault; the same
+/// failure repeats for every page of that pool until the peer's map changes.
+#[derive(Debug)]
+struct UnaddressablePeer {
+    agent_name: String,
+    detail: String,
+}
+
+impl std::fmt::Display for UnaddressablePeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HiCache G2 cannot address peer {}: {}",
+            self.agent_name, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnaddressablePeer {}
+
+/// Consecutive unaddressable failures on one peer pool before the reader drops
+/// its copy of the peer's map and imports it again.
+const HICACHE_G2_PEER_REIMPORT_AFTER: u32 = 3;
+/// Consecutive failures (counting those before the re-import) before the pool
+/// is suspended. After a suspension one more failure suspends it again.
+const HICACHE_G2_PEER_SUSPEND_AFTER: u32 = 6;
+const HICACHE_G2_PEER_SUSPEND_INITIAL: Duration = Duration::from_secs(30);
+const HICACHE_G2_PEER_SUSPEND_MAX: Duration = Duration::from_secs(600);
+
+/// One peer process's pages of one size. Health is per pool, not per peer: a
+/// peer whose second pool is missing from its exported map still serves its
+/// first pool, and a success there must not reset the failing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PeerPoolKey {
+    instance_id: u64,
+    page_bytes: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PeerFailureAction {
+    /// Keep trying; the next candidate takes this fetch's pages.
+    Retry,
+    /// Drop this reader's copy of the peer's map so the next read imports it fresh.
+    Reimport,
+    /// Skip the pool for this long, and re-import when it comes back.
+    Suspend(Duration),
+}
+
+struct PeerPoolHealth {
+    consecutive_failures: u32,
+    suspended_until: Option<Instant>,
+    next_suspension: Duration,
+}
+
+/// Which peer pools keep failing to be addressable, and which are suspended.
+///
+/// Without it a peer whose exported map lacks one of its pools costs every
+/// reader a lease and a failed `create_xfer_req` on every fetch that touches
+/// that pool, indefinitely: the index keeps advertising its pages and nothing
+/// else ever drops them.
+#[derive(Default)]
+struct PeerHealthTracker {
+    pools: Mutex<HashMap<PeerPoolKey, PeerPoolHealth>>,
+}
+
+impl PeerHealthTracker {
+    fn pools(&self) -> std::sync::MutexGuard<'_, HashMap<PeerPoolKey, PeerPoolHealth>> {
+        // Every update leaves the map consistent; a panic elsewhere must not
+        // turn the health check into a fetch failure.
+        self.pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn record_failure(&self, key: PeerPoolKey, now: Instant) -> PeerFailureAction {
+        let mut pools = self.pools();
+        let health = pools.entry(key).or_insert(PeerPoolHealth {
+            consecutive_failures: 0,
+            suspended_until: None,
+            next_suspension: HICACHE_G2_PEER_SUSPEND_INITIAL,
+        });
+        // A fetch that started before the suspension says nothing new.
+        if health.suspended_until.is_some_and(|until| now < until) {
+            return PeerFailureAction::Retry;
+        }
+        health.consecutive_failures += 1;
+        if health.consecutive_failures >= HICACHE_G2_PEER_SUSPEND_AFTER {
+            let suspension = health.next_suspension;
+            health.suspended_until = Some(now + suspension);
+            health.next_suspension = (suspension * 2).min(HICACHE_G2_PEER_SUSPEND_MAX);
+            // The first read after the suspension is a probe: if it fails too,
+            // suspend again at once rather than paying for five more.
+            health.consecutive_failures = HICACHE_G2_PEER_SUSPEND_AFTER - 1;
+            PeerFailureAction::Suspend(suspension)
+        } else if health.consecutive_failures == HICACHE_G2_PEER_REIMPORT_AFTER {
+            PeerFailureAction::Reimport
+        } else {
+            PeerFailureAction::Retry
+        }
+    }
+
+    /// Forget the pool's failures. Returns how many it had, so a recovery can be logged.
+    fn record_success(&self, key: PeerPoolKey) -> u32 {
+        let mut pools = self.pools();
+        if pools.is_empty() {
+            return 0;
+        }
+        pools
+            .remove(&key)
+            .map_or(0, |health| health.consecutive_failures)
+    }
+
+    /// Whether the peer's pool of `page_bytes` pages, or with `None` any of
+    /// its pools, is suspended.
+    fn is_suspended(&self, instance_id: u64, page_bytes: Option<u64>, now: Instant) -> bool {
+        let pools = self.pools();
+        if pools.is_empty() {
+            return false;
+        }
+        let suspended =
+            |health: &PeerPoolHealth| health.suspended_until.is_some_and(|until| now < until);
+        match page_bytes {
+            Some(page_bytes) => pools
+                .get(&PeerPoolKey {
+                    instance_id,
+                    page_bytes,
+                })
+                .is_some_and(suspended),
+            None => pools
+                .iter()
+                .any(|(key, health)| key.instance_id == instance_id && suspended(health)),
+        }
+    }
+
+    /// Drop a departed peer's pools; its instance id is never reused.
+    fn forget_instance(&self, instance_id: u64) {
+        self.pools().retain(|key, _| key.instance_id != instance_id);
+    }
+}
 
 fn elapsed_ns(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -522,6 +684,14 @@ pub struct HiCacheG2Metrics {
     pub metadata_reloads: AtomicU64,
     /// Import attempts. In steady state exactly one per peer agent.
     pub metadata_loads: AtomicU64,
+    /// Peer reads that failed because the peer's memory could not be addressed
+    /// (metadata load or `create_xfer_req` failed). Zero in a healthy fleet.
+    pub unaddressable_peer_failures: AtomicU64,
+    /// Peer maps dropped and re-imported after repeated unaddressable failures.
+    pub peer_metadata_reimports: AtomicU64,
+    /// Times a peer pool was suspended, and index candidates skipped for it.
+    pub peer_suspensions: AtomicU64,
+    pub suspended_peer_candidates: AtomicU64,
     /// Where a fetch's wall clock goes, summed over every fetch.
     pub index_query_ns: AtomicU64,
     pub lease_rpc_ns: AtomicU64,
@@ -606,6 +776,22 @@ impl HiCacheG2Metrics {
             (
                 "metadata_loads",
                 self.metadata_loads.load(Ordering::Relaxed),
+            ),
+            (
+                "unaddressable_peer_failures",
+                self.unaddressable_peer_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "peer_metadata_reimports",
+                self.peer_metadata_reimports.load(Ordering::Relaxed),
+            ),
+            (
+                "peer_suspensions",
+                self.peer_suspensions.load(Ordering::Relaxed),
+            ),
+            (
+                "suspended_peer_candidates",
+                self.suspended_peer_candidates.load(Ordering::Relaxed),
             ),
             (
                 "index_query_ms",
@@ -849,6 +1035,8 @@ struct HiCacheG2State {
     /// This replica's own map generation, bumped on every region registration
     /// and sent with every fetch response.
     map_generation: AtomicU64,
+    /// Peer pools this replica keeps failing to address; see [`PeerHealthTracker`].
+    peer_health: PeerHealthTracker,
     /// Built once: a page batch is hashed on every publish and every fetch.
     hash_pool: rayon::ThreadPool,
     metrics: HiCacheG2Metrics,
@@ -1077,7 +1265,11 @@ impl HiCacheG2State {
             &response.agent_name,
             &response.agent_metadata,
             response.metadata_generation,
-        )?;
+        )
+        .map_err(|error| UnaddressablePeer {
+            agent_name: response.agent_name.clone(),
+            detail: format!("{error:#}"),
+        })?;
 
         let regions = self.region_guard()?;
         anyhow::ensure!(
@@ -1236,6 +1428,61 @@ impl HiCacheG2State {
         Ok(())
     }
 
+    /// Act on a peer pool that could not be addressed: count it, and after
+    /// repeated failures re-import the peer's map or suspend the pool.
+    fn record_unaddressable(&self, key: PeerPoolKey, failure: &UnaddressablePeer) {
+        self.metrics
+            .unaddressable_peer_failures
+            .fetch_add(1, Ordering::Relaxed);
+        let action = self.peer_health.record_failure(key, Instant::now());
+        let suspend_secs = match action {
+            PeerFailureAction::Retry => return,
+            PeerFailureAction::Reimport => {
+                self.metrics
+                    .peer_metadata_reimports
+                    .fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            PeerFailureAction::Suspend(suspension) => {
+                self.metrics
+                    .peer_suspensions
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(suspension.as_secs())
+            }
+        };
+        // Either way the next read imports whatever the peer sends now, merged
+        // over the map NIXL holds, so a map that went stale on this side does
+        // not outlive the suspension.
+        if let Ok(mut loaded) = self.loaded_remotes.lock() {
+            loaded.forget(&failure.agent_name);
+        }
+        tracing::warn!(
+            instance_id = key.instance_id,
+            page_bytes = key.page_bytes,
+            agent_name = %failure.agent_name,
+            suspend_secs,
+            error = %failure.detail,
+            "HiCache G2 peer pool is repeatedly unaddressable; {}",
+            if suspend_secs.is_some() {
+                "suspending it; it re-imports its NIXL metadata when it comes back"
+            } else {
+                "re-importing its NIXL metadata on the next read"
+            }
+        );
+    }
+
+    fn record_peer_success(&self, key: PeerPoolKey) {
+        let failures = self.peer_health.record_success(key);
+        if failures != 0 {
+            tracing::info!(
+                instance_id = key.instance_id,
+                page_bytes = key.page_bytes,
+                failures,
+                "HiCache G2 peer pool is addressable again"
+            );
+        }
+    }
+
     /// Describe a failed `create_xfer_req` in terms of addresses and registration.
     ///
     /// Bounded to a few descriptors: a chunk can carry hundreds, and this runs
@@ -1245,14 +1492,14 @@ impl HiCacheG2State {
         remote_agent: &str,
         chunk: &[(u64, u64, u64)],
         error: &impl std::fmt::Display,
-    ) {
+    ) -> Option<usize> {
         const MAX_REPORTED: usize = 4;
         let regions = match self.region_guard() {
             Ok(regions) => regions,
             Err(guard_error) => {
                 tracing::warn!(%error, %guard_error, remote_agent,
                     "HiCache G2 create_xfer_req failed and the region lock is poisoned");
-                return;
+                return None;
             }
         };
         let uncontained_local = chunk
@@ -1284,6 +1531,7 @@ impl HiCacheG2State {
             local_regions = %registered.join(","),
             "HiCache G2 create_xfer_req failed: descriptor/registration detail"
         );
+        Some(uncontained_local)
     }
 
     /// Build and post one chunk. `Ok(None)` means NIXL completed it synchronously.
@@ -1314,10 +1562,20 @@ impl HiCacheG2State {
                 Err(error) => {
                     // A create failure names neither descriptor; say which address
                     // and, for the local side, whether it is inside a registration.
-                    self.log_xfer_req_failure(remote_agent, chunk, &error);
-                    return PostOutcome::NotSubmitted(anyhow::anyhow!(
-                        "failed to create NIXL read request: {error}"
-                    ));
+                    let uncontained_local = self.log_xfer_req_failure(remote_agent, chunk, &error);
+                    let detail = format!("failed to create NIXL read request: {error}");
+                    // With every local descriptor registered, what NIXL could not
+                    // resolve is the peer's side: its map, as loaded here, does
+                    // not cover the source addresses it just leased to us.
+                    return PostOutcome::NotSubmitted(if uncontained_local == Some(0) {
+                        UnaddressablePeer {
+                            agent_name: remote_agent.to_string(),
+                            detail,
+                        }
+                        .into()
+                    } else {
+                        anyhow::anyhow!(detail)
+                    });
                 }
             };
         match self.agent.post_xfer_req(&request, None) {
@@ -1636,6 +1894,7 @@ fn spawn_departed_peer_purger(
                     if departed == state.source.key.instance_id {
                         return;
                     }
+                    state.peer_health.forget_instance(departed);
                     // A departed peer can own hundreds of thousands of entries;
                     // keep the purge off the async workers.
                     let Ok((sources, entries)) =
@@ -1738,7 +1997,7 @@ impl HiCacheG2Direct {
             row: baseten_row_from_env()?,
         };
 
-        let agent_name = g2pb_nixl_agent_name(instance_id ^ u64::from(config.tp_rank));
+        let agent_name = hicache_g2_agent_name(instance_id, config.tp_rank);
         // The progress-thread cadence is a real throughput knob for this path;
         // g2pb's 1 ms default is tuned for a TRT decode worker that must not
         // burn a core while idle. See HICACHE_G2_PROGRESS_DELAY_US_ENV.
@@ -1765,6 +2024,7 @@ impl HiCacheG2Direct {
             publisher,
             loaded_remotes: Mutex::new(RemoteMetadataCache::default()),
             map_generation: AtomicU64::new(0),
+            peer_health: PeerHealthTracker::default(),
             hash_pool,
             metrics: HiCacheG2Metrics::default(),
             reaper: UnsettledReadReaper::default(),
@@ -1783,6 +2043,17 @@ impl HiCacheG2Direct {
         start_peer_service(&peer_component, Arc::clone(&state))?;
 
         let peers = HiCachePeerClient::new(peer_component).await?;
+        // Readers' logs name a peer only by its agent; this line maps it back to
+        // a pod, which otherwise takes guesswork once early logs have rotated.
+        tracing::info!(
+            instance_id,
+            agent_name = %agent_name,
+            tp_rank = state.config.tp_rank,
+            tp_world_size = state.config.tp_world_size,
+            replica_id = state.source.replica_id(),
+            host = std::env::var("HOSTNAME").ok(),
+            "HiCache G2 started"
+        );
         spawn_departed_peer_purger(
             Arc::downgrade(&index),
             peers.clone(),
@@ -1886,10 +2157,23 @@ impl HiCacheG2Direct {
         // cannot address the pools registered after the first one. The
         // generation moves with it, under the same write lock, so a peer can
         // never observe a generation that is ahead of the metadata it names.
-        regions.local_metadata =
+        let metadata =
             self.state.agent.get_local_md().map_err(|error| {
                 anyhow::anyhow!("failed to export local NIXL metadata: {error}")
             })?;
+        let freeze = std::env::var(HICACHE_G2_TEST_FREEZE_METADATA_RANK_ENV)
+            .ok()
+            .and_then(|rank| rank.trim().parse::<u32>().ok())
+            == Some(self.state.config.tp_rank);
+        if freeze && !regions.local_metadata.is_empty() {
+            tracing::warn!(
+                tp_rank = self.state.config.tp_rank,
+                "{HICACHE_G2_TEST_FREEZE_METADATA_RANK_ENV} is set: keeping the previous NIXL \
+                 metadata, so peers cannot address this pool (test only)"
+            );
+        } else {
+            regions.local_metadata = metadata;
+        }
         // One bump per pool, after all of its chunks: every peer reloads
         // metadata on a generation increase, so per-chunk bumps would multiply
         // reloads across the fleet.
@@ -1930,7 +2214,7 @@ impl HiCacheG2Direct {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let locations = self.query_locations(keys);
+        let locations = self.query_locations(keys, None);
         let mask = locations
             .iter()
             .map(|candidates| !candidates.is_empty())
@@ -1951,7 +2235,7 @@ impl HiCacheG2Direct {
 
     /// Longest prefix of `keys` that some *other* replica advertises.
     pub fn lookup_prefix(&self, keys: &[SequenceHash]) -> Result<usize> {
-        let locations = self.query_locations(keys);
+        let locations = self.query_locations(keys, None);
         let mut prefix = 0;
         for candidates in &locations {
             if candidates.is_empty() {
@@ -2005,22 +2289,38 @@ impl HiCacheG2Direct {
             });
         }
         let deadline = Instant::now() + self.state.config.lease_ttl;
-        let mut locations = self.query_locations(keys);
+        // Every page of one fetch belongs to the same engine pool.
+        let page_bytes = destination[0]
+            .segments
+            .iter()
+            .map(|(_, len)| *len)
+            .sum::<u64>();
+        let mut locations = self.query_locations(keys, Some(page_bytes));
         Ok(fetch_runs(
             &mut locations,
             deadline,
             |instance_id, range| {
+                let pool = PeerPoolKey {
+                    instance_id,
+                    page_bytes,
+                };
                 let result = self.fetch_run(
                     instance_id,
                     &keys[range.clone()],
                     &destination[range],
                     deadline,
                 );
-                if result.is_err() {
-                    self.state
-                        .metrics
-                        .fetch_failures
-                        .fetch_add(1, Ordering::Relaxed);
+                match &result {
+                    Ok(()) => self.state.record_peer_success(pool),
+                    Err(error) => {
+                        self.state
+                            .metrics
+                            .fetch_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        if let Some(failure) = error.downcast_ref::<UnaddressablePeer>() {
+                            self.state.record_unaddressable(pool, failure);
+                        }
+                    }
                 }
                 result
             },
@@ -2124,9 +2424,15 @@ impl HiCacheG2Direct {
     }
 
     /// Ask the directory where each key lives, dropping this replica's own
-    /// entries (a local hit is HiCache's own L2 business, not ours) and those
-    /// of sources that are no longer live peers.
-    fn query_locations(&self, keys: &[SequenceHash]) -> Vec<Vec<ReplicaLocation>> {
+    /// entries (a local hit is HiCache's own L2 business, not ours), those of
+    /// sources that are no longer live peers, and those of suspended peer pools.
+    /// A lookup names no pool (`None`) and skips a peer with any pool suspended:
+    /// a page it cannot restore in every pool is not a hit.
+    fn query_locations(
+        &self,
+        keys: &[SequenceHash],
+        page_bytes: Option<u64>,
+    ) -> Vec<Vec<ReplicaLocation>> {
         let query_started = Instant::now();
         let locations = self
             .index
@@ -2143,6 +2449,18 @@ impl HiCacheG2Direct {
                 .metrics
                 .dead_source_candidates
                 .fetch_add(dead as u64, Ordering::Relaxed);
+        }
+        let now = Instant::now();
+        let (locations, suspended) = without_suspended_candidates(locations, |instance_id| {
+            self.state
+                .peer_health
+                .is_suspended(instance_id, page_bytes, now)
+        });
+        if suspended != 0 {
+            self.state
+                .metrics
+                .suspended_peer_candidates
+                .fetch_add(suspended as u64, Ordering::Relaxed);
         }
         locations
     }
@@ -2183,6 +2501,29 @@ fn remote_live_candidates(
     (locations, dead)
 }
 
+/// Drop the candidates whose source `suspended` names. Returns the candidates
+/// and how many were dropped.
+fn without_suspended_candidates(
+    locations: Vec<Vec<ReplicaLocation>>,
+    suspended: impl Fn(u64) -> bool,
+) -> (Vec<Vec<ReplicaLocation>>, usize) {
+    let mut dropped = 0usize;
+    let locations = locations
+        .into_iter()
+        .map(|candidates| {
+            candidates
+                .into_iter()
+                .filter(|location| {
+                    let skip = suspended(location.source.key.instance_id);
+                    dropped += usize::from(skip);
+                    !skip
+                })
+                .collect()
+        })
+        .collect();
+    (locations, dropped)
+}
+
 /// Walk `locations` from the front, one peer run at a time, and return how many
 /// leading pages were fetched.
 ///
@@ -2192,6 +2533,8 @@ fn remote_live_candidates(
 ///
 /// - a verification failure names its stale pages, so the verified prefix
 ///   counts as fetched and only the stale pages lose that candidate;
+/// - an unaddressable peer ([`UnaddressablePeer`]) is at fault for every page of
+///   the run, not any one of them, so the whole run loses that candidate;
 /// - a failure that names no page (lease refused, transfer error, deadline) on a
 ///   run longer than one page is retried on the first half of the run, and only
 ///   a single-page failure removes the candidate from that page.
@@ -2267,6 +2610,20 @@ fn fetch_runs(
                     }
                     completed += stale_pages[0];
                     run_cap = usize::MAX;
+                } else if error.downcast_ref::<UnaddressablePeer>().is_some() {
+                    // Halving would lease from the same unaddressable peer again
+                    // for nothing; no page of this run can be read from it.
+                    tracing::warn!(
+                        %error,
+                        instance_id,
+                        pages = run_len,
+                        "HiCache G2 peer is unaddressable; trying the next candidate for the run"
+                    );
+                    for candidates in &mut locations[completed..end] {
+                        candidates
+                            .retain(|location| location.source.key.instance_id != instance_id);
+                    }
+                    run_cap = usize::MAX;
                 } else if run_len > 1 {
                     // The failure does not say which page is at fault; a stale
                     // tail must not cost the healthy head its only copy.
@@ -2321,6 +2678,23 @@ fn start_peer_service(component: &Component, state: Arc<HiCacheG2State>) -> Resu
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn agent_names_are_unique_for_adjacent_instance_ids() {
+        // Instance ids come out as consecutive even numbers; every TP4 rank of
+        // eight such processes must get its own name.
+        let ids: Vec<u64> = (0..8).map(|i| 4_610_454_111_727_008_640 + 2 * i).collect();
+        let mut names = HashSet::new();
+        let mut old_names = HashSet::new();
+        for &id in &ids {
+            for rank in 0..4u32 {
+                assert!(names.insert(hicache_g2_agent_name(id, rank)));
+                old_names.insert(id ^ u64::from(rank));
+            }
+        }
+        // The previous `instance_id ^ tp_rank` scheme collided on exactly these ids.
+        assert!(old_names.len() < ids.len() * 4);
+    }
 
     #[test]
     fn cache_keys_are_a_pure_function_of_the_qualified_key() {
@@ -2390,27 +2764,27 @@ mod tests {
         Instant::now() + Duration::from_secs(60)
     }
 
+    /// Models NIXL 1.4: a re-import over a held map merges into it, unless
+    /// `conflict_next`, which rejects it and erases the map; `fail_next` fails
+    /// an import into an empty slot.
     #[derive(Default)]
     struct StatefulImporter {
         present: Cell<bool>,
         fail_next: Cell<bool>,
+        conflict_next: Cell<bool>,
         imports: Cell<usize>,
-        invalidations: Cell<usize>,
     }
 
     impl RemoteMetadataImporter for StatefulImporter {
         fn import(&self, metadata: &[u8]) -> Result<String> {
             self.imports.set(self.imports.get() + 1);
-            anyhow::ensure!(!self.present.get(), "metadata already loaded");
+            if self.present.get() && self.conflict_next.replace(false) {
+                self.present.set(false);
+                anyhow::bail!("conflicting metadata; map erased");
+            }
             anyhow::ensure!(!self.fail_next.replace(false), "import failed");
             self.present.set(true);
             Ok(std::str::from_utf8(metadata)?.to_owned())
-        }
-
-        fn invalidate(&self, _agent_name: &str) -> Result<()> {
-            self.invalidations.set(self.invalidations.get() + 1);
-            self.present.set(false);
-            Ok(())
         }
 
         fn is_loaded(&self, _agent_name: &str) -> bool {
@@ -2430,13 +2804,14 @@ mod tests {
             );
         }
         assert_eq!(importer.imports.get(), 1);
+        // The newer map is merged over the held one; NIXL never goes without one.
         assert_eq!(
             cache.load(&importer, "peer", b"peer", 2).unwrap(),
             RemoteMetadataLoad::Imported {
                 previous_generation: Some(1)
             }
         );
-        assert_eq!(importer.invalidations.get(), 1);
+        assert!(importer.present.get());
         assert_eq!(importer.imports.get(), 2);
         assert_eq!(cache.loaded["peer"], 2);
     }
@@ -2447,7 +2822,7 @@ mod tests {
             let importer = StatefulImporter::default();
             let mut cache = RemoteMetadataCache::default();
             cache.load(&importer, "peer", b"peer", 1).unwrap();
-            importer.fail_next.set(true);
+            importer.conflict_next.set(true);
             assert!(cache.load(&importer, "peer", b"peer", 2).is_err());
             assert!(!importer.present.get());
             assert!(cache.loaded.is_empty());
@@ -2466,6 +2841,25 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_peer_reimports_its_current_generation() {
+        let importer = StatefulImporter::default();
+        let mut cache = RemoteMetadataCache::default();
+        cache.load(&importer, "peer", b"peer", 2).unwrap();
+        cache.forget("peer");
+        // The held map stays until the re-import merges over it.
+        assert!(importer.present.get());
+        assert!(cache.loaded.is_empty());
+        assert_eq!(
+            cache.load(&importer, "peer", b"peer", 2).unwrap(),
+            RemoteMetadataLoad::Imported {
+                previous_generation: None
+            }
+        );
+        assert_eq!(importer.imports.get(), 2);
+        assert_eq!(cache.loaded["peer"], 2);
+    }
+
+    #[test]
     fn backend_invalidation_allows_same_generation_recovery() {
         let importer = StatefulImporter::default();
         let mut cache = RemoteMetadataCache::default();
@@ -2474,6 +2868,17 @@ mod tests {
         cache.load(&importer, "peer", b"peer", 1).unwrap();
         assert!(importer.present.get());
         assert_eq!(importer.imports.get(), 2);
+    }
+
+    #[test]
+    fn a_failed_first_import_is_retried() {
+        let importer = StatefulImporter::default();
+        let mut cache = RemoteMetadataCache::default();
+        importer.fail_next.set(true);
+        assert!(cache.load(&importer, "peer", b"peer", 1).is_err());
+        assert!(cache.loaded.is_empty());
+        cache.load(&importer, "peer", b"peer", 1).unwrap();
+        assert_eq!(cache.loaded["peer"], 1);
     }
 
     #[test]
@@ -2817,6 +3222,132 @@ mod tests {
             }
         );
         assert_eq!(locations[0].len(), 1);
+    }
+
+    #[test]
+    fn an_unaddressable_peer_loses_the_whole_run_without_halving() {
+        let mut locations: Vec<_> = (0..4)
+            .map(|key| vec![location(7, key), location(9, key)])
+            .collect();
+        let mut calls = Vec::new();
+        let completed = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            calls.push((instance_id, range.clone()));
+            if instance_id == 7 {
+                return Err(UnaddressablePeer {
+                    agent_name: "peer".into(),
+                    detail: "failed to create NIXL read request".into(),
+                }
+                .into());
+            }
+            Ok(())
+        })
+        .completed;
+        assert_eq!(completed, 4);
+        assert_eq!(calls, vec![(7, 0..4), (9, 0..4)]);
+        assert!(locations.iter().all(|candidates| candidates.len() == 1));
+    }
+
+    #[test]
+    fn an_unaddressable_peer_is_recognised_through_added_context() {
+        let error = anyhow::Error::from(UnaddressablePeer {
+            agent_name: "peer".into(),
+            detail: "rejected".into(),
+        })
+        .context("reading from instance 7");
+        assert!(error.downcast_ref::<UnaddressablePeer>().is_some());
+    }
+
+    fn pool(instance_id: u64) -> PeerPoolKey {
+        PeerPoolKey {
+            instance_id,
+            page_bytes: 667_392,
+        }
+    }
+
+    #[test]
+    fn repeated_unaddressable_failures_reimport_then_suspend_with_backoff() {
+        let tracker = PeerHealthTracker::default();
+        let start = Instant::now();
+        let actions: Vec<_> = (0..HICACHE_G2_PEER_SUSPEND_AFTER)
+            .map(|_| tracker.record_failure(pool(7), start))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                PeerFailureAction::Retry,
+                PeerFailureAction::Retry,
+                PeerFailureAction::Reimport,
+                PeerFailureAction::Retry,
+                PeerFailureAction::Retry,
+                PeerFailureAction::Suspend(HICACHE_G2_PEER_SUSPEND_INITIAL),
+            ]
+        );
+        assert!(tracker.is_suspended(7, Some(pool(7).page_bytes), start));
+        // Reads that were already running when it was suspended change nothing.
+        assert_eq!(
+            tracker.record_failure(pool(7), start + Duration::from_secs(1)),
+            PeerFailureAction::Retry
+        );
+        let expired = start + HICACHE_G2_PEER_SUSPEND_INITIAL;
+        assert!(!tracker.is_suspended(7, Some(pool(7).page_bytes), expired));
+        // A failed probe suspends again at once, for twice as long.
+        assert_eq!(
+            tracker.record_failure(pool(7), expired),
+            PeerFailureAction::Suspend(HICACHE_G2_PEER_SUSPEND_INITIAL * 2)
+        );
+        let mut now = expired;
+        let mut last = Duration::ZERO;
+        for _ in 0..10 {
+            now += HICACHE_G2_PEER_SUSPEND_MAX;
+            if let PeerFailureAction::Suspend(suspension) = tracker.record_failure(pool(7), now) {
+                last = suspension;
+            }
+        }
+        assert_eq!(last, HICACHE_G2_PEER_SUSPEND_MAX);
+    }
+
+    #[test]
+    fn peer_pools_recover_independently() {
+        let tracker = PeerHealthTracker::default();
+        let now = Instant::now();
+        let other_pool = PeerPoolKey {
+            instance_id: 7,
+            page_bytes: 12_307,
+        };
+        for _ in 0..HICACHE_G2_PEER_SUSPEND_AFTER {
+            tracker.record_failure(pool(7), now);
+        }
+        tracker.record_failure(pool(9), now);
+        // The same peer's other pool succeeding does not vouch for this one.
+        assert_eq!(tracker.record_success(other_pool), 0);
+        assert!(tracker.is_suspended(7, Some(pool(7).page_bytes), now));
+        assert!(!tracker.is_suspended(7, Some(other_pool.page_bytes), now));
+        // A lookup, which names no pool, skips a peer with any pool suspended.
+        assert!(tracker.is_suspended(7, None, now));
+        assert!(!tracker.is_suspended(9, Some(pool(9).page_bytes), now));
+        assert_eq!(tracker.record_success(pool(9)), 1);
+        assert_eq!(
+            tracker.record_failure(pool(9), now),
+            PeerFailureAction::Retry
+        );
+        tracker.forget_instance(7);
+        assert!(!tracker.is_suspended(7, Some(pool(7).page_bytes), now));
+        assert_eq!(
+            tracker.record_failure(pool(7), now),
+            PeerFailureAction::Retry
+        );
+    }
+
+    #[test]
+    fn suspended_candidates_are_skipped() {
+        let (kept, dropped) = without_suspended_candidates(
+            vec![vec![location(7, 0), location(9, 0)], vec![location(7, 1)]],
+            |instance_id| instance_id == 7,
+        );
+        assert_eq!(dropped, 2);
+        assert_eq!(kept[0].len(), 1);
+        assert_eq!(kept[0][0].source.key.instance_id, 9);
+        assert!(kept[1].is_empty());
     }
 
     #[test]

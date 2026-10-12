@@ -2730,6 +2730,7 @@ Source commits:
 - Split from the G2PB branch (`mf/g2pb-main-v1.2.0`, #387), including the
   resiliency fixes from #958.
 - fix(g2direct): purge directory entries of peers that leave discovery
+- fix(g2direct): unique NIXL agent names; suspend peer pools readers cannot address
 
 Purpose:
 
@@ -2741,7 +2742,15 @@ the checksum of every page. Reads that are still in flight at the fetch
 deadline go to a reaper, and the engine holds their pages until a settlement
 ticket reports them done. Peers that discovery no longer lists are skipped, and
 their index entries are purged 30 s after they leave (purged instances are
-remembered, so late deltas from them are dropped). Index publishing is advisory. The SGLang adapter, the deferred host release
+remembered, so late deltas from them are dropped). Index publishing is advisory.
+Each process's NIXL agent is named `{instance_id}-{tp_rank}`: the earlier
+`instance_id ^ tp_rank` collided across processes because instance ids are
+allocated close together, and readers key peer maps by agent name. A peer map
+is imported over the one NIXL holds and never invalidated at runtime
+(invalidating disconnects UCX endpoints still in use). Readers count
+unaddressable failures per (peer, page size): after 3 they re-import the map,
+after 6 they suspend that pool with 30 s to 10 min backoff and skip it in
+lookups and fetches. `DYN_HICACHE_G2_TEST_FREEZE_METADATA_RANK` is test only. The SGLang adapter, the deferred host release
 patch, and MLA host dedup live in the monorepo.
 
 Shared pieces outside the crates: `dynamo-memory` registration chunking
