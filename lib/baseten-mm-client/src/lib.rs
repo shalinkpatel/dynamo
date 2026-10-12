@@ -3,16 +3,51 @@
 
 #![doc = include_str!("../README.md")]
 
+mod dsv41;
+mod kimi;
+mod media;
+mod media_fetcher;
+mod planning;
 mod types;
-pub use types::{
-    Detail, EmbeddingPayload, EncodeRequest, EncoderRejection, Media, MultiModalResponse,
-    ReplayRequest,
+pub use dsv41::{Dsv41ImageConfig, Dsv41ImagePlan};
+pub use dynamo_multimodal as multimodal;
+pub use kimi::{KimiImageConfig, KimiImagePlan};
+pub use media::{
+    ImageDimensions, MediaResolver, MediaResolverConfig, ResolvedImage, ResolvedMedia,
 };
+pub use media_fetcher::MediaFetcher;
+pub use planning::{
+    MropePlan, PlannedMedia, PlanningRequest, PreResolvedRequest, QwenImagePlan, TokenPlan,
+    TokenPlannerSpec,
+};
+pub use types::{
+    Detail, EmbeddingPayload, EncodeRequest, EncoderMetadata, EncoderRejection, Media,
+    MultiModalResponse, ReplayRequest,
+};
+
+pub const MULTIMODAL_UPSTREAM_REVISION: &str = "17020c2662a490f4366d1710db1971776d4e63b5";
+pub const NATIVE_IMAGE_FAMILIES: &[&str] = &[
+    "kimi_k25",
+    "kimi_k26",
+    "kimi_k27",
+    "kimi_k3",
+    "kimi_k3_flash",
+    "deepseek_v4",
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "qwen3_5",
+    "qwen3_5_moe",
+];
 
 use anyhow::{Context, Result, bail};
 use baseten_performance_client_core::http::HttpMethod;
 use baseten_performance_client_core::{PerformanceClientCore, RequestProcessingPreference};
 use std::collections::HashMap;
+
+#[cfg(test)]
+const TEST_IMAGE_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAFQAAAA4CAIAAADsP0i3AAAAJElEQVR4nO3BAQEAAACCIP+vbkhAAQAAAAAAAAAAAAAAAMCPATdYAAFXCTwrAAAAAElFTkSuQmCC";
 
 #[derive(Debug)]
 pub struct ProductionBdnProxyRequired;
@@ -61,7 +96,9 @@ pub fn http_error_status(error: &anyhow::Error) -> Option<u16> {
         Some(baseten_performance_client_core::errors::ClientError::Http { status, .. }) => {
             Some(*status)
         }
-        _ => None,
+        _ => error
+            .downcast_ref::<reqwest::Error>()
+            .and_then(|error| error.status().map(|status| status.as_u16())),
     }
 }
 

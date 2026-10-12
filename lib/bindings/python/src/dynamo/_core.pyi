@@ -114,8 +114,27 @@ class MultiModalEncoderClient:
         request_timeout_s: float = 300.0,
         max_retries: int = 1,
         max_concurrent_requests: int = 64,
+        max_media_bytes: int = 67108864,
+        max_total_media_bytes: int = 268435456,
+        max_media_items: int = 256,
+        max_image_pixels: int = 64000000,
+        max_concurrent_resolutions: int = 64,
     ) -> None: ...
     async def call_batch(self, requests: List[Dict[str, Any]]) -> Dict[str, Any]: ...
+    async def pre_resolve(
+        self,
+        input_ids: TokenIds,
+        requests: List[Dict[str, Any]],
+        *,
+        max_tokens: int,
+        model_config: Optional[Dict[str, Any]] = None,
+        preprocessor_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return token_plan for both workers and base64 prefill_media for prefill only."""
+        ...
+    async def replay(self, prefill_media: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Fetch encoder-derived planned embeddings and validate hashes and lengths."""
+        ...
 
 
 def log_message(level: str, message: str, module: str, file: str, line: int) -> None:

@@ -1892,6 +1892,29 @@ Responses already did, so strict tool arguments reach the serving grammar.
 Encoder `mm_kwargs` stay in Rust as `MediaEmbedding` handles; worker requests take
 their bytes by move, so embeddings no longer cross into Python and back as copies.
 
+`baseten-mm-client` pins `dynamo-multimodal` at
+`17020c2662a490f4366d1710db1971776d4e63b5`, with a Baseten fetching/planning
+adapter analogous to `baseten-parsers`. Pre-resolution accepts presigned HTTP(S)
+URLs and inline base64, fetches media with 64 shared resolution slots through BDN_PROXY when set,
+and emits canonical base64 media only for prefill. Vendor Dynamo's URL/DNS policy
+independently of NIXL, bound compressed sizes, and inspect headers without pixel
+decoding. Native image planners cover Kimi K2.7/K3, DSV4.1 and Qwen using pinned
+resize rules and checkpoint settings. Reuse upstream layout expansion and Qwen
+M-RoPE; return media-free expanded IDs, positions, lengths, hashes, geometry and
+feature ranges and DSV4.1 token types for routing/decode. The trusted BDN proxy
+may use private addresses without allowing private media destinations. Add
+request-wide media-count/streaming-byte budgets and an original-image pixel cap;
+rely on BDN's independent internal-destination blocking to prevent proxy-side
+DNS rebinding. Actual decoders still need resource limits and isolation.
+Native Qwen planning rejects mixed native/encoder media before I/O so required
+M-RoPE is never silently omitted. Python `MultiModalEncoderClient.pre_resolve`
+selects planners from checkpoint configs. Other families and audio/video use
+exact encoder metadata, retaining the existing encoder response transfer cost.
+Encoder-derived `replay` validates hash/length before returning move-only
+embeddings. Frontend routing and native worker acceptance of supplied spans
+remain caller integrations. Keep the Baseten BDN adapter on rebase; compare
+native geometry adapters against upstream coverage before replaying them.
+
 Unified Rust parser API (#915):
 
 - Replaces the separate tool-only and reasoning streams with `UnifiedParserStream`

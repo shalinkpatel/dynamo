@@ -3,7 +3,10 @@
 
 use std::sync::Mutex;
 
-use baseten_mm_client::{HttpEncoderConfig, MultiModalClient, ProductionBdnProxyRequired};
+use baseten_mm_client::{
+    HttpEncoderConfig, Media, MediaResolver, MediaResolverConfig, MultiModalClient, PlannedMedia,
+    PlanningRequest, ProductionBdnProxyRequired, TokenPlannerSpec,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -192,16 +195,38 @@ fn encoder_error(error: anyhow::Error) -> PyErr {
     }
 }
 
+fn encoder_batch_to_python(mut batch: baseten_mm_client::EncoderBatch) -> PyResult<Py<PyDict>> {
+    let embeddings: Vec<_> = batch.responses.iter_mut().map(take_mm_kwargs).collect();
+    Python::with_gil(|py| {
+        let data = pythonize::pythonize(py, &batch.responses)?;
+        for (index, bytes) in embeddings.into_iter().enumerate() {
+            if let Some(bytes) = bytes {
+                data.get_item(index)?
+                    .get_item("mm_response")?
+                    .set_item("mm_kwargs", Py::new(py, MediaEmbedding::from_vec(bytes))?)?;
+            }
+        }
+        let result = PyDict::new(py);
+        result.set_item("data", data)?;
+        result.set_item("individual_request_times", batch.individual_request_times)?;
+        result.set_item("total_time", batch.total_time)?;
+        result.set_item("num_cached", batch.num_cached)?;
+        result.set_item("num_shared", batch.num_shared)?;
+        Ok(result.unbind())
+    })
+}
+
 #[pyclass]
 #[derive(Clone)]
 pub(crate) struct MultiModalEncoderClient {
     transport: MultiModalClient,
+    resolver: MediaResolver,
 }
 
 #[pymethods]
 impl MultiModalEncoderClient {
     #[new]
-    #[pyo3(signature = (*, url, api_key, cache_urls=Vec::new(), proxy=None, request_timeout_s=300.0, max_retries=1, max_concurrent_requests=64))]
+    #[pyo3(signature = (*, url, api_key, cache_urls=Vec::new(), proxy=None, request_timeout_s=300.0, max_retries=1, max_concurrent_requests=64, max_media_bytes=67108864, max_total_media_bytes=268435456, max_media_items=256, max_image_pixels=64000000, max_concurrent_resolutions=64))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         url: String,
@@ -211,7 +236,22 @@ impl MultiModalEncoderClient {
         request_timeout_s: f64,
         max_retries: u32,
         max_concurrent_requests: usize,
+        max_media_bytes: usize,
+        max_total_media_bytes: usize,
+        max_media_items: usize,
+        max_image_pixels: u64,
+        max_concurrent_resolutions: usize,
     ) -> PyResult<Self> {
+        let resolver = MediaResolver::new(MediaResolverConfig {
+            proxy: proxy.clone(),
+            max_bytes: max_media_bytes,
+            max_total_bytes: max_total_media_bytes,
+            max_media_items,
+            max_image_pixels,
+            max_concurrent_resolutions,
+            ..Default::default()
+        })
+        .map_err(to_pyerr)?;
         let transport = MultiModalClient::new(HttpEncoderConfig {
             url,
             api_key,
@@ -228,7 +268,54 @@ impl MultiModalEncoderClient {
                 to_pyerr(error)
             }
         })?;
-        Ok(Self { transport })
+        Ok(Self {
+            transport,
+            resolver,
+        })
+    }
+
+    #[pyo3(signature = (input_ids, requests, *, max_tokens, model_config=None, preprocessor_config=None))]
+    fn pre_resolve<'py>(
+        &self,
+        py: Python<'py>,
+        input_ids: &Bound<'py, PyAny>,
+        requests: &Bound<'py, PyAny>,
+        max_tokens: usize,
+        model_config: Option<&Bound<'py, PyAny>>,
+        preprocessor_config: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let input_ids: Vec<i32> = crate::tokens::extract_list_or_numpy_u32(input_ids)?
+            .into_iter()
+            .map(|id| {
+                i32::try_from(id).map_err(|_| PyValueError::new_err("Token IDs must fit i32"))
+            })
+            .collect::<PyResult<_>>()?;
+        let mut requests: Vec<PlanningRequest> = pythonize::depythonize(requests)?;
+        if let Some(config) = model_config {
+            let config = pythonize::depythonize(config)?;
+            let preprocessor = match preprocessor_config {
+                Some(value) => pythonize::depythonize(value)?,
+                None => serde_json::Value::Object(Default::default()),
+            };
+            let planner =
+                TokenPlannerSpec::from_hf_configs(config, preprocessor).map_err(to_pyerr)?;
+            for request in &mut requests {
+                if matches!(request.request.media, Media::Image { .. })
+                    && matches!(request.planner, TokenPlannerSpec::Encoder)
+                {
+                    request.planner = planner.clone();
+                }
+            }
+        }
+        let transport = self.transport.clone();
+        let resolver = self.resolver.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let resolved = transport
+                .pre_resolve(&resolver, &input_ids, requests, max_tokens)
+                .await
+                .map_err(encoder_error)?;
+            Python::with_gil(|py| Ok(pythonize::pythonize(py, &resolved)?.unbind()))
+        })
     }
 
     fn call_batch<'py>(
@@ -239,28 +326,50 @@ impl MultiModalEncoderClient {
         let requests: Vec<serde_json::Value> = pythonize::depythonize(requests)?;
         let transport = self.transport.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut batch = transport
+            let batch = transport
                 .call_batch(requests)
                 .await
                 .map_err(encoder_error)?;
-            let embeddings: Vec<_> = batch.responses.iter_mut().map(take_mm_kwargs).collect();
-            Python::with_gil(|py| {
-                let data = pythonize::pythonize(py, &batch.responses)?;
-                for (index, bytes) in embeddings.into_iter().enumerate() {
-                    if let Some(bytes) = bytes {
-                        data.get_item(index)?
-                            .get_item("mm_response")?
-                            .set_item("mm_kwargs", Py::new(py, MediaEmbedding::from_vec(bytes))?)?;
-                    }
+            encoder_batch_to_python(batch)
+        })
+    }
+    fn replay<'py>(
+        &self,
+        py: Python<'py>,
+        prefill_media: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let items: Vec<PlannedMedia> = pythonize::depythonize(prefill_media)?;
+        let expected = items
+            .iter()
+            .map(PlannedMedia::replay_request)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(to_pyerr)?;
+        let requests = expected
+            .iter()
+            .map(|item| serde_json::to_value(&item.request))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(to_pyerr)?;
+        let transport = self.transport.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let batch = transport
+                .call_batch(requests)
+                .await
+                .map_err(encoder_error)?;
+            if batch.responses.len() != expected.len() {
+                return Err(PyValueError::new_err(
+                    "Encoder replay response count differs from planned media count",
+                ));
+            }
+            for (response, item) in batch.responses.iter().zip(&expected) {
+                let metadata = baseten_mm_client::EncoderMetadata::from_envelope(response)
+                    .map_err(encoder_error)?;
+                if metadata.mm_hash != item.mm_hash || metadata.length != item.length {
+                    return Err(PyValueError::new_err(
+                        "Encoder replay metadata differs from the routed request",
+                    ));
                 }
-                let result = PyDict::new(py);
-                result.set_item("data", data)?;
-                result.set_item("individual_request_times", batch.individual_request_times)?;
-                result.set_item("total_time", batch.total_time)?;
-                result.set_item("num_cached", batch.num_cached)?;
-                result.set_item("num_shared", batch.num_shared)?;
-                Ok(result.unbind())
-            })
+            }
+            encoder_batch_to_python(batch)
         })
     }
 }

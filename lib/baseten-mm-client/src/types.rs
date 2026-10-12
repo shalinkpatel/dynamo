@@ -17,6 +17,40 @@ pub enum Media {
     Audio { audio_url: BTreeMap<String, String> },
 }
 
+impl Media {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Image { .. } => "image_url",
+            Self::Video { .. } => "video_url",
+            Self::Audio { .. } => "audio_url",
+        }
+    }
+
+    pub(crate) fn fields(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Image { image_url } => image_url,
+            Self::Video { video_url } => video_url,
+            Self::Audio { audio_url } => audio_url,
+        }
+    }
+
+    pub fn url(&self) -> Result<&str> {
+        self.fields()
+            .get("url")
+            .map(String::as_str)
+            .context("Media has no url")
+    }
+
+    pub(crate) fn set_url(&mut self, url: String) {
+        let fields = match self {
+            Self::Image { image_url } => image_url,
+            Self::Video { video_url } => video_url,
+            Self::Audio { audio_url } => audio_url,
+        };
+        fields.insert("url".into(), url);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Detail {
@@ -92,6 +126,12 @@ pub struct MultiModalResponse {
     pub length: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EncoderMetadata {
+    pub mm_hash: String,
+    pub length: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplayRequest {
     pub request: EncodeRequest,
@@ -112,7 +152,7 @@ impl std::fmt::Display for EncoderRejection {
 }
 impl std::error::Error for EncoderRejection {}
 
-impl MultiModalResponse {
+impl EncoderMetadata {
     pub fn from_envelope(envelope: &rmpv::Value) -> Result<Self> {
         if envelope["success"].as_bool() != Some(true) {
             return Err(EncoderRejection {
@@ -140,7 +180,14 @@ impl MultiModalResponse {
             .as_u64()
             .filter(|n| *n > 0)
             .context("Expected integer length >= 1")?;
-        let mm_kwargs = match &payload["mm_kwargs"] {
+        Ok(Self { mm_hash, length })
+    }
+}
+
+impl MultiModalResponse {
+    pub fn from_envelope(envelope: &rmpv::Value) -> Result<Self> {
+        let EncoderMetadata { mm_hash, length } = EncoderMetadata::from_envelope(envelope)?;
+        let mm_kwargs = match &envelope["mm_response"]["mm_kwargs"] {
             rmpv::Value::Binary(bytes) => EmbeddingPayload::Bytes(bytes.clone()),
             rmpv::Value::String(text) => EmbeddingPayload::Base64(
                 text.as_str().context("Invalid UTF-8 mm_kwargs")?.to_owned(),
