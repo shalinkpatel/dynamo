@@ -64,7 +64,9 @@ with the pinned processor's `encode(text)` fallback for tokenizers without that
 keyword. Rust callers attach an existing serving tokenizer with
 `resolver.with_media_tokenizer(Arc::new(...))`; the callback returns `Vec<i32>`
 and must preserve media special tokens without adding unrelated BOS/EOS tokens.
-The tokenizer is never serialized to workers. Missing tokenizers fail before
+The planner checks that media control tokens have distinct single IDs and that
+the prompt placeholder matches the checkpoint media-pad ID. The tokenizer is
+never serialized to workers. Missing tokenizers fail before
 fetching/encoding rather than producing an incomplete K3 prompt. The prefill
 record retains the framing IDs in `kimi3_framing`.
 

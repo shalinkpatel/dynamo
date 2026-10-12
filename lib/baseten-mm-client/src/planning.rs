@@ -231,6 +231,47 @@ impl MediaResolver {
                     .all(|request| !matches!(request.planner, TokenPlannerSpec::Kimi3 { .. })),
             "Native Kimi K3 planning requires a checkpoint media tokenizer"
         );
+        let kimi3_controls = if requests
+            .iter()
+            .any(|item| matches!(item.planner, TokenPlannerSpec::Kimi3 { .. }))
+        {
+            let tokenizer = self
+                .media_tokenizer
+                .as_ref()
+                .context("Kimi K3 requires a media tokenizer")?;
+            let mut ids = Vec::new();
+            for text in [
+                "<|media_begin|>",
+                "<|media_content|>",
+                "<|media_end|>",
+                "<|media_pad|>",
+            ] {
+                let encoded = tokenizer(text)?;
+                ensure!(
+                    encoded.len() == 1 && encoded[0] >= 0,
+                    "Kimi K3 media control tokens must each encode to one nonnegative ID"
+                );
+                ids.push(encoded[0]);
+            }
+            ensure!(
+                ids.iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == 4,
+                "Kimi K3 media control token IDs must be distinct"
+            );
+            ensure!(
+                requests
+                    .iter()
+                    .filter(|item| matches!(item.planner, TokenPlannerSpec::Kimi3 { .. }))
+                    .all(|item| item.placeholder_token_id == ids[3]),
+                "Kimi K3 placeholder token ID differs from checkpoint tokenizer"
+            );
+            Some([ids[0], ids[1], ids[2]])
+        } else {
+            None
+        };
         let budget = crate::media::MediaBudget::new(self.max_total_bytes);
         let budget = &budget;
         let positions = placeholder_positions(input_ids, &requests)?;
@@ -278,7 +319,10 @@ impl MediaResolver {
                         let tokenizer = self.media_tokenizer.as_ref().context("Kimi K3 requires a media tokenizer")?;
                         let prefix_ids = tokenizer(&format!("<|media_begin|>image {}x{}<|media_content|>", image.width, image.height))?;
                         let suffix_ids = tokenizer("<|media_end|>")?;
-                        ensure!(!prefix_ids.is_empty() && !suffix_ids.is_empty()
+                        let [begin, content, end] = kimi3_controls.context("Kimi K3 media controls are missing")?;
+                        ensure!(prefix_ids.len() >= 3 && prefix_ids.first() == Some(&begin)
+                            && prefix_ids.last() == Some(&content) && suffix_ids == [end]
+                            && prefix_ids[1..prefix_ids.len() - 1].iter().all(|id| ![begin, content, end].contains(id))
                             && prefix_ids.iter().chain(&suffix_ids).all(|&id| id >= 0 && id != item.placeholder_token_id),
                             "Kimi K3 framing must contain nonnegative control/text IDs without image placeholders");
                         kimi3_framing = Some(Kimi3ImageFraming { prefix_ids, suffix_ids });
@@ -651,8 +695,12 @@ mod tests {
 
     // Synthetic tokenizer: verify the exact framing text, not checkpoint vocab IDs.
     fn k3_tokenizer(text: &str) -> Result<Vec<i32>> {
-        if text == "<|media_end|>" {
-            return Ok(vec![903]);
+        match text {
+            "<|media_begin|>" => return Ok(vec![901]),
+            "<|media_content|>" => return Ok(vec![902]),
+            "<|media_end|>" => return Ok(vec![903]),
+            "<|media_pad|>" => return Ok(vec![100]),
+            _ => {}
         }
         let dimensions = text
             .strip_prefix("<|media_begin|>image ")
@@ -736,6 +784,49 @@ mod tests {
             let resolver = resolver
                 .clone()
                 .with_media_tokenizer(std::sync::Arc::new(move |_| Ok(ids.clone())));
+            assert!(
+                resolver
+                    .pre_resolve(&[100], vec![image("k3", 100, kimi3())], 100, None)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("media control")
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kimi3_checks_placeholder_id_and_framing_controls() -> Result<()> {
+        let resolver = MediaResolver::new(MediaResolverConfig::default())?
+            .with_media_tokenizer(std::sync::Arc::new(k3_tokenizer));
+        assert!(
+            resolver
+                .pre_resolve(&[101], vec![image("k3", 101, kimi3())], 100, None)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("differs from checkpoint tokenizer")
+        );
+        for prefix in [
+            vec![901, 902],
+            vec![901, 100, 902],
+            vec![901, 901, 902],
+            vec![901, 902, 902],
+            vec![901, 903, 902],
+        ] {
+            let resolver =
+                resolver
+                    .clone()
+                    .with_media_tokenizer(std::sync::Arc::new(move |text| {
+                        if text.contains("image ") {
+                            Ok(prefix.clone())
+                        } else {
+                            k3_tokenizer(text)
+                        }
+                    }));
             assert!(
                 resolver
                     .pre_resolve(&[100], vec![image("k3", 100, kimi3())], 100, None)

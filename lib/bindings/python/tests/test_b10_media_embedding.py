@@ -65,10 +65,20 @@ def image_request():
 class K3TokenizerStub:
     """Synthetic IDs; check the pinned processor's framing text and encode options."""
 
+    def __init__(self):
+        self.seen = []
+
     def encode(self, text, *, allowed_special):
+        self.seen.append(text)
         assert allowed_special == "all"
-        if text == "<|media_end|>":
-            return [94]
+        controls = {
+            "<|media_begin|>": 91,
+            "<|media_content|>": 93,
+            "<|media_end|>": 94,
+            "<|media_pad|>": 100,
+        }
+        if text in controls:
+            return [controls[text]]
         assert text == "<|media_begin|>image 84x56<|media_content|>"
         return [91, 92, 93]
 
@@ -135,6 +145,13 @@ async def test_native_pre_resolution_expands_without_encoder(encoder_client, fam
         item["request"]["image_url"]["url"] == "data:image/png;base64," + IMAGE_BASE64
         for item in result["prefill_media"]
     )
+    if family == "kimi_k3":
+        assert {
+            "<|media_begin|>",
+            "<|media_content|>",
+            "<|media_end|>",
+            "<|media_pad|>",
+        }.issubset(arguments["tokenizer"].seen)
     if family == "qwen3_vl":
         assert tuple(plan["qwen_geometry"][0]["grid_thw"]) == (1, 4, 6)
         assert len(plan["mrope"]["position_ids"]) == 3 * len(plan["input_ids"])

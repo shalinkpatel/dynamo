@@ -1910,7 +1910,9 @@ Native K3/K3 Flash planning now uses a separate planner and requires the serving
 checkpoint tokenizer to add original-dimension media framing around feature IDs.
 Include framing in the expanded context limit, but report feature-only offsets
 and lengths. Keep the tokenizer out of serialized worker plans; missing or invalid
-framing fails rather than returning an incomplete prompt. K2.7 remains unframed
+framing fails rather than returning an incomplete prompt. Validate distinct
+single-token media controls and the checkpoint media-pad placeholder ID.
+K2.7 remains unframed
 by this planner because its existing template supplies that framing.
 Expose native-only Python `MediaPreprocessor` without encoder credentials, sharing
 resolver connection pools and concurrency limits across requests; leave caching
