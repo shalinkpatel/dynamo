@@ -23,6 +23,7 @@ pub mod baseten;
 pub mod metadata;
 mod openai;
 
+pub mod b10_coordinate;
 pub mod b10_rate_limiter;
 pub mod busy_threshold;
 pub mod disconnect;

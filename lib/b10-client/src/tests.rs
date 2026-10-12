@@ -4168,3 +4168,88 @@ async fn b10_retry_after_router_error_uses_fresh_router_unique_request_id() {
             .all(|h| h.as_deref() == Some("req-fresh-id-per-attempt"))
     );
 }
+
+/// The frontend's route (`coordinate_router`, which `dynamo-llm`'s HttpService mounts)
+/// answers exactly as the coordinator listener does, for a JSON-labelled protobuf body.
+#[tokio::test]
+async fn coordinate_router_answers_like_the_coordinator_listener() {
+    use crate::GenerationCoordinatorService;
+    use crate::protocol::{self, NewRequestV1, RoutingV1, generation_response_frame_v1::Frame};
+    use prost::Message;
+
+    let router = RouterGuardClientForTesting::new(
+        vec![7],
+        vec![7],
+        (0..2).map(|_| route_response_new(1)).collect(),
+    );
+    let worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
+    worker.set_stream_chunks(vec![vec![jv!({"token": 42}), jv!({"token": 43})]; 2]);
+    let coordinator = generation_coordinator(
+        router,
+        worker,
+        None,
+        None,
+        DisaggregationStrategy::Aggregated,
+    );
+    let service = Arc::new(GenerationCoordinatorService::new(
+        Arc::new(coordinator),
+        DisaggregationStrategy::Aggregated,
+    ));
+    let listener = service
+        .clone()
+        .start("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let frontend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let frontend_url = format!(
+        "http://{}{}",
+        frontend.local_addr().unwrap(),
+        crate::service::COORDINATE_PATH
+    );
+    let app = service.coordinate_router();
+    tokio::spawn(async move { axum::serve(frontend, app).await });
+
+    let request = NewRequestV1 {
+        request_id: "frontend-coordinate".into(),
+        tokens: vec![1, 2, 3],
+        routing: Some(RoutingV1::default()),
+        worker_msgpack: rmp_serde::to_vec_named(&jv!({"model": "m", "streaming": true})).unwrap(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    // Beefeater relabels the protobuf body as JSON. The measured prefill duration is the one
+    // field that may differ between two runs.
+    let frames = |url: String| {
+        let request = reqwest::Client::new()
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request.clone());
+        async move {
+            let mut body = request
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            let mut frames = Vec::new();
+            while !body.is_empty() {
+                let len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+                let payload = body.split_to(4 + len).split_off(4);
+                let mut frame = protocol::GenerationResponseFrameV1::decode(payload).unwrap();
+                if let Some(Frame::Admission(admission)) = &mut frame.frame {
+                    admission.prefill_duration_ms = None;
+                }
+                frames.push(protocol::encode_response_frame(&frame));
+            }
+            frames
+        }
+    };
+    let expected = frames(listener.endpoint_url()).await;
+    // Admission, then two chunks.
+    assert_eq!(expected.len(), 3);
+    assert_eq!(frames(frontend_url).await, expected);
+    listener.shutdown().await.unwrap();
+}

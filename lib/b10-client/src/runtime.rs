@@ -130,6 +130,13 @@ struct Listener {
     address: Option<SocketAddr>,
     strategy: DisaggregationStrategy,
     started: OnceCell<Option<String>>,
+    shutdown: CancellationToken,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 impl GenerationCoordinatorRuntime {
@@ -185,6 +192,7 @@ impl GenerationCoordinatorRuntime {
             address: settings.listen_address(),
             strategy: options.strategy,
             started: OnceCell::new(),
+            shutdown: runtime.child_token(),
         });
         let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) =
             if is_client_force.unwrap_or(settings.remotes.is_some() || default_remote.is_some()) {
@@ -262,7 +270,7 @@ impl GenerationCoordinatorRuntime {
             self.client.start().await?;
             return Ok(None);
         };
-        let shutdown = listener.runtime.child_token();
+        let shutdown = listener.shutdown.clone();
         ensure!(!shutdown.is_cancelled(), "runtime is shut down");
         listener
             .started
@@ -282,28 +290,55 @@ impl GenerationCoordinatorRuntime {
                         result = self.client.start() => { result?; }
                     }
                 }
-                let Some(address) = listener.address else {
-                    return Ok(None);
-                };
-                let server = Arc::new(GenerationCoordinatorService::new(
+                let service = Arc::new(GenerationCoordinatorService::new(
                     self.client.clone(),
                     listener.strategy,
-                ))
-                .start(address)
-                .await?;
-                let url = server.endpoint_url();
+                ));
+                // Bind first: a failed listener startup must not publish a frontend route.
+                let server = match listener.address {
+                    Some(address) => Some(service.clone().start(address).await?),
+                    None => None,
+                };
+                let url = server.as_ref().map(|server| server.endpoint_url());
+                let registration = if self.local.is_some() {
+                    Some(mount_on_frontend(&service, shutdown.clone()).await)
+                } else {
+                    None
+                };
+                // Also run cleanup when the coordinator only uses the frontend listener.
                 tokio::spawn(async move {
                     let _guard = guard;
                     shutdown.cancelled().await;
-                    if let Err(error) = server.shutdown().await {
+                    if let Some(server) = server
+                        && let Err(error) = server.shutdown().await
+                    {
                         tracing::error!(%error, "generation coordinator HTTP shutdown failed");
                     }
+                    // Retain the graceful-task guard until frontend requests have drained too.
+                    if let Some(registration) = registration {
+                        registration.unregister().await;
+                    }
                 });
-                Ok(Some(url))
+                Ok(url)
             })
             .await
             .cloned()
     }
+}
+
+/// Serve `POST /v1/coordinate` on this process's frontend HTTP server too: Beefeater sends
+/// coordinate requests to the OV's frontend Service, and a local coordinator sends them to this
+/// OV's routers and workers, so the OV needs no coordinator pod. Local mode only: a remote-mode
+/// frontend (a global frontend) must not become a relay.
+async fn mount_on_frontend(
+    service: &Arc<GenerationCoordinatorService>,
+    shutdown: CancellationToken,
+) -> Arc<dynamo_llm::http::service::b10_coordinate::Registration> {
+    dynamo_llm::http::service::b10_coordinate::register(
+        service.clone().coordinate_router(),
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]

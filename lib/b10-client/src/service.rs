@@ -20,6 +20,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Response, StatusCode, header};
 use axum::routing::{get, post};
+use dynamo_llm::http::service::forwarded_headers::FORWARDED_HEADERS_METADATA_KEY;
 use dynamo_runtime::pipeline::AsyncEngineContext;
 use dynamo_runtime::pipeline::context::Controller;
 use dynamo_runtime::pipeline::network::get_tcp_max_message_size;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-pub const COORDINATE_PATH: &str = "/v1/coordinate";
+pub use dynamo_llm::http::service::b10_coordinate::COORDINATE_PATH;
 pub const HEALTH_PATH: &str = "/health";
 pub const WORKER_LOADS_PATH: &str = "/v1/worker_loads";
 pub const BID_PATH: &str = "/v1/bid";
@@ -63,13 +64,12 @@ impl GenerationCoordinatorService {
             })?;
         let local_addr = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let app = Router::new()
-            .route(COORDINATE_PATH, post(coordinate))
-            .route(HEALTH_PATH, get(health))
-            .route(WORKER_LOADS_PATH, get(worker_loads))
-            .route(BID_PATH, post(bid))
-            .layer(DefaultBodyLimit::max(get_tcp_max_message_size()))
-            .with_state(self);
+        let app = self.with_coordinate(
+            Router::new()
+                .route(HEALTH_PATH, get(health))
+                .route(WORKER_LOADS_PATH, get(worker_loads))
+                .route(BID_PATH, post(bid)),
+        );
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async move {
@@ -85,11 +85,27 @@ impl GenerationCoordinatorService {
         })
     }
 
+    /// Only `POST /v1/coordinate`, for a frontend's HTTP server: the frontend serves its
+    /// own `/health`, and a global frontend sends coordinate requests only.
+    pub fn coordinate_router(self: Arc<Self>) -> Router {
+        self.with_coordinate(Router::new())
+    }
+
+    fn with_coordinate(self: Arc<Self>, routes: Router<Arc<Self>>) -> Router {
+        routes
+            .route(COORDINATE_PATH, post(coordinate))
+            .layer(DefaultBodyLimit::max(get_tcp_max_message_size()))
+            .with_state(self)
+    }
+
     async fn generate(&self, mut request: NewRequestV1) -> Result<GenerationOutcome> {
         protocol::validate_request(&request)?;
         let request_id = request.request_id.clone();
         let trace_context = request.trace_context.take();
-        let metadata = std::mem::take(&mut request.metadata);
+        let mut metadata = std::mem::take(&mut request.metadata);
+        // Only this process's HTTP layer sets it: a caller must not choose the headers a remote
+        // coordinator client forwards.
+        metadata.remove(FORWARDED_HEADERS_METADATA_KEY);
         let generation_request = decode_new_request(request_id.clone(), request, self.strategy)?;
         let inner: Arc<dyn AsyncEngineContext> = Arc::new(Controller::new(request_id));
         let trace_context = trace_context.map(trace_context_from_wire);
@@ -404,6 +420,33 @@ mod tests {
         assert_eq!(
             map_value(&capture.request.primary_worker_request, "lora").and_then(Value::as_str),
             Some("adapter-a")
+        );
+
+        // A caller cannot choose the headers a remote coordinator client would forward.
+        let request = NewRequestV1 {
+            request_id: "request-service-2".into(),
+            tokens: vec![1],
+            routing: Some(protocol::RoutingV1::default()),
+            worker_msgpack: rmp_serde::to_vec_named(&Value::Map(vec![])).unwrap(),
+            metadata: [(FORWARDED_HEADERS_METADATA_KEY.into(), "[]".into())].into(),
+            trace_context: Some(protocol::TraceContextV1 {
+                trace_id: "0123456789abcdef0123456789abcdef".into(),
+                span_id: "0123456789abcdef".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        reqwest::Client::new()
+            .post(format!("{base_url}{COORDINATE_PATH}"))
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .unwrap();
+        let capture = coordinator.capture.lock().unwrap().take().unwrap();
+        assert!(
+            !capture
+                .metadata
+                .contains_key(FORWARDED_HEADERS_METADATA_KEY)
         );
         running.shutdown().await.unwrap();
     }

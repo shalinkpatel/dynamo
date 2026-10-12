@@ -402,6 +402,7 @@ impl HttpService {
         cancel_token: CancellationToken,
         listener: Option<tokio::net::TcpListener>,
     ) -> Result<()> {
+        let _coordinator_frontend = super::b10_coordinate::FRONTENDS.token();
         if self.supports_waypoints() {
             super::waypoints::spawn(
                 self.router.clone(),
@@ -457,8 +458,9 @@ impl HttpService {
             // Spawn canary after all fallible startup so it won't leak on early errors
             tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
 
+            tokio::pin!(server);
             tokio::select! {
-                result = server => {
+                result = &mut server => {
                     let result = result.map_err(|e| anyhow::anyhow!("HTTPS server error: {}", e));
                     cancel_token.cancel();
                     result?;
@@ -466,9 +468,9 @@ impl HttpService {
                 _ = observer.cancelled() => {
                     state_cancel.cancel();
                     tracing::info!("HTTPS server shutdown requested");
-                    // accepting requests for 5 more seconds, to allow incorrectly routed requests to arrive
-                    handle.graceful_shutdown(Some(Duration::from_secs(get_graceful_shutdown_timeout() as u64)));
-                    // no longer accepting requests, draining all existing connections
+                    handle.graceful_shutdown(None);
+                    // Keep the serving future alive until HTTPS connections finish draining.
+                    server.await.map_err(|e| anyhow::anyhow!("HTTPS server error: {}", e))?;
                 }
             }
         } else {
@@ -703,6 +705,8 @@ impl HttpServiceConfigBuilder {
             inference_router = inference_router.merge(route);
             all_docs.extend(route_docs);
         }
+        // 404 until a generation coordinator in this process registers.
+        inference_router = inference_router.merge(super::b10_coordinate::coordinate_router());
         inference_router = inference_router.layer(
             TraceLayer::new_for_http()
                 .make_span_with(make_inference_request_span)

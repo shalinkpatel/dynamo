@@ -1860,6 +1860,17 @@ carry the client's auth to Alyx. When replaying, keep the capture in the OpenAI
 context builder (`context_from_headers_with_body_session`) and the Anthropic
 messages handler together with the `.direct()` drop.
 
+Frontend serves `/v1/coordinate`:
+
+A started local-mode `GenerationCoordinatorRuntime` registers its coordinate route
+(`GenerationCoordinatorService::coordinate_router`) in `http::service::b10_coordinate`, which every
+`HttpService` serves at `POST /v1/coordinate`, so an OV needs no coordinator pod. Baseten-only
+(Beefeater sends it to the OV frontend); replay the slot, its `service_v2` mount and `runtime.rs`'s
+`mount_on_frontend` together. The registration uses a Tokio `RwLock`: each request
+clones the latest router before dispatch. Runtime shutdown/drop keeps the registration
+and backend connections alive through the frontend's grace period and request drain,
+then removes only its own registration. Failed listener startup publishes no route.
+
 v1.2 read-only coordinator bids (#803):
 
 Coordinator bids use dedicated `RouterRequest::Bid` / `RouterResponse::Bid`
