@@ -198,10 +198,10 @@ impl GenerationCoordinator {
     pub async fn generate(
         &self,
         context: RequestContext,
-        request: GenerationRequest,
+        mut request: GenerationRequest,
         options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
-        validate_generation_request(&request, self.strategy)?;
+        validate_generation_request(&mut request, self.strategy)?;
         match self.strategy {
             DisaggregationStrategy::Aggregated => {
                 self.generate_aggregated(context, request, options.primary)
@@ -563,7 +563,7 @@ pub struct WorkerLoad {
 }
 
 fn validate_generation_request(
-    request: &GenerationRequest,
+    request: &mut GenerationRequest,
     strategy: DisaggregationStrategy,
 ) -> Result<()> {
     if map_get_value(&request.primary_worker_request, "router_response")
@@ -583,9 +583,22 @@ fn validate_generation_request(
         && map_get_value(&request.primary_worker_request, "sampling_params")
             .and_then(|params| map_get_value(params, "max_tokens"))
             .and_then(Value::as_i64)
-            .is_some_and(|max_tokens| max_tokens <= 1)
+            .is_some_and(|max_tokens| max_tokens <= 0)
     {
-        bail!("max_tokens must be at least 2 for this deployment");
+        bail!("max_tokens must be positive for this deployment");
+    }
+    if strategy == DisaggregationStrategy::PrefillFirst {
+        // Leave one decode token after prefill so the handoff can complete.
+        for payload in std::iter::once(&mut request.primary_worker_request)
+            .chain(request.decode_worker_request.iter_mut())
+        {
+            if let Value::Map(map) = payload
+                && let Some(params) = map_get_mut(map, "sampling_params")
+                && map_get_value(params, "max_tokens").and_then(Value::as_i64) == Some(1)
+            {
+                set_map_field(params, "max_tokens", Value::from(2))?;
+            }
+        }
     }
     Ok(())
 }
@@ -777,6 +790,23 @@ mod tests {
 
     fn jv(value: serde_json::Value) -> Value {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn b10_disagg_raises_single_token_limit_on_both_legs() {
+        let payload = jv(serde_json::json!({"sampling_params": {"max_tokens": 1}}));
+        let mut request = GenerationRequest {
+            routing_request: RouterRequestNew::default(),
+            primary_worker_request: payload.clone(),
+            decode_worker_request: Some(payload.clone()),
+        };
+        validate_generation_request(&mut request, DisaggregationStrategy::Aggregated).unwrap();
+        assert_eq!(request.primary_worker_request, payload);
+        assert_eq!(request.decode_worker_request, Some(payload));
+        validate_generation_request(&mut request, DisaggregationStrategy::PrefillFirst).unwrap();
+        let expected = jv(serde_json::json!({"sampling_params": {"max_tokens": 2}}));
+        assert_eq!(request.primary_worker_request, expected);
+        assert_eq!(request.decode_worker_request, Some(expected));
     }
 
     #[test]
