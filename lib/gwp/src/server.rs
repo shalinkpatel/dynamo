@@ -72,19 +72,31 @@ async fn build_inner(
     let topology = TopologyStore::new(initial_topology);
     router.register_info_route(topology.clone());
     let (updates_tx, updates_rx) = tokio::sync::mpsc::channel(TOPOLOGY_UPDATE_BUFFER);
+    let (planner_tx, planner_rx) = tokio::sync::mpsc::channel(TOPOLOGY_UPDATE_BUFFER);
+    let mut discovery_handle = crate::b10_discovery::spawn(
+        initial.discovery.clone(),
+        planner_rx,
+        updates_tx,
+        router.metrics().clone(),
+    )
+    .await?;
     let controller = TopologyController::model_scoped(topology.clone(), router.clone())
         .with_metrics(router.metrics().clone())
         .with_lifecycle(lifecycle.clone());
     let mut controller_handle = controller.spawn(updates_rx);
-    let mut reflector_handle = Reflector::new(config.clone(), updates_tx)
+    let mut reflector_handle = Reflector::new(config.clone(), planner_tx)
         .with_metrics(router.metrics().clone())
         .spawn();
-    // Either side exiting tears down the whole topology pipeline.
+    // Any stage exiting tears down the whole topology pipeline.
     let topology_handle = tokio::spawn(async move {
         tokio::select! {
-            _ = &mut reflector_handle => controller_handle.abort(),
-            _ = &mut controller_handle => reflector_handle.abort(),
+            _ = &mut reflector_handle => {},
+            _ = &mut controller_handle => {},
+            _ = &mut discovery_handle => {},
         }
+        reflector_handle.abort();
+        controller_handle.abort();
+        discovery_handle.abort();
     });
 
     let affinity = Arc::new(InstrumentedAffinityStore::new(

@@ -2738,6 +2738,7 @@ dependencies = [
  "baseten-configmap",
  "basetenkenizer",
  "bytes",
+ "chrono",
  "dashmap",
  "dynamo-kv-router",
  "dynamo-llm",

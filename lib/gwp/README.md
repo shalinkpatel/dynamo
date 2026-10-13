@@ -51,3 +51,64 @@ tokenization:
       mode: template_only
       directory: /workspace/lib/gwp/vendored_tokenizers/glm5.2
 ```
+
+## MCM discovery through Redis
+
+Set `discovery.type: mcm_redis` to use the Redis view already maintained by
+MCM/Beefeater's Kafka consumers. This adapter feeds the existing GWP topology
+independently of the request transport. The default remains
+`discovery.type: planner`.
+
+For each configured deployment it pipelines these reads in the background:
+
+- `GET rt:<model_deployment_id>` for MCM's `RouteTable` protobuf JSON.
+- `HGETALL bis:<model_deployment_id>:v1:metrics` for relayed LSM samples.
+- Optionally, `HGETALL bis:<model_deployment_id>:v1:metrics:observed` for the
+  newer samples Alyx has collected through responses.
+
+The endpoint directory and credentials remain operator configuration. Each
+endpoint maps explicitly to one deployment and workload plane; its canonical
+GWP model ID must equal `model_deployment_id`. Optional `namespace` additionally
+checks both route and sample identity. Every configured endpoint needs a
+mapping. See `deploy/gwp/mcm/gwp.example.yaml`.
+
+A destination must have both an MCM route and fresh positive capacity.
+Weighted routes require positive weight and replicas other than explicit zero;
+fill-first routes require positive replicas and container concurrency. This
+adapter determines membership; it does not implement MCM traffic weights or
+request-specific region/compliance policy. Existing GWP routing-requirement
+filtering and worker scoring still apply.
+
+The newest valid relayed/observed sample wins. Identity mismatches, malformed
+samples, stale timestamps and regressing revisions cannot restore a removed
+route. A missing route, expired hash field, Redis error or read timeout removes
+the affected destinations from the published topology. Redis failures withdraw
+all MCM destinations until a successful refresh. These empty snapshots propagate
+to readiness; dispatchers can fall back to their existing routing. Sample age
+is measured from LSM's timestamp, so reading a delayed Kafka event does not make
+it fresh again.
+
+Planner polling continues to supply worker inventory and detailed load.
+The current MCM capacity message lacks those details; its empty `workerIds`
+field is not interpreted as an authoritative empty worker set. A Redis refresh
+does not reset the scheduler's load-observation anchors. Extending LSM's worker
+snapshot later can replace this planner source without changing request handlers.
+
+Build with `server,redis,etcd`. `deploy/gwp/mcm` builds on the existing
+GWP/Envoy deployment, supplies `DYN_GWP_MCM_REDIS_URL` from the
+`dynamo-gwp-mcm` Secret's `redis-url` key, and needs the GWP and Envoy ConfigMaps and
+service resources. Populate the GWP ConfigMap using the example adapted for
+your deployment. Build the GWP image from this revision; see
+`deploy/gwp/kubernetes/README.md` for the remaining deployment setup. Discovery
+configuration is startup-only. No new Kafka consumer group is required. GWP's
+existing etcd peer discovery and ZMQ/NATS scheduler synchronization remain
+separate from MCM destination discovery.
+
+Observe `gwp_discovery_polls_total{result="ok"|"error"}` and
+`gwp_discovery_eligible_endpoints`, together with standard readiness and planner
+metrics. The Redis integration test uses an isolated database:
+
+```sh
+DYN_GWP_TEST_REDIS=redis://127.0.0.1:6379/ cargo test -p dynamo-gwp \
+  --features server,redis,etcd --lib b10_discovery:: -- --include-ignored
+```

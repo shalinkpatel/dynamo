@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../kubernetes
+patches:
+  - target:
+      kind: Deployment
+      name: dynamo-gwp
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: dynamo-gwp
+      spec:
+        template:
+          spec:
+            containers:
+              - name: gwp
+                env:
+                  - name: DYN_GWP_MCM_REDIS_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: dynamo-gwp-mcm
+                        key: redis-url

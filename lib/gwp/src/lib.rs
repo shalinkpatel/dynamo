@@ -27,6 +27,7 @@
 //! `server`; binary `dynamo-gwp`). Multi-replica session affinity uses etcd
 //! (feature `etcd`) and treats backend errors as affinity misses.
 
+pub mod b10_discovery;
 pub mod config;
 pub mod control;
 pub mod core;

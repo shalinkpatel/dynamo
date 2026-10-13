@@ -69,6 +69,8 @@ pub struct GwpMetrics {
     scheduler_inflight_tokens: GaugeVec,
     scheduler_live_workers: IntGaugeVec,
     topology_ambiguous_workers: IntGauge,
+    discovery_polls: IntCounterVec,
+    discovery_endpoints: IntGauge,
     scheduler_load: Arc<Mutex<HashMap<EndpointId, ClusterSchedulerLoad>>>,
     time_to_first_byte_seconds: HistogramVec,
     request_duration_seconds: HistogramVec,
@@ -104,6 +106,8 @@ impl GwpMetrics {
     pub fn from_endpoint(endpoint: &dynamo_runtime::component::Endpoint) -> anyhow::Result<Self> {
         let metrics = endpoint.metrics();
         Ok(Self {
+            discovery_polls: metrics.create_intcountervec("gwp_discovery_polls_total", "MCM Redis discovery polls by result.", &["result"], &[])?,
+            discovery_endpoints: metrics.create_intgauge("gwp_discovery_eligible_endpoints", "Endpoints with a current MCM route and fresh capacity.", &[])?,
             routing_decisions: metrics.create_intcountervec(
                 "gwp_routing_decisions_total",
                 "GWP routing decisions made before forwarding upstream.",
@@ -496,6 +500,11 @@ impl GwpMetrics {
         self.lifecycle_reconciliations
             .with_label_values(&[outcome])
             .inc();
+    }
+
+    pub fn record_discovery(&self, result: &str, endpoints: usize) {
+        self.discovery_polls.with_label_values(&[result]).inc();
+        self.discovery_endpoints.set(endpoints as i64);
     }
 
     pub fn observe_lifecycle_rpc(&self, method: &str, result: &str, elapsed: Duration) {

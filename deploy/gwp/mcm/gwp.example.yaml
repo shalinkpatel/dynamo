@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Put this in the dynamo-gwp ConfigMap's gwp.yaml after replacing example
+# deployment identities and service addresses with the regional catalog.
+endpoints:
+  ov-example-us-east:
+    ingress_url: http://coordinator-east.example.internal:8000/v1
+    planner_url: http://planner-east.example.internal:8001/deep/health
+  ov-example-us-west:
+    ingress_url: http://coordinator-west.example.internal:8000/v1
+    planner_url: http://planner-west.example.internal:8001/deep/health
+routes:
+  - models: [ov-example]
+    endpoints: [ov-example-us-east, ov-example-us-west]
+discovery:
+  type: mcm_redis
+  url_env: DYN_GWP_MCM_REDIS_URL
+  poll_interval_ms: 1000
+  timeout_ms: 1000
+  max_sample_age_secs: 10
+  observed_metrics: true
+  endpoints:
+    ov-example-us-east:
+      model_deployment_id: ov-example
+      workload_plane: us-east
+    ov-example-us-west:
+      model_deployment_id: ov-example
+      workload_plane: us-west
+session:
+  backend:
+    type: redis
+    url: redis://gwp-affinity.example.internal:6379/
+routing:
+  block_size: 32
+  planner_staleness_grace_secs: 30
+  replica_warmup_secs: 90

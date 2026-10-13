@@ -329,6 +329,8 @@ pub struct GwpConfig {
     #[serde(default)]
     pub routing: RoutingConfig,
     #[serde(default)]
+    pub discovery: crate::b10_discovery::DiscoveryConfig,
+    #[serde(default)]
     pub tokenization: TokenizationConfig,
     /// Hot-reloadable stage switches resolved by canonical model name.
     #[serde(default)]
@@ -378,6 +380,7 @@ impl GwpConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        self.discovery.validate(self)?;
         anyhow::ensure!(
             !self.endpoints.is_empty(),
             "GWP config must define at least one endpoint"
@@ -728,6 +731,12 @@ impl ConfigStore {
                 match GwpConfig::load_from_str(&contents) {
                     Ok(mut next) => {
                         let previous = store.load();
+                        if next.discovery != previous.discovery {
+                            tracing::warn!(
+                                "discovery backend is startup-only; retaining current configuration"
+                            );
+                            next.discovery = previous.discovery.clone();
+                        }
                         if next.routing.block_size != previous.routing.block_size {
                             tracing::warn!(
                                 old = previous.routing.block_size,
@@ -779,6 +788,10 @@ impl ConfigStore {
                             );
                             next.session.backend = previous.session.backend.clone();
                             next.session.etcd_endpoints = previous.session.etcd_endpoints.clone();
+                        }
+                        if let Err(error) = next.validate() {
+                            tracing::warn!(%error, "config update conflicts with startup-only settings; retaining current config");
+                            continue;
                         }
                         store.replace(next);
                         last_contents = Some(contents);
