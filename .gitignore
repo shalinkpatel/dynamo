@@ -110,8 +110,10 @@ TensorRT-LLM
 !/.claude/skills
 /.agents/*
 !/.agents/skills
-/CLAUDE.md
 /CLAUDE.md.bak
+# Personal agent instructions; the committed CLAUDE.md files only import AGENTS.md
+CLAUDE.local.md
+AGENTS.local.md
 
 # Benchmarks
 benchmarks/results
