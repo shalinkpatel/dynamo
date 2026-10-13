@@ -32,7 +32,7 @@ message BidResponse
   uint64 decode_tokens = 3;
 }
 
-// Alyx owns generation streams and consults GWP for placement and
+// Alyx owns generation streams and consults Grid / KVLocator / GWP for placement and
 // attempt accounting. NewRequest and GenerationResponseFrame stay on the
 // generation path; worker payloads and output chunks are not sent to GWP.
 //
