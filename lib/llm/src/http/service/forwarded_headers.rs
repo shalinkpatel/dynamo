@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 
 pub const FORWARDED_HEADERS_METADATA_KEY: &str = "baseten.forwarded_headers";
 type Headers = Vec<(String, Vec<u8>)>;
-const EXCLUDED_HEADERS: &[&str] = &["host", "accept", "content-type"];
+// Host is forwarded: Alyx resolves a dedicated model from `Host: model-<id>.<apiBaseHost>`.
+const EXCLUDED_HEADERS: &[&str] = &["accept", "content-type"];
 
 pub fn capture(metadata: &mut BTreeMap<String, String>, headers: &HeaderMap) {
     let entries: Vec<_> = headers

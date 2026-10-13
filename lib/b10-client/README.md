@@ -57,8 +57,9 @@ result = await coordinator.generate(
 ```
 
 Incoming HTTP headers are captured as JSON in `baseten.forwarded_headers` context
-metadata, excluding `Host`, `Accept`, and `Content-Type` while preserving
-`Authorization`, repeated values, and opaque bytes. Remote coordinators consume
+metadata, excluding `Accept` and `Content-Type` while preserving `Host` (Alyx
+routes dedicated models on it), `Authorization`, repeated values, and opaque bytes.
+Because `Host` is forwarded, use HTTP/1.1 (`http://`) remotes. Remote coordinators consume
 that key and forward the headers over HTTP; the protobuf client sets its own
 `Content-Type`, `Accept`, body framing, and response compression. Router/worker `.direct()` calls drop the
 key. Remote URLs remain exact coordinator URLs; no path rewriting is performed.

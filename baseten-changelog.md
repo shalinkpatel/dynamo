@@ -1852,8 +1852,9 @@ Remote coordinator header forwarding:
 
 The HTTP service captures each request's incoming headers as JSON in the
 `baseten.forwarded_headers` context metadata key (`http::service::forwarded_headers`),
-excluding `Host`, `Accept`, `Content-Type` and connection-specific headers while
-keeping `Authorization`, repeated values and opaque bytes. The remote coordinator
+excluding `Accept`, `Content-Type` and connection-specific headers while keeping
+`Host` (Alyx resolves dedicated models from `Host: model-<id>.<apiBaseHost>`),
+`Authorization`, repeated values and opaque bytes. The remote coordinator
 client consumes the key and sends the headers with the protobuf request; router and
 worker `.direct()` calls drop it, so it never reaches them or the protobuf metadata.
 Remote URLs stay exact coordinator URLs. Baseten-only: it lets a global frontend
