@@ -27,11 +27,45 @@ use super::*;
 use crate::Endpoint;
 use crate::to_pyerr;
 use dynamo_runtime::component::Component;
-use dynamo_runtime::discovery::{DiscoveryEvent, DiscoveryInstance, DiscoveryQuery};
+use dynamo_runtime::discovery::{
+    DiscoveryEvent, DiscoveryInstance, DiscoveryQuery, ModelTaintsUpdate,
+};
 use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::EventSubscriber;
 
 const FPM_TOPIC: &str = "forward-pass-metrics";
+
+/// Applies a scoped taint update to the card retained for its worker. The fork keeps one card
+/// per worker (upstream indexes every card per worker), so the update applies to whichever card
+/// is retained.
+fn update_worker_model_card_taints(
+    cards: &DashMap<String, String>,
+    update: &ModelTaintsUpdate,
+) -> anyhow::Result<bool> {
+    let worker_id = update.id.instance_id.to_string();
+    let Some(mut retained) = cards.get_mut(&worker_id) else {
+        return Ok(false);
+    };
+    let mut card: serde_json::Value = serde_json::from_str(&retained)?;
+    let runtime_config = card
+        .get_mut("runtime_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("model card is missing runtime_config"))?;
+    let taints = serde_json::Value::Array(
+        update
+            .taints
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
+    if runtime_config.get("taints") == Some(&taints) {
+        return Ok(false);
+    }
+    runtime_config.insert("taints".to_string(), taints);
+    *retained = serde_json::to_string(&card)?;
+    Ok(true)
+}
 
 // ---------------------------------------------------------------------------
 // Relay: raw ZMQ (child process) -> event plane
@@ -692,6 +726,23 @@ impl FpmEventSubscriber {
                                     known.insert(wid.clone());
                                     tracing::debug!("FPM tracker: worker {wid} added to known set");
                                 }
+                                Some(Ok(DiscoveryEvent::ModelTaintsUpdated(update))) => {
+                                    match update_worker_model_card_taints(&cards, &update) {
+                                        Ok(true) => tracing::debug!(
+                                            instance_id = update.id.instance_id,
+                                            "FPM tracker: model-card taints updated"
+                                        ),
+                                        Ok(false) => tracing::debug!(
+                                            instance_id = update.id.instance_id,
+                                            "FPM tracker: ignored unknown or duplicate taint update"
+                                        ),
+                                        Err(error) => tracing::warn!(
+                                            instance_id = update.id.instance_id,
+                                            %error,
+                                            "FPM tracker: failed to update model-card taints"
+                                        ),
+                                    }
+                                }
                                 Some(Ok(DiscoveryEvent::Removed(id))) => {
                                     let removed_id = id.instance_id().to_string();
                                     known.remove(&removed_id);
@@ -788,5 +839,49 @@ impl FpmEventSubscriber {
 impl Drop for FpmEventSubscriber {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynamo_runtime::discovery::ModelCardInstanceId;
+
+    fn card_id(instance_id: u64) -> ModelCardInstanceId {
+        ModelCardInstanceId {
+            namespace: "ns".to_string(),
+            component: "backend".to_string(),
+            endpoint: "generate".to_string(),
+            instance_id,
+            model_suffix: None,
+        }
+    }
+
+    #[test]
+    fn scoped_taint_update_refreshes_retained_base_card() {
+        let cards = DashMap::new();
+        cards.insert(
+            "42".to_string(),
+            serde_json::json!({"runtime_config": {"taints": ["old"]}}).to_string(),
+        );
+
+        let update = ModelTaintsUpdate {
+            id: card_id(42),
+            taints: vec!["blue".to_string(), "gpu".to_string()],
+        };
+        assert!(update_worker_model_card_taints(&cards, &update).unwrap());
+        let card: serde_json::Value = serde_json::from_str(&cards.get("42").unwrap()).unwrap();
+        assert_eq!(
+            card["runtime_config"]["taints"],
+            serde_json::json!(["blue", "gpu"])
+        );
+        assert!(!update_worker_model_card_taints(&cards, &update).unwrap());
+
+        let unknown = ModelTaintsUpdate {
+            id: card_id(99),
+            taints: vec!["unknown".to_string()],
+        };
+        assert!(!update_worker_model_card_taints(&cards, &unknown).unwrap());
+        assert_eq!(cards.len(), 1);
     }
 }

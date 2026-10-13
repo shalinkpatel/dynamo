@@ -339,6 +339,12 @@ impl ModelWatcher {
                     }
                     self.pending_puts.insert(instance_key, handle);
                 }
+                DiscoveryEvent::ModelTaintsUpdated(update) => {
+                    tracing::debug!(
+                        instance_id = update.id.instance_id,
+                        "Ignoring model taint update in structural model discovery"
+                    );
+                }
                 DiscoveryEvent::Removed(id) => {
                     // Extract ModelCardInstanceId from the removal event
                     let model_card_instance_id = match &id {

@@ -5,8 +5,8 @@ use std::cmp;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use std::{collections::HashMap, pin::Pin};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use fs4::fs_std::FileExt;
 use futures::StreamExt;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event};
 use parking_lot::Mutex;
@@ -34,6 +35,9 @@ const MIN_KEEP_ALIVE: Duration = Duration::from_secs(1);
 /// Prefix for temporary files used in atomic writes.
 /// Files with this prefix are ignored by the watcher.
 const TEMP_FILE_PREFIX: &str = ".tmp_";
+const TEMP_FILE_CREATE_ATTEMPTS: usize = 16;
+const MUTATION_LOCK_ATTEMPTS: usize = 100;
+const MUTATION_LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 /// Treat as a singleton
 #[derive(Clone)]
@@ -191,6 +195,26 @@ pub struct Directory {
     owned_files: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
+struct DirectoryMutationLock {
+    _file: File,
+}
+
+impl DirectoryMutationLock {
+    fn acquire(path: &Path) -> Result<Self, StoreError> {
+        let file = File::open(path).map_err(to_fs_err)?;
+        FileExt::lock_exclusive(&file).map_err(to_fs_err)?;
+        Ok(Self { _file: file })
+    }
+
+    fn try_acquire(path: &Path) -> Result<Option<Self>, StoreError> {
+        let file = File::open(path).map_err(to_fs_err)?;
+        match FileExt::try_lock_exclusive(&file).map_err(to_fs_err)? {
+            true => Ok(Some(Self { _file: file })),
+            false => Ok(None),
+        }
+    }
+}
+
 impl Directory {
     fn new(root: PathBuf, p: PathBuf, ttl: Duration) -> Self {
         // Canonicalize root to handle symlinks (e.g., /var -> /private/var on macOS)
@@ -232,6 +256,9 @@ impl Directory {
     /// Returns an error if we cannot open the directory. Errors inside the directory are logged
     /// but non-fatal.
     fn delete_expired_files(&self) -> anyhow::Result<()> {
+        let _mutation_lock = self
+            .lock_mutations_blocking()
+            .map_err(anyhow::Error::from)?;
         let deadline = SystemTime::now() - self.ttl;
         let dirname = self.p.display().to_string();
         for entry in fs::read_dir(&self.p).with_context(|| dirname.clone())? {
@@ -274,6 +301,9 @@ impl Directory {
     }
 
     fn delete_owned_files(&mut self) -> anyhow::Result<()> {
+        let _mutation_lock = self
+            .lock_mutations_blocking()
+            .map_err(anyhow::Error::from)?;
         let mut errs = Vec::new();
         for p in self.owned_files.lock().drain() {
             if let Err(err) = fs::remove_file(&p) {
@@ -284,6 +314,41 @@ impl Directory {
             anyhow::bail!(errs.join(", "));
         }
         Ok(())
+    }
+
+    fn lock_mutations_blocking(&self) -> Result<DirectoryMutationLock, StoreError> {
+        DirectoryMutationLock::acquire(&self.p)
+    }
+
+    async fn lock_mutations(&self) -> Result<DirectoryMutationLock, StoreError> {
+        for attempt in 0..MUTATION_LOCK_ATTEMPTS {
+            if let Some(lock) = DirectoryMutationLock::try_acquire(&self.p)? {
+                return Ok(lock);
+            }
+            if attempt + 1 < MUTATION_LOCK_ATTEMPTS {
+                tokio::time::sleep(MUTATION_LOCK_RETRY_DELAY).await;
+            }
+        }
+
+        Err(StoreError::FilesystemError(format!(
+            "timed out acquiring FileStore mutation lock for {} after {MUTATION_LOCK_ATTEMPTS} attempts",
+            self.p.display()
+        )))
+    }
+
+    fn write_temp_file(&self, value: &[u8]) -> Result<PathBuf, StoreError> {
+        for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
+            let temp_name = format!("{TEMP_FILE_PREFIX}{:016x}", rand::random::<u64>());
+            let temp_path = self.p.join(&temp_name);
+            if write_temp_file_at(&temp_path, value)? {
+                return Ok(temp_path);
+            }
+        }
+
+        Err(StoreError::FilesystemError(format!(
+            "failed to create unique FileStore temp file in {} after {TEMP_FILE_CREATE_ATTEMPTS} attempts",
+            self.p.display()
+        )))
     }
 }
 
@@ -307,15 +372,8 @@ impl Bucket for Directory {
         let full_path = self.p.join(safe_key.as_ref());
         let str_path = full_path.display().to_string();
 
-        // Use atomic write: write to temp file, then rename.
-        // This prevents watchers from seeing partially written files.
-        let temp_name = format!("{TEMP_FILE_PREFIX}{:016x}", rand::random::<u64>());
-        let temp_path = self.p.join(&temp_name);
-
-        // Write to temp file first
-        fs::write(&temp_path, &value)
-            .with_context(|| format!("writing temp file {}", temp_path.display()))
-            .map_err(a_to_fs_err)?;
+        let _mutation_lock = self.lock_mutations().await?;
+        let temp_path = self.write_temp_file(&value)?;
 
         // Atomic rename to target path
         fs::rename(&temp_path, &full_path)
@@ -324,6 +382,43 @@ impl Bucket for Directory {
 
         self.owned_files.lock().insert(full_path.clone());
         Ok(StoreOutcome::Created(0))
+    }
+
+    async fn compare_and_replace(
+        &self,
+        key: &Key,
+        expected: bytes::Bytes,
+        value: bytes::Bytes,
+    ) -> Result<StoreOutcome, StoreError> {
+        let full_path = self.p.join(key.url_safe().as_ref());
+        let str_path = full_path.display().to_string();
+        let _mutation_lock = self.lock_mutations().await?;
+
+        let current = match fs::read(&full_path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(StoreError::MissingKey(key.to_string()));
+            }
+            Err(error) => return Err(to_fs_err(error)),
+        };
+        if current.as_slice() != expected.as_ref() {
+            return Err(StoreError::Retry);
+        }
+
+        let temp_path = self.write_temp_file(&value)?;
+        if let Err(error) = fs::rename(&temp_path, &full_path) {
+            if let Err(remove_error) = fs::remove_file(&temp_path) {
+                tracing::warn!(path = %temp_path.display(), %remove_error, "Failed to remove FileStore temp file after replace error");
+            }
+            return Err(a_to_fs_err(anyhow::Error::new(error).context(format!(
+                "renaming {} to {}",
+                temp_path.display(),
+                str_path
+            ))));
+        }
+
+        self.owned_files.lock().insert(full_path);
+        Ok(StoreOutcome::Created(1))
     }
 
     /// Read a file from the directory
@@ -346,6 +441,7 @@ impl Bucket for Directory {
         let safe_key = key.url_safe();
         let full_path = self.p.join(safe_key.as_ref());
         let str_path = full_path.display().to_string();
+        let _mutation_lock = self.lock_mutations().await?;
         if !full_path.exists() {
             return Err(StoreError::MissingKey(str_path));
         }
@@ -376,12 +472,20 @@ impl Bucket for Directory {
             .watch(&self.p, RecursiveMode::NonRecursive)
             .map_err(to_fs_err)?;
 
+        // Establish the filesystem watcher before reading the snapshot. Mutations that race
+        // with the snapshot are buffered by notify; event values are read when consumed, so
+        // replaying a buffered notification cannot regress an emitted snapshot value.
+        let initial_entries = self.entries().await?;
         let dir = self.p.clone();
         let root = self.root.clone();
 
         Ok(Box::pin(async_stream::stream! {
             // Keep watcher alive for the duration of the stream
             let _watcher = watcher;
+
+            for (key, value) in initial_entries {
+                yield WatchEvent::Put(KeyValue::new(key, value));
+            }
 
             while let Some(event_result) = rx.recv().await {
                 let event = match event_result {
@@ -441,7 +545,14 @@ impl Bucket for Directory {
                             yield WatchEvent::Put(item);
                         }
                         EventKind::Remove(event::RemoveKind::File) => {
-                            yield WatchEvent::Delete(key);
+                            if should_emit_delete(&item_path) {
+                                yield WatchEvent::Delete(key);
+                            } else {
+                                tracing::debug!(
+                                    item = %item_path.display(),
+                                    "Suppressing stale FileStore remove event for a recreated key"
+                                );
+                            }
                         }
                         _ => {
                             // These happen every time the keep-alive updates last modified time
@@ -454,6 +565,7 @@ impl Bucket for Directory {
     }
 
     async fn entries(&self) -> Result<HashMap<Key, bytes::Bytes>, StoreError> {
+        let _mutation_lock = self.lock_mutations().await?;
         let contents = fs::read_dir(&self.p)
             .with_context(|| self.p.display().to_string())
             .map_err(a_to_fs_err)?;
@@ -508,6 +620,41 @@ impl Bucket for Directory {
     }
 }
 
+fn write_temp_file_at(temp_path: &Path, value: &[u8]) -> Result<bool, StoreError> {
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => {
+            let err = anyhow::Error::new(err)
+                .context(format!("creating temp file {}", temp_path.display()));
+            return Err(a_to_fs_err(err));
+        }
+    };
+
+    if let Err(err) = file.write_all(value) {
+        if let Err(remove_err) = fs::remove_file(temp_path) {
+            tracing::warn!(
+                path = %temp_path.display(),
+                error = %remove_err,
+                "Failed to remove FileStore temp file after write error"
+            );
+        }
+        let err =
+            anyhow::Error::new(err).context(format!("writing temp file {}", temp_path.display()));
+        return Err(a_to_fs_err(err));
+    }
+
+    Ok(true)
+}
+
+fn should_emit_delete(path: &Path) -> bool {
+    !path.exists()
+}
+
 // For anyhow preserve the context
 fn a_to_fs_err(err: anyhow::Error) -> StoreError {
     StoreError::FilesystemError(format!("{err:#}"))
@@ -520,10 +667,98 @@ fn to_fs_err<E: std::error::Error>(err: E) -> StoreError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use tokio::sync::Barrier;
     use tokio_util::sync::CancellationToken;
 
-    use crate::storage::kv::{Bucket as _, FileStore, Key, Store as _};
+    use crate::storage::kv::{Bucket as _, FileStore, Key, Store as _, StoreError, StoreOutcome};
+
+    #[test]
+    fn stale_remove_event_for_recreated_file_is_suppressed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("recreated");
+
+        assert!(super::should_emit_delete(&path));
+        fs::write(&path, b"new").unwrap();
+        assert!(!super::should_emit_delete(&path));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_mutation_lock_does_not_block_runtime_worker() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cancel_token = CancellationToken::new();
+        let store = FileStore::new(cancel_token.clone(), temp_dir.path());
+        let bucket = store.get_or_create_bucket("v1/tests", None).await.unwrap();
+        let held_lock = bucket.lock_mutations_blocking().unwrap();
+
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held_lock);
+        });
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = bucket.lock_mutations() => {
+                panic!("contended mutation lock blocked the current-thread runtime");
+            }
+        }
+
+        release_thread.join().unwrap();
+        cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn delete_wins_race_with_compare_and_replace() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let update_cancel = CancellationToken::new();
+        let delete_cancel = CancellationToken::new();
+        let update_store = FileStore::new(update_cancel.clone(), temp_dir.path());
+        let delete_store = FileStore::new(delete_cancel.clone(), temp_dir.path());
+        let update_bucket = Arc::new(
+            update_store
+                .get_or_create_bucket("v1/tests", None)
+                .await
+                .unwrap(),
+        );
+        let delete_bucket = Arc::new(
+            delete_store
+                .get_or_create_bucket("v1/tests", None)
+                .await
+                .unwrap(),
+        );
+        let key = Key::new("model".to_string());
+        update_bucket.insert(&key, "old".into(), 0).await.unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let task_bucket = update_bucket.clone();
+        let task_key = key.clone();
+        let task_barrier = barrier.clone();
+        let update = tokio::spawn(async move {
+            task_barrier.wait().await;
+            task_bucket
+                .compare_and_replace(&task_key, "old".into(), "new".into())
+                .await
+        });
+        let task_bucket = delete_bucket.clone();
+        let task_key = key.clone();
+        let task_barrier = barrier.clone();
+        let delete = tokio::spawn(async move {
+            task_barrier.wait().await;
+            task_bucket.delete(&task_key).await
+        });
+
+        barrier.wait().await;
+        let update_result = update.await.unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(update_result.is_ok() || matches!(update_result, Err(StoreError::MissingKey(_))));
+        assert_eq!(update_bucket.get(&key).await.unwrap(), None);
+
+        update_cancel.cancel();
+        delete_cancel.cancel();
+    }
 
     #[tokio::test]
     async fn test_entries_full_path() {

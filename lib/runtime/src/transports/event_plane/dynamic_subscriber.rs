@@ -143,6 +143,7 @@ impl DynamicSubscriber {
                             );
                         }
                     }
+                    Ok(DiscoveryEvent::ModelTaintsUpdated(_)) => {}
                     Ok(DiscoveryEvent::Removed(instance_id)) => {
                         let id_str = instance_id.instance_id().to_string();
                         tracing::info!(

@@ -559,6 +559,7 @@ impl WorkerQueryClient {
                     };
                     self.handle_discovered_query_endpoint(endpoint).await;
                 }
+                DiscoveryEvent::ModelTaintsUpdated(_) => {}
                 DiscoveryEvent::Removed(id) => {
                     let Some((worker_id, dp_rank, endpoint_id)) =
                         WorkerQueryEndpointDirectory::parse_removed(id)

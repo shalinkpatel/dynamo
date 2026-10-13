@@ -3150,6 +3150,7 @@ dependencies = [
  "either",
  "etcd-client",
  "figment",
+ "fs4",
  "futures",
  "humantime",
  "jsonschema",

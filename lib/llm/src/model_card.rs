@@ -1473,7 +1473,8 @@ impl PartialEq for ModelDeploymentCard {
     }
 }
 
-/// A ModelDeploymentCard is published a single time per instance and never updated.
+/// Model-card registration is create-only. The discovery taint API owns the
+/// narrow exception for updating runtime_config.taints on an existing record.
 impl kv::Versioned for ModelDeploymentCard {
     fn revision(&self) -> u64 {
         0
@@ -2164,6 +2165,17 @@ mod tests {
         a.extra_files.extend([cf1.clone(), cf2.clone()]);
         b.extra_files.extend([cf2, cf1]);
         assert_eq!(a.mdcsum(), b.mdcsum());
+    }
+
+    #[test]
+    fn runtime_taints_do_not_change_mdcsum() {
+        let mut fast = super::ModelDeploymentCard::with_name_only("model");
+        fast.runtime_config.taints = std::collections::HashSet::from(["fast".to_string()]);
+
+        let mut slow = super::ModelDeploymentCard::with_name_only("model");
+        slow.runtime_config.taints = std::collections::HashSet::from(["slow".to_string()]);
+
+        assert_eq!(fast.mdcsum(), slow.mdcsum());
     }
 
     #[test]

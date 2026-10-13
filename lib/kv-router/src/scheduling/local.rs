@@ -27,6 +27,12 @@ use crate::sequences::{
 };
 use dynamo_tokens::SequenceHash;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerConfigReconcileOutcome {
+    Unchanged,
+    Applied,
+}
+
 pub struct LocalScheduler<
     P,
     C,
@@ -89,6 +95,27 @@ where
         capacities
     }
 
+    fn reconcile_worker_configs(
+        slots: &ActiveSequencesMultiWorker<P>,
+        current_workers: HashMap<WorkerId, C>,
+        last_workers: &mut HashMap<WorkerId, C>,
+    ) -> WorkerConfigReconcileOutcome {
+        if *last_workers == current_workers {
+            return WorkerConfigReconcileOutcome::Unchanged;
+        }
+
+        let dp_range = Self::worker_dp_range(&current_workers);
+        slots.update_workers(&dp_range);
+        if slots.tracks_residency() {
+            let current_capacities = Self::worker_residency_capacities(&current_workers);
+            if current_capacities != Self::worker_residency_capacities(last_workers) {
+                slots.configure_residency(&current_capacities);
+            }
+        }
+        *last_workers = current_workers;
+        WorkerConfigReconcileOutcome::Applied
+    }
+
     /// Construct a scheduler with dequeue-time overlap refresh.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_overlap_refresh(
@@ -116,8 +143,25 @@ where
             ));
         }
 
+        let queue = Arc::new(SchedulerQueue::new_with_overlap_refresh(
+            Arc::clone(&slots),
+            workers_with_configs.clone(),
+            threshold_frac,
+            queue_depth_tiers,
+            block_size,
+            selector,
+            policy,
+            prefill_load_estimator,
+            overlap_scores_refresh,
+            overloaded_worker_provider,
+            track_active_request_isl,
+        ));
+        let (queue_updates, _) = watch::channel(());
+
         if monitor_worker_configs {
             let slots_monitor = Arc::clone(&slots);
+            let queue_config_updates = Arc::clone(&queue);
+            let queue_updates_config = queue_updates.clone();
             let mut monitor_rx = workers_with_configs.clone();
             let mut last_workers = monitor_rx.borrow().clone();
             let monitor_cancel_token = cancellation_token.clone();
@@ -139,38 +183,19 @@ where
                     }
 
                     let current_workers = monitor_rx.borrow_and_update().clone();
-                    if current_workers == last_workers {
-                        continue;
+                    if Self::reconcile_worker_configs(
+                        &slots_monitor,
+                        current_workers,
+                        &mut last_workers,
+                    ) == WorkerConfigReconcileOutcome::Applied
+                    {
+                        queue_config_updates.update().await;
+                        let _ = queue_updates_config.send(());
                     }
-
-                    let dp_range = Self::worker_dp_range(&current_workers);
-                    slots_monitor.update_workers(&dp_range);
-                    if slots_monitor.tracks_residency() {
-                        let current_capacities =
-                            Self::worker_residency_capacities(&current_workers);
-                        if current_capacities != Self::worker_residency_capacities(&last_workers) {
-                            slots_monitor.configure_residency(&current_capacities);
-                        }
-                    }
-                    last_workers = current_workers;
                 }
             });
         }
 
-        let queue = Arc::new(SchedulerQueue::new_with_overlap_refresh(
-            Arc::clone(&slots),
-            workers_with_configs,
-            threshold_frac,
-            queue_depth_tiers,
-            block_size,
-            selector,
-            policy,
-            prefill_load_estimator,
-            overlap_scores_refresh,
-            overloaded_worker_provider,
-            track_active_request_isl,
-        ));
-        let (queue_updates, _) = watch::channel(());
         let queue_remote_updates = Arc::clone(&queue);
         let queue_periodic_updates = Arc::clone(&queue);
         let mut remote_state_updates = slots.subscribe_remote_state_changes();
@@ -1457,6 +1482,104 @@ mod tests {
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].potential_prefill_tokens, 64);
         assert_eq!(loads[0].active_requests, 1);
+
+        cancel_token.cancel();
+    }
+
+    #[tokio::test]
+    async fn worker_taint_update_wakes_constrained_pending_request() {
+        let fast = HashSet::from(["capacity/fast".to_string()]);
+        let workers = HashMap::from([
+            (
+                0,
+                SimpleWorkerConfig {
+                    max_num_batched_tokens: Some(64),
+                    taints: fast.clone(),
+                    ..Default::default()
+                },
+            ),
+            (
+                1,
+                SimpleWorkerConfig {
+                    max_num_batched_tokens: Some(64),
+                    taints: HashSet::from(["capacity/slow".to_string()]),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let (scheduler, _slots, cfg_tx, cancel_token) =
+            make_scheduler(workers.clone(), Some(0.5), true, None);
+
+        let require_fast = || crate::protocols::RoutingConstraints {
+            required_taints: fast.clone(),
+            ..Default::default()
+        };
+        let first_response = scheduler
+            .schedule(
+                Some("req-1".to_string()),
+                64,
+                Some(vec![1, 2, 3, 4]),
+                TierOverlapBlocks::default(),
+                HashMap::new(),
+                HashMap::new(),
+                None,
+                true,
+                None,
+                0.0,
+                0,
+                false,
+                None,
+                None,
+                None,
+                None,
+                require_fast(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_response.best_worker.worker_id, 0);
+
+        let queued = {
+            let scheduler = Arc::clone(&scheduler);
+            let routing_constraints = require_fast();
+            tokio::spawn(async move {
+                scheduler
+                    .schedule(
+                        Some("req-2".to_string()),
+                        64,
+                        Some(vec![5, 6, 7, 8]),
+                        TierOverlapBlocks::default(),
+                        HashMap::new(),
+                        HashMap::new(),
+                        None,
+                        true,
+                        None,
+                        0.0,
+                        0,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        routing_constraints,
+                        None,
+                    )
+                    .await
+            })
+        };
+        wait_for_pending_count(&scheduler, 1).await;
+
+        let mut updated_workers = workers;
+        updated_workers.get_mut(&1).unwrap().taints = fast;
+        cfg_tx.send(updated_workers).unwrap();
+
+        let response = tokio::time::timeout(Duration::from_millis(250), queued)
+            .await
+            .expect("taint update should wake the pending request")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.best_worker.worker_id, 1);
+        assert_eq!(scheduler.pending_count(), 0);
 
         cancel_token.cancel();
     }

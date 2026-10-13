@@ -2777,6 +2777,16 @@ in #387 depends on this crate, so replay this patch first. Nested-namespace
 discovery is required at runtime: the serving-G2 endpoints live under
 `<model>.kvbm-serving-g2`.
 
+## PATCH-023: Dynamic runtime-config (taint) updates in discovery (backport of upstream #12620)
+
+Status: `upstream-sync`
+
+Rust runtime, discovery and router parts of `ai-dynamo/dynamo#12620`
+(compare-and-swap card updates, `Discovery::update_model_taints`, scheduler
+wakeup); the HTTP route, Python and engine changes are left out. Drop when the
+fork advances to an upstream release containing #12620. Details and expected
+conflicts: the backport PR.
+
 ## GWP Control Plane (global-routing)
 
 Status: `keep` — Baseten-specific control plane; not upstream.
