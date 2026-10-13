@@ -291,6 +291,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-openai"
+version = "0.42.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "174e979f1e2ffe94b88d584740c11fd071f6d829c29120b1ba88bcaeb3374063"
+dependencies = [
+ "bytes",
+ "derive_builder",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2577,7 +2590,7 @@ dependencies = [
 name = "dynamo-protocols"
 version = "1.2.0"
 dependencies = [
- "async-openai",
+ "async-openai 0.42.2",
  "derive_builder",
  "futures",
  "serde",
@@ -2593,7 +2606,7 @@ name = "dynamo-protocols"
 version = "6.1.0"
 source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
 dependencies = [
- "async-openai",
+ "async-openai 0.41.3",
  "derive_builder",
  "futures",
  "serde",

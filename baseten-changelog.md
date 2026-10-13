@@ -1468,6 +1468,14 @@ Status: upstream-sync with Baseten-owned scoring arms; on the next rebase
 onto an upstream cut that includes #13768, keep the upstream handler/route
 and reconcile the estimator arms against the fork converter.
 
+Protocol dependency alignment (#1013): types-only `async-openai` 0.42.2,
+following [frontend-crates#258](https://github.com/ai-dynamo/frontend-crates/pull/258).
+Responses consumers migrate renamed types and new fields; `max` now echoes
+unchanged. Failed MCP output uses structured errors, while the narrow input
+override preserves legacy string-error replay. Status: upstream-sync; retain
+permissive reasoning and MCP-input overrides until upstream accepts the same
+client shapes. The pinned parser dependency still requires 0.41.3.
+
 Reasoning effort is carried, not judged. `B10ReasoningEffort` types the seven
 canonical levels (`B10_REASONING_EFFORT_LEVELS`: `none`, `minimal`, `low`,
 `medium`, `high`, `xhigh`, `max`) and carries every other value — an unknown
@@ -1482,9 +1490,10 @@ That map, its env-var override and its two per-surface hooks are removed, so
 `max` now reaches the serve side as `max`. There is deliberately no `Default`:
 upstream's enum defaults to `medium`, which makes "sent nothing" and "asked for
 medium" indistinguishable and unreachable for the policy's own default. The
-`/v1/responses` echo still converts through upstream's enum, where `max` has no
-variant and reports as `xhigh`, and a non-level omits `effort`. Supersedes the
-alias-map behavior added in #574.
+`/v1/responses` echo converts through upstream's enum, which now supports
+`max` and preserves every canonical level; a non-level still omits `effort`.
+Supersedes the alias-map behavior added in #574 and the former `max` ->
+`xhigh` response-echo fallback.
 
 Anthropic thinking controls land on first-class Chat Completions fields rather
 than in `chat_template_kwargs`, which is a rendering input while these are

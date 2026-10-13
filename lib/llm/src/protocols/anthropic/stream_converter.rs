@@ -752,6 +752,7 @@ mod tests {
                         dynamo_protocols::types::PromptTokensDetails {
                             audio_tokens: None,
                             cached_tokens: Some(c),
+                            ..Default::default()
                         }
                     }),
                     completion_tokens_details: None,
@@ -912,6 +913,7 @@ mod tests {
             prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
                 audio_tokens: None,
                 cached_tokens: Some(7100),
+                ..Default::default()
             }),
             completion_tokens_details: None,
         });
@@ -978,6 +980,7 @@ mod tests {
                 prompt_tokens_details: Some(PromptTokensDetails {
                     audio_tokens: None,
                     cached_tokens,
+                    ..Default::default()
                 }),
                 ..usage_chunk(7125, None, 1).inner.usage.unwrap()
             });

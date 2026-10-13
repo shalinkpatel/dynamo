@@ -96,7 +96,10 @@ fn buffered_failed_server_tool_renders_as_failed() {
     let mcp_call = &responses_body["output"][0];
     assert_eq!(mcp_call["type"], "mcp_call");
     assert_eq!(mcp_call["status"], "failed");
-    assert_eq!(mcp_call["error"], "tool execution failed: connect timeout");
+    assert_eq!(
+        mcp_call["error"],
+        json!({"type": "mcp_tool_execution_error", "content": "tool execution failed: connect timeout"})
+    );
 
     let (transcript, iterations) = failed_tool_iteration();
     let messages_body = buffered_full(

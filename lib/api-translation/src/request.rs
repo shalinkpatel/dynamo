@@ -36,7 +36,7 @@ use dynamo_protocols::types::anthropic::{
 use dynamo_protocols::types::responses::{
     AgentMessageInputContent, AgentMessageItemParam, EasyInputContent, FunctionCallOutput,
     InputContent, InputItem, InputRole, Item, MessageItem, ReasoningItemContent, ResponseTextParam,
-    Role as ResponsesRole, ServiceTier as ResponsesServiceTier, SummaryPart,
+    Role as ResponsesRole, ServiceTierResponses as ResponsesServiceTier, SummaryPart,
     TextResponseFormatConfiguration, Tool as ResponsesTool, ToolChoiceFunction, ToolChoiceOptions,
     ToolChoiceParam,
 };
@@ -1237,6 +1237,7 @@ fn translate_message(
                 text.push_str(block_text);
                 parts.push(ChatCompletionRequestUserMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
                         text: block_text.clone(),
                     },
                 ));
@@ -1450,6 +1451,7 @@ fn tool_result_content(
                 text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
                         text: block_text.clone(),
                     },
                 ));
@@ -1467,7 +1469,10 @@ fn tool_result_content(
                 let block_text = doc.text().unwrap_or_else(|| document_placeholder(doc));
                 text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText { text: block_text },
+                    ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
+                        text: block_text,
+                    },
                 ));
             }
             ToolResultContentBlock::SearchResult(result) => {
@@ -1476,7 +1481,10 @@ fn tool_result_content(
                     .unwrap_or_else(|| search_result_placeholder(result));
                 text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText { text: block_text },
+                    ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
+                        text: block_text,
+                    },
                 ));
             }
             ToolResultContentBlock::Other(value) => {
@@ -1486,7 +1494,10 @@ fn tool_result_content(
                 let block_text = coerce_unknown_block(value, field, losses);
                 text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText { text: block_text },
+                    ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
+                        text: block_text,
+                    },
                 ));
             }
         }
@@ -1802,7 +1813,11 @@ fn adapt_responses(
             temperature: responses_request.temperature,
             top_p: responses_request.top_p,
             stream: responses_request.stream,
-            service_tier: responses_request.service_tier.map(cc_service_tier),
+            service_tier: responses_request
+                .service_tier
+                .map(cc_service_tier)
+                .transpose()
+                .map_err(RequestRejection::malformed)?,
             user: responses_request.user,
             tool_choice: match responses_request
                 .tool_choice
@@ -1889,14 +1904,18 @@ fn cc_reasoning_effort(
 /// Responses `service_tier` -> CC `service_tier`, one-to-one: `auto` (let the platform pick a tier)
 /// and `default` (explicitly the default tier) are distinct requests, so neither is folded into the
 /// other — the fork's previous converter kept them apart too, and the response echoes what was sent.
-fn cc_service_tier(tier: ResponsesServiceTier) -> CcServiceTier {
-    match tier {
+fn cc_service_tier(tier: ResponsesServiceTier) -> Result<CcServiceTier, String> {
+    Ok(match tier {
         ResponsesServiceTier::Auto => CcServiceTier::Auto,
         ResponsesServiceTier::Default => CcServiceTier::Default,
         ResponsesServiceTier::Flex => CcServiceTier::Flex,
         ResponsesServiceTier::Scale => CcServiceTier::Scale,
         ResponsesServiceTier::Priority => CcServiceTier::Priority,
-    }
+        ResponsesServiceTier::Fast => CcServiceTier::Fast,
+        ResponsesServiceTier::Ultrafast => {
+            return Err("service_tier `ultrafast` has no Chat Completions equivalent".to_string());
+        }
+    })
 }
 
 /// Stateless-only stance: TB persists no response, so continuing from one would silently produce a
@@ -2061,7 +2080,7 @@ fn translate_input_items(
                 ));
                 turn.flush_into(cc_messages);
                 let result = if let Some(error) = &call.error {
-                    error.clone()
+                    error.to_text()
                 } else {
                     call.output.clone().unwrap_or_default()
                 };
@@ -2073,7 +2092,9 @@ fn translate_input_items(
             InputItem::Item(Item::FunctionCallOutput(output)) => {
                 turn.flush_into(cc_messages);
                 cc_messages.push(tool_result_message(
-                    output.call_id.clone(),
+                    output.call_id.clone().ok_or_else(|| {
+                        "function_call_output requires `call_id` for Chat Completions translation".to_string()
+                    })?,
                     ChatCompletionRequestToolMessageContent::Text(function_call_output_text(
                         &output.output,
                     )?),
@@ -2224,6 +2245,7 @@ fn user_input_content(
                 text.push_str(&part.text);
                 cc_parts.push(ChatCompletionRequestUserMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
                         text: part.text.clone(),
                     },
                 ));
@@ -2443,9 +2465,9 @@ fn translate_responses_tool_choice(
     tool_choice: &ToolChoiceParam,
 ) -> Result<ChatCompletionToolChoiceOption, String> {
     Ok(match tool_choice {
-        ToolChoiceParam::Mode(ToolChoiceOptions::Auto) => ChatCompletionToolChoiceOption::Auto,
-        ToolChoiceParam::Mode(ToolChoiceOptions::None) => ChatCompletionToolChoiceOption::None,
-        ToolChoiceParam::Mode(ToolChoiceOptions::Required) => {
+        ToolChoiceParam::Option(ToolChoiceOptions::Auto) => ChatCompletionToolChoiceOption::Auto,
+        ToolChoiceParam::Option(ToolChoiceOptions::None) => ChatCompletionToolChoiceOption::None,
+        ToolChoiceParam::Option(ToolChoiceOptions::Required) => {
             ChatCompletionToolChoiceOption::Required
         }
         ToolChoiceParam::Function(ToolChoiceFunction { name }) => {

@@ -226,6 +226,7 @@ fn cc_usage(prompt_tokens: u32, cached_tokens: Option<u32>) -> CompletionUsage {
         prompt_tokens_details: cached_tokens.map(|cached| PromptTokensDetails {
             cached_tokens: Some(cached),
             audio_tokens: None,
+            ..Default::default()
         }),
         completion_tokens_details: None,
     }

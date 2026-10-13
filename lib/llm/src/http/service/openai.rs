@@ -1913,7 +1913,7 @@ async fn handler_responses(
     let context_id = get_or_create_context_id(&headers);
     let is_service_tier_flex = matches!(
         request.inner.service_tier,
-        Some(dynamo_protocols::types::responses::ServiceTier::Flex)
+        Some(dynamo_protocols::types::responses::ServiceTierResponses::Flex)
     );
     if let Some(response) = b10_rate_limit_request(&headers, &context_id, is_service_tier_flex) {
         return Ok(response);
@@ -2058,7 +2058,7 @@ async fn responses(
         instructions: typed.inner.instructions.clone(),
         reasoning: typed.inner.reasoning.as_ref().map(Into::into),
         text: typed.inner.text.clone(),
-        service_tier: typed.inner.service_tier,
+        service_tier: typed.inner.service_tier.clone(),
         include: typed.inner.include.clone(),
         truncation: typed.inner.truncation,
         presence_penalty: raw_f32("presence_penalty"),
@@ -2674,15 +2674,7 @@ async fn images(
         .inner
         .model
         .as_ref()
-        .map(|m| match m {
-            dynamo_protocols::types::ImageModel::DallE2 => "dall-e-2".to_string(),
-            dynamo_protocols::types::ImageModel::DallE3 => "dall-e-3".to_string(),
-            dynamo_protocols::types::ImageModel::GptImage1 => "gpt-image-1".to_string(),
-            dynamo_protocols::types::ImageModel::GptImage1dot5 => "gpt-image-1.5".to_string(),
-            dynamo_protocols::types::ImageModel::GptImage1Mini => "gpt-image-1-mini".to_string(),
-            dynamo_protocols::types::ImageModel::GptImage2 => "gpt-image-2".to_string(),
-            dynamo_protocols::types::ImageModel::Other(s) => s.clone(),
-        })
+        .map(ToString::to_string)
         .unwrap_or_else(|| "diffusion".to_string());
 
     let metric_model = state.manager().metric_model_for(&model).to_string();

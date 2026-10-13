@@ -713,7 +713,7 @@ async fn responses_failed_server_tool_resolves_to_failed_mcp_call() {
     assert_eq!(resolved.data["item"]["status"], "failed");
     assert_eq!(
         resolved.data["item"]["error"],
-        "tool execution failed: connect timeout"
+        json!({"type": "mcp_tool_execution_error", "content": "tool execution failed: connect timeout"})
     );
 }
 

@@ -13,17 +13,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::Event;
 use dynamo_protocols::types::responses::{
-    AssistantRole, ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails,
-    Instructions, OutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
+    AssistantRole, FunctionToolCall, IncompleteDetails, InputTokenDetails, Instructions,
+    OutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputStatus,
     OutputTextContent, OutputTokenDetails, ReasoningItem, Response, ResponseCompletedEvent,
     ResponseContentPartAddedEvent, ResponseContentPartDoneEvent, ResponseCreatedEvent,
-    ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseError, ResponseErrorCode, ResponseFailedEvent, ResponseFunctionCallArgumentsDeltaEvent,
     ResponseFunctionCallArgumentsDoneEvent, ResponseInProgressEvent, ResponseIncompleteEvent,
     ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
     ResponseReasoningSummaryPartAddedEvent, ResponseReasoningSummaryPartDoneEvent,
     ResponseReasoningSummaryTextDeltaEvent, ResponseReasoningSummaryTextDoneEvent,
     ResponseStreamEvent, ResponseTextDeltaEvent, ResponseTextDoneEvent, ResponseTextParam,
-    ResponseUsage, ServiceTier, Status, SummaryPart, SummaryTextContent,
+    ResponseUsage, ServiceTierResponses, Status, SummaryPart, SummaryTextContent,
     TextResponseFormatConfiguration, ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use uuid::Uuid;
@@ -127,6 +127,7 @@ impl ResponseStreamConverter {
         super::resolve_tool_identity(self.params.tools.as_deref(), chat_name)
     }
 
+    #[allow(deprecated)] // Echo the legacy cache-retention field for existing clients.
     fn make_response(&self, status: Status, output: Vec<OutputItem>) -> Response {
         let is_incomplete = status == Status::Incomplete;
         let completed_at = if status == Status::Completed {
@@ -140,6 +141,9 @@ impl ResponseStreamConverter {
             None
         };
         Response {
+            moderation: None,
+            prompt_cache_options: None,
+            prompt_cache_diagnostics: None,
             id: self.response_id.clone(),
             object: "response".to_string(),
             created_at: self.created_at,
@@ -160,7 +164,7 @@ impl ResponseStreamConverter {
                 .params
                 .tool_choice
                 .clone()
-                .or(Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto))),
+                .or(Some(ToolChoiceParam::Option(ToolChoiceOptions::Auto))),
             tools: Some(
                 self.params
                     .tools
@@ -188,7 +192,12 @@ impl ResponseStreamConverter {
             prompt_cache_retention: self.params.prompt_cache_retention,
             reasoning: self.params.reasoning.clone(),
             safety_identifier: self.params.safety_identifier.clone(),
-            service_tier: Some(self.params.service_tier.unwrap_or(ServiceTier::Auto)),
+            service_tier: Some(
+                self.params
+                    .service_tier
+                    .clone()
+                    .unwrap_or(ServiceTierResponses::Auto),
+            ),
             top_logprobs: Some(self.params.top_logprobs.unwrap_or(0)),
             usage: self.usage.clone(),
         }
@@ -225,6 +234,7 @@ impl ResponseStreamConverter {
             self.usage = Some(ResponseUsage {
                 input_tokens: u.prompt_tokens,
                 input_tokens_details: InputTokenDetails {
+                    cache_write_tokens: Some(0),
                     cached_tokens: u
                         .prompt_tokens_details
                         .as_ref()
@@ -415,6 +425,8 @@ impl ResponseStreamConverter {
                                         sequence_number: seq,
                                         output_index,
                                         item: OutputItem::FunctionCall(FunctionToolCall {
+                                            caller: None,
+                                            r#async: None,
                                             id: Some(item_id),
                                             call_id,
                                             namespace,
@@ -504,6 +516,8 @@ impl ResponseStreamConverter {
             sequence_number: self.next_seq(),
             output_index,
             item: OutputItem::FunctionCall(FunctionToolCall {
+                caller: None,
+                r#async: None,
                 id: Some(item_id),
                 call_id,
                 namespace,
@@ -566,6 +580,7 @@ impl ResponseStreamConverter {
         });
         let part_done = ResponseStreamEvent::ResponseReasoningSummaryPartDone(
             ResponseReasoningSummaryPartDoneEvent {
+                status: None,
                 sequence_number: self.next_seq(),
                 item_id: self.reasoning_item_id.clone(),
                 output_index: self.reasoning_output_index,
@@ -631,6 +646,8 @@ impl ResponseStreamConverter {
                 output.push((
                     function_call.output_index,
                     OutputItem::FunctionCall(FunctionToolCall {
+                        caller: None,
+                        r#async: None,
                         id: Some(function_call.item_id.clone()),
                         call_id: function_call.call_id.clone(),
                         namespace,
@@ -760,22 +777,24 @@ impl ResponseStreamConverter {
         let output = self.collect_output(OutputStatus::Incomplete);
         let mut response = self.make_response(Status::Failed, output);
         response.error = Some(match error {
-            Some(error) => ErrorObject {
+            Some(error) => ResponseError {
+                misalignment: None,
                 code: if error.http_status == 429 {
-                    "rate_limit_exceeded".to_string()
+                    ResponseErrorCode::RateLimitExceeded
                 } else if error.is_context_overflow() {
                     // The exact string OpenAI clients classify on: codex, for
                     // one, matches `error.code == "context_length_exceeded"`
                     // verbatim and presents its clean out-of-context-room
                     // handling instead of a raw failure dump.
-                    "context_length_exceeded".to_string()
+                    ResponseErrorCode::Other("context_length_exceeded".to_string())
                 } else {
-                    "server_error".to_string()
+                    ResponseErrorCode::ServerError
                 },
                 message: error.message,
             },
-            None => ErrorObject {
-                code: "server_error".to_string(),
+            None => ResponseError {
+                misalignment: None,
+                code: ResponseErrorCode::ServerError,
                 message: "The model backend returned an error before the response completed."
                     .to_string(),
             },
@@ -840,6 +859,23 @@ impl ResponseStreamConverter {
 
 fn get_event_type(event: &ResponseStreamEvent) -> &'static str {
     match event {
+        ResponseStreamEvent::ResponseAudioDelta(_) => "response.audio.delta",
+        ResponseStreamEvent::ResponseAudioDone(_) => "response.audio.done",
+        ResponseStreamEvent::ResponseAudioTranscriptDelta(_) => "response.audio.transcript.delta",
+        ResponseStreamEvent::ResponseAudioTranscriptDone(_) => "response.audio.transcript.done",
+        ResponseStreamEvent::ResponseShellCallCommandAdded(_) => {
+            "response.shell_call_command.added"
+        }
+        ResponseStreamEvent::ResponseShellCallCommandDelta(_) => {
+            "response.shell_call_command.delta"
+        }
+        ResponseStreamEvent::ResponseShellCallCommandDone(_) => "response.shell_call_command.done",
+        ResponseStreamEvent::ResponseShellCallOutputContentDelta(_) => {
+            "response.shell_call_output_content.delta"
+        }
+        ResponseStreamEvent::ResponseShellCallOutputContentDone(_) => {
+            "response.shell_call_output_content.done"
+        }
         ResponseStreamEvent::ResponseCreated(_) => "response.created",
         ResponseStreamEvent::ResponseInProgress(_) => "response.in_progress",
         ResponseStreamEvent::ResponseCompleted(_) => "response.completed",
@@ -1218,6 +1254,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1245,6 +1282,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1278,6 +1316,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1323,6 +1362,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1361,6 +1401,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1421,6 +1462,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1451,6 +1493,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };
@@ -1484,6 +1527,7 @@ mod tests {
             reasoning: Some(Reasoning {
                 effort: None,
                 summary: Some(ReasoningSummary::Auto),
+                ..Default::default()
             }),
             ..default_params()
         };

@@ -20,7 +20,7 @@ repository.workspace = true
 
 [dependencies]
 # Upstream OpenAI types (types-only, no HTTP client)
-async-openai = { version = "0.41", default-features = false, features = [
+async-openai = { version = "0.42.2", default-features = false, features = [
     "chat-completion-types",
     "response-types",
     "completion-types",

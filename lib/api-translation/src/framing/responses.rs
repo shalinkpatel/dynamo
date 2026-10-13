@@ -24,12 +24,13 @@
 use std::collections::HashMap;
 
 use dynamo_protocols::types::responses::{
-    B10ReasoningEffort, ErrorObject, FunctionToolCall, IncompleteDetails, InputTokenDetails,
-    Instructions, MCPToolCall, MCPToolCallStatus, OutputContent, OutputItem, OutputMessage,
-    OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
-    PromptCacheRetention, Reasoning, ReasoningItem, ReasoningItemContent, ReasoningTextContent,
-    Response, ResponseTextParam, ResponseUsage, ServiceTier, Status,
-    TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam, Truncation,
+    B10ReasoningEffort, FunctionToolCall, IncompleteDetails, InputTokenDetails, Instructions,
+    MCPToolCall, MCPToolCallError, MCPToolCallStatus, MCPToolExecutionError, OutputContent,
+    OutputItem, OutputMessage, OutputMessageContent, OutputStatus, OutputTextContent,
+    OutputTokenDetails, PromptCacheRetention, Reasoning, ReasoningItem, ReasoningItemContent,
+    ReasoningTextContent, Response, ResponseError, ResponseErrorCode, ResponseTextParam,
+    ResponseUsage, ServiceTierResponses, Status, TextResponseFormatConfiguration, Tool,
+    ToolChoiceOptions, ToolChoiceParam, Truncation,
 };
 use dynamo_protocols::types::{CompletionUsage, FinishReason};
 use serde_json::{Value, json};
@@ -70,7 +71,7 @@ pub struct ResponsesParams {
     pub instructions: Option<String>,
     pub reasoning: Option<Reasoning>,
     pub text: Option<ResponseTextParam>,
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<ServiceTierResponses>,
     pub truncation: Option<Truncation>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
@@ -113,6 +114,7 @@ impl ResponsesParams {
                         .as_ref()
                         .and_then(B10ReasoningEffort::to_async_openai),
                     summary: field(reasoning, "summary"),
+                    ..Default::default()
                 }),
             text: field(body, "text"),
             service_tier: field(body, "service_tier"),
@@ -275,7 +277,7 @@ impl ResponsesEvent {
 /// The response envelope, echoing request params with the spec's defaults for omitted fields —
 /// mirrors the fork's `make_response` (lib/llm responses/stream_converter.rs). `error` is set only
 /// by the terminal-failure path.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, deprecated)] // Echo the legacy cache-retention field.
 fn make_response(
     params: &ResponsesParams,
     id: String,
@@ -283,10 +285,13 @@ fn make_response(
     output: Vec<OutputItem>,
     status: Status,
     incomplete_details: Option<IncompleteDetails>,
-    error: Option<ErrorObject>,
+    error: Option<ResponseError>,
     usage: Option<ResponseUsage>,
 ) -> Response {
     Response {
+        moderation: None,
+        prompt_cache_options: None,
+        prompt_cache_diagnostics: None,
         background: Some(false),
         billing: None,
         conversation: None,
@@ -308,7 +313,12 @@ fn make_response(
         prompt_cache_retention: params.prompt_cache_retention,
         reasoning: params.reasoning.clone(),
         safety_identifier: params.safety_identifier.clone(),
-        service_tier: Some(params.service_tier.unwrap_or(ServiceTier::Auto)),
+        service_tier: Some(
+            params
+                .service_tier
+                .clone()
+                .unwrap_or(ServiceTierResponses::Auto),
+        ),
         status,
         temperature: params.temperature.or(Some(1.0)),
         text: Some(params.text.clone().unwrap_or(ResponseTextParam {
@@ -318,7 +328,7 @@ fn make_response(
         tool_choice: params
             .tool_choice
             .clone()
-            .or(Some(ToolChoiceParam::Mode(ToolChoiceOptions::Auto))),
+            .or(Some(ToolChoiceParam::Option(ToolChoiceOptions::Auto))),
         tools: Some(params.normalized_tools()),
         top_logprobs: Some(params.top_logprobs.unwrap_or(0)),
         top_p: params.top_p.or(Some(1.0)),
@@ -565,6 +575,8 @@ fn function_call_item(
     status: OutputStatus,
 ) -> OutputItem {
     OutputItem::FunctionCall(FunctionToolCall {
+        caller: None,
+        r#async: None,
         arguments: raw_args.to_string(),
         call_id: id.to_string(),
         namespace: namespace.map(str::to_string),
@@ -597,7 +609,11 @@ fn mcp_call_item(
         name: name.to_string(),
         server_label: provider.to_string(),
         approval_request_id: None,
-        error: is_error.then(|| output.to_string()),
+        error: is_error.then(|| {
+            MCPToolCallError::McpToolExecutionError(MCPToolExecutionError {
+                content: json!(output),
+            })
+        }),
         output: (!is_error).then(|| output.to_string()),
         status: Some(if is_error {
             MCPToolCallStatus::Failed
@@ -630,6 +646,7 @@ fn responses_usage(usage: &CompletionUsage) -> ResponseUsage {
     ResponseUsage {
         input_tokens: usage.prompt_tokens,
         input_tokens_details: InputTokenDetails {
+            cache_write_tokens: Some(0),
             cached_tokens: usage
                 .prompt_tokens_details
                 .as_ref()
@@ -778,7 +795,7 @@ impl ResponsesFraming {
         output: Vec<OutputItem>,
         status: Status,
         incomplete_details: Option<IncompleteDetails>,
-        error: Option<ErrorObject>,
+        error: Option<ResponseError>,
         usage: Option<ResponseUsage>,
     ) -> Response {
         make_response(
@@ -1253,13 +1270,14 @@ impl StreamFraming for ResponsesFraming {
         let mut frames = Vec::new();
         self.ensure_started(&mut frames);
         self.close_open_with(&mut frames, OutputStatus::Incomplete);
-        let error_object = ErrorObject {
+        let error_object = ResponseError {
+            misalignment: None,
             code: if error.http_status == Some(429) {
-                "rate_limit_exceeded".to_string()
+                ResponseErrorCode::RateLimitExceeded
             } else if error.is_context_overflow() {
-                "context_length_exceeded".to_string()
+                ResponseErrorCode::Other("context_length_exceeded".to_string())
             } else {
-                "server_error".to_string()
+                ResponseErrorCode::ServerError
             },
             message: error.message.clone(),
         };
@@ -1295,8 +1313,9 @@ impl StreamFraming for ResponsesFraming {
         self.close_open(&mut frames);
         // `error_code` is total on projected errors; "error" is a never-expected backstop.
         debug_assert!(error_code.is_some(), "projected error without error_code");
-        let error_object = ErrorObject {
-            code: error_code.unwrap_or("error").to_string(),
+        let error_object = ResponseError {
+            misalignment: None,
+            code: ResponseErrorCode::Other(error_code.unwrap_or("error").to_string()),
             message: message.to_string(),
         };
         let output = std::mem::take(&mut self.output);

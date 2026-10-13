@@ -947,6 +947,7 @@ mod tests {
                     prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
                         audio_tokens: None,
                         cached_tokens: Some(11),
+                        ..Default::default()
                     }),
                     completion_tokens_details: None,
                 }),
@@ -990,6 +991,7 @@ mod tests {
             prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
                 audio_tokens: None,
                 cached_tokens: Some(20),
+                ..Default::default()
             }),
             completion_tokens_details: None,
         };

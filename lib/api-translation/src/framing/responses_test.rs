@@ -26,6 +26,7 @@ fn responses_usage_maps_cache_reads_into_input_token_details() {
         prompt_tokens_details: Some(dynamo_protocols::types::PromptTokensDetails {
             cached_tokens: Some(900),
             audio_tokens: None,
+            ..Default::default()
         }),
         completion_tokens_details: None,
     };
@@ -215,15 +216,15 @@ mod graft_tests {
     /// Parsing it into a type that cannot spell one drops the whole block leniently, taking
     /// `summary` with it and withholding the reasoning item the client asked for.
     #[test]
-    fn echoed_reasoning_survives_an_effort_the_upstream_enum_cannot_spell() {
+    fn echoed_reasoning_preserves_max_effort() {
         let params = ResponsesParams::from_body(&json!({
             "reasoning": {"effort": "max", "summary": "auto"}
         }));
         let reasoning = params.reasoning.expect("the block must survive");
         assert_eq!(
             reasoning.effort,
-            Some(dynamo_protocols::types::ReasoningEffort::Xhigh),
-            "`max` reports as the strongest level the echo type has"
+            Some(dynamo_protocols::types::ReasoningEffort::Max),
+            "`max` echoes unchanged"
         );
         assert_eq!(
             reasoning.summary,

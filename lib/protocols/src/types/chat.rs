@@ -370,11 +370,9 @@ impl B10ReasoningEffort {
     /// The nearest value the async-openai `ReasoningEffort` enum can spell.
     ///
     /// For the `/v1/responses` echo only -- the request keeps whatever the
-    /// client sent, since [`Serialize`] writes `Other` back verbatim. Two
-    /// values narrow here because the response type cannot hold them: `max`
-    /// echoes as `xhigh`, the strongest that enum has, and a non-level echoes
-    /// nothing, so the field is omitted rather than reporting an effort the
-    /// client did not ask for.
+    /// client sent, since [`Serialize`] writes `Other` back verbatim. Canonical
+    /// levels echo unchanged. A non-level echoes nothing, so the field is
+    /// omitted rather than reporting an effort the client did not ask for.
     pub fn to_async_openai(&self) -> Option<ReasoningEffort> {
         match self {
             Self::None => Some(ReasoningEffort::None),
@@ -382,7 +380,8 @@ impl B10ReasoningEffort {
             Self::Low => Some(ReasoningEffort::Low),
             Self::Medium => Some(ReasoningEffort::Medium),
             Self::High => Some(ReasoningEffort::High),
-            Self::Xhigh | Self::Max => Some(ReasoningEffort::Xhigh),
+            Self::Xhigh => Some(ReasoningEffort::Xhigh),
+            Self::Max => Some(ReasoningEffort::Max),
             Self::Other(_) => None,
         }
     }
@@ -951,7 +950,10 @@ impl<'de> Deserialize<'de> for ChatCompletionRequestAssistantMessage {
                         Part::Typed(TypedPart::Thinking { thinking }) => thoughts.push(thinking),
                         Part::UntypedText { text } => {
                             kept.push(ChatCompletionRequestAssistantMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText { text },
+                                ChatCompletionRequestMessageContentPartText {
+                                    text,
+                                    prompt_cache_breakpoint: None,
+                                },
                             ))
                         }
                     }
@@ -2050,12 +2052,12 @@ mod tests {
     }
 
     #[test]
-    fn only_max_folds_when_echoed_through_the_upstream_enum() {
+    fn canonical_efforts_echo_unchanged_through_the_upstream_enum() {
         for level in B10_REASONING_EFFORT_LEVELS {
             let parsed: B10ReasoningEffort =
                 serde_json::from_value(serde_json::json!(level)).unwrap();
             let echoed = parsed.to_async_openai().expect("a level always echoes");
-            let expected = if level == "max" { "xhigh" } else { level };
+            let expected = level;
             assert_eq!(
                 serde_json::to_value(echoed).unwrap(),
                 serde_json::json!(expected),

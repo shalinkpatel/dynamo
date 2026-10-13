@@ -1363,6 +1363,32 @@ fn adapt_responses_mcp_call_carries_its_own_result() {
 }
 
 #[test]
+fn adapt_responses_mcp_errors_replay_legacy_and_structured_forms() {
+    for error in [
+        json!("tool failed"),
+        json!({"type": "mcp_tool_execution_error", "content": "tool failed"}),
+        json!({"type": "mcp_protocol_error", "code": -32603, "message": "tool failed"}),
+        json!({"type": "http_error", "code": 503, "message": "tool failed"}),
+    ] {
+        let out = responses_input(json!([{
+            "type": "mcp_call", "id": "c1", "name": "lookup",
+            "server_label": "stub", "arguments": "{}", "error": error,
+        }]));
+        assert_eq!(out[1]["content"], "tool failed");
+    }
+}
+
+#[test]
+fn adapt_responses_function_output_without_call_id_is_refused() {
+    let error = adapt_responses_body(json!({"input": [{
+        "type": "function_call_output", "output": "result",
+    }]}))
+    .err()
+    .unwrap();
+    assert!(error.detail().contains("requires `call_id`"), "{error}");
+}
+
+#[test]
 fn adapt_responses_item_reference_is_refused() {
     let items: Vec<InputItem> = serde_json::from_value(json!([{"id": "resp_123_item_0"}])).unwrap();
     let err = translate_input_items(&items, &mut Vec::new(), &mut Losses::default())
@@ -2106,7 +2132,7 @@ fn adapt_responses_body(extra: Value) -> Result<AdaptedRequest, RequestRejection
 /// other would silently change routing and make the echo lie.
 #[test]
 fn adapt_responses_service_tier_maps_one_to_one() {
-    for tier in ["auto", "default", "flex", "scale", "priority"] {
+    for tier in ["auto", "default", "flex", "scale", "priority", "fast"] {
         let adapted = adapt_responses_body(json!({"service_tier": tier})).unwrap();
         assert_eq!(
             json!(adapted.request.service_tier),
@@ -2119,6 +2145,14 @@ fn adapt_responses_service_tier_maps_one_to_one() {
         adapted.request.service_tier.is_none(),
         "absent stays absent"
     );
+}
+
+#[test]
+fn adapt_responses_ultrafast_is_refused_without_changing_tier() {
+    let error = adapt_responses_body(json!({"service_tier": "ultrafast"}))
+        .err()
+        .unwrap();
+    assert!(error.detail().contains("ultrafast"), "{error}");
 }
 
 /// Responses replay segments reasoning around tool calls exactly like the Messages path: segment i

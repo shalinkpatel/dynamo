@@ -53,6 +53,43 @@ pub type PromptConfig = Prompt;
 pub type TextConfig = ResponseTextParam;
 pub type TextResponseFormat = TextResponseFormatConfiguration;
 
+/// Input-side MCP errors accept legacy strings as well as structured errors.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum InputMCPToolCallError {
+    Legacy(String),
+    Structured(MCPToolCallError),
+}
+
+impl InputMCPToolCallError {
+    /// Text forwarded to the model for a replayed tool failure.
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Legacy(text) => text.clone(),
+            Self::Structured(MCPToolCallError::McpProtocolError(error)) => error.message.clone(),
+            Self::Structured(MCPToolCallError::HttpError(error)) => error.message.clone(),
+            Self::Structured(MCPToolCallError::McpToolExecutionError(error)) => error
+                .content
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.content.to_string()),
+        }
+    }
+}
+
+/// Relaxed MCP transcript input; output continues to use upstream `MCPToolCall`.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct InputMCPToolCall {
+    pub arguments: String,
+    pub id: String,
+    pub name: String,
+    pub server_label: String,
+    pub approval_request_id: Option<String>,
+    pub error: Option<InputMCPToolCallError>,
+    pub output: Option<String>,
+    pub status: Option<MCPToolCallStatus>,
+}
+
 /// Stream of response events.
 pub type ResponseStream = std::pin::Pin<
     Box<dyn futures::Stream<Item = Result<ResponseStreamEvent, crate::error::OpenAIError>> + Send>,
@@ -298,12 +335,13 @@ pub struct AdditionalToolsItemParam {
     pub tools: Vec<serde_json::Value>,
 }
 
-/// Structured input/output item, discriminated by `type`. Mirrors upstream
-/// `Item` variant-for-variant; only `Message` uses a Dynamo-owned type.
+/// Structured input item, discriminated by `type`. Mirrors upstream `Item`
+/// with local message and MCP overrides and Dynamo's agent-message extension.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
     Message(MessageItem),
+    ConfigurationUpdate(ResponseConfigurationUpdateItemParam),
     FileSearchCall(FileSearchToolCall),
     ComputerCall(ComputerToolCall),
     ComputerCallOutput(ComputerCallOutputItemParam),
@@ -325,7 +363,7 @@ pub enum Item {
     McpListTools(MCPListTools),
     McpApprovalRequest(MCPApprovalRequest),
     McpApprovalResponse(MCPApprovalResponse),
-    McpCall(MCPToolCall),
+    McpCall(InputMCPToolCall),
     CustomToolCallOutput(CustomToolCallOutput),
     CustomToolCall(CustomToolCall),
     /// Codex multi-agent sessions replay sub-agent turns as `agent_message` items (author,
@@ -369,12 +407,12 @@ impl Default for InputParam {
 ///
 /// Structurally the upstream `Reasoning`, but `effort` is the permissive
 /// [`B10ReasoningEffort`], so `/v1/responses` and `/v1/chat/completions` accept
-/// exactly the same efforts. The upstream enum cannot spell `max`, and a value
-/// only the serve-side policy can judge must not be refused at deserialization.
+/// exactly the same efforts. A value only the serve-side policy can judge
+/// must not be refused at deserialization.
 ///
 /// The response object keeps the upstream [`Reasoning`]; [`From`] converts for
-/// the echo, where `max` becomes `xhigh` (the strongest the upstream enum has)
-/// and a non-level omits `effort` entirely.
+/// the echo, where canonical levels stay unchanged and a non-level omits
+/// `effort` entirely.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct B10ReasoningParam {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +429,7 @@ impl From<&B10ReasoningParam> for Reasoning {
                 .as_ref()
                 .and_then(B10ReasoningEffort::to_async_openai),
             summary: param.summary.clone(),
+            ..Default::default()
         }
     }
 }
@@ -433,7 +472,7 @@ pub struct CreateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<ServiceTier>,
+    pub service_tier: Option<ServiceTierResponses>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -831,8 +870,9 @@ fn measure_item(item: &Item) -> (GroupEffect, usize) {
                 + call
                     .error
                     .as_ref()
-                    .or(call.output.as_ref())
-                    .map_or(0, |result| result.len()),
+                    .map(|error| error.to_text().len())
+                    .or_else(|| call.output.as_ref().map(String::len))
+                    .unwrap_or(0),
         ),
         // Everything below contributes nothing, because nothing below reaches
         // the prompt: the converter flushes and skips every one of these
@@ -848,7 +888,8 @@ fn measure_item(item: &Item) -> (GroupEffect, usize) {
         // let that new variant default to zero silently; an exhaustive match
         // turns it into a compile error that forces a render-or-not decision
         // here, the same mechanism the `From` impls rely on to catch drift.
-        Item::Compaction(_)
+        Item::ConfigurationUpdate(_)
+        | Item::Compaction(_)
         | Item::FileSearchCall(_)
         | Item::ComputerCall(_)
         | Item::ComputerCallOutput(_)
@@ -936,15 +977,15 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_max_echoes_as_xhigh() {
+    fn reasoning_effort_max_echoes_unchanged() {
         let param = B10ReasoningParam {
             effort: Some(B10ReasoningEffort::Max),
             summary: None,
         };
         assert_eq!(
             Reasoning::from(&param).effort,
-            Some(ReasoningEffort::Xhigh),
-            "the upstream echo type cannot spell `max`"
+            Some(ReasoningEffort::Max),
+            "the upstream echo preserves `max`"
         );
     }
 
