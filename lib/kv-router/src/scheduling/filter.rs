@@ -6,6 +6,9 @@ use std::collections::{HashMap, HashSet};
 use super::types::KvSchedulerError;
 use crate::protocols::{DpRank, RoutingConstraints, WorkerConfigLike, WorkerId, WorkerWithDpRank};
 
+pub mod b10_draining;
+use b10_draining::DrainingFilter;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WorkerEligibilityError {
     #[error("worker {worker_id} is not in allowed worker set")]
@@ -35,6 +38,7 @@ pub struct RoutingEligibility<'a> {
     overloaded_worker_ids: Option<&'a HashSet<WorkerId>>,
     pinned_worker: Option<WorkerWithDpRank>,
     routing_constraints: &'a RoutingConstraints,
+    draining: DrainingFilter,
 }
 
 impl<'a> RoutingEligibility<'a> {
@@ -50,6 +54,7 @@ impl<'a> RoutingEligibility<'a> {
             overloaded_worker_ids,
             pinned_worker,
             routing_constraints,
+            draining: DrainingFilter::Allow,
         }
     }
 
@@ -82,6 +87,7 @@ impl<'a> RoutingEligibility<'a> {
         config: &C,
     ) -> bool {
         self.caller_allows_worker_id(worker_id)
+            && self.admits_draining(config, |s| s.worker_id == worker_id)
             && self
                 .routing_constraints
                 .is_compatible_with_worker_taints(config.taints())
@@ -90,6 +96,7 @@ impl<'a> RoutingEligibility<'a> {
     #[inline]
     pub fn allows_worker<C: WorkerConfigLike>(&self, worker_id: WorkerId, config: &C) -> bool {
         self.allows_worker_id(worker_id)
+            && self.admits_draining(config, |s| s.worker_id == worker_id)
             && self
                 .routing_constraints
                 .is_compatible_with_worker_taints(config.taints())
@@ -184,7 +191,8 @@ impl<'a> RoutingEligibility<'a> {
             let dp_start = config.data_parallel_start_rank();
             let dp_end = dp_start + config.data_parallel_size();
             for dp_rank in dp_start..dp_end {
-                if predicate(WorkerWithDpRank::new(worker_id, dp_rank), config) {
+                let worker = WorkerWithDpRank::new(worker_id, dp_rank);
+                if self.admits_draining(config, |s| s == worker) && predicate(worker, config) {
                     return true;
                 }
             }

@@ -21,6 +21,7 @@ use crate::model_type::{ModelInput, ModelType};
 use crate::preprocessor::media::{MediaDecoder, MediaFetcher};
 use crate::request_template::RequestTemplate;
 
+pub mod b10_drain;
 pub mod runtime_config;
 
 use runtime_config::ModelRuntimeConfig;
@@ -552,6 +553,7 @@ impl LocalModel {
             model_suffix,
         )?;
         let _instance = discovery.register(spec).await?;
+        b10_drain::register_route(endpoint.drt());
 
         Ok(())
     }

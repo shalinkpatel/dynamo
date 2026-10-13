@@ -142,8 +142,14 @@ where
             // Starting from 0 credits cancellations that happened between
             // queue start and this task's first sync.
             let mut last_cancelled_requests = 0;
+            let mut draining_sync = super::b10_draining_metrics::B10DrainingSync::default();
             let sync_scheduler = Arc::clone(&metrics_scheduler);
             let mut sync_queue_metrics = move || {
+                draining_sync.sync(
+                    worker_type,
+                    &workers_with_configs.borrow(),
+                    sync_scheduler.b10_draining_counters(),
+                );
                 ROUTER_QUEUE_METRICS.set_pending(worker_type, sync_scheduler.pending_count());
                 ROUTER_QUEUE_METRICS
                     .set_pending_isl_tokens(worker_type, sync_scheduler.pending_isl_tokens());

@@ -614,6 +614,7 @@ pub fn register_global_metrics_with_component(component: &Component) {
         Box::new(q.isl_tokens_last_evaluated.clone()),
         "router_queue_isl_tokens_last_evaluated",
     );
+    crate::kv_router::b10_draining_metrics::register_draining_metrics_with_component(component);
 }
 
 // ---------------------------------------------------------------------------

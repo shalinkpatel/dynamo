@@ -179,6 +179,7 @@ struct B10RoutingConfigOverride {
     router_cache_miss_min_isl: Option<usize>,
     #[serde(alias = "router_session_affinity_discount")]
     router_session_affinity_score_multiplier: Option<f64>,
+    router_honor_draining: Option<bool>,
     router_residency_eviction_cost: Option<f64>,
     router_residency_half_life: Option<f64>,
     router_queue_threshold: Option<Option<f64>>,
@@ -240,6 +241,11 @@ pub struct B10RoutingConfig {
         alias = "router_session_affinity_discount"
     )]
     pub router_session_affinity_score_multiplier: f64,
+
+    /// Keep new work off workers publishing a `b10.drain/until=` taint, unless no other worker
+    /// is eligible. Requests pinned or sticky to a draining worker still reach it.
+    #[serde(default)]
+    pub router_honor_draining: bool,
 
     #[serde(default = "default_router_residency_eviction_cost")]
     pub router_residency_eviction_cost: f64,
@@ -305,6 +311,9 @@ impl B10RoutingConfig {
         if let Some(value) = overrides.router_session_affinity_score_multiplier {
             self.router_session_affinity_score_multiplier = value;
         }
+        if let Some(value) = overrides.router_honor_draining {
+            self.router_honor_draining = value;
+        }
         if let Some(value) = overrides.router_residency_eviction_cost {
             self.router_residency_eviction_cost = value;
         }
@@ -342,6 +351,7 @@ impl Default for B10RoutingConfig {
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
             router_session_affinity_score_multiplier:
                 default_router_session_affinity_score_multiplier(),
+            router_honor_draining: false,
             router_residency_eviction_cost: default_router_residency_eviction_cost(),
             router_residency_half_life: default_router_residency_half_life(),
             router_queue_threshold: None,
@@ -919,6 +929,24 @@ override_args:
             2.0 / 3.0
         );
         assert_eq!(unified_config.router_active_replicas, 1);
+    }
+
+    #[test]
+    fn router_honor_draining_defaults_off_and_follows_override_group() {
+        let defaults = B10RoutingConfig::default();
+        assert!(!defaults.router_honor_draining);
+        let yaml = r#"
+b10_routing_config:
+  router_honor_draining: true
+override_args:
+  decode:
+    b10_routing_config:
+      router_honor_draining: false
+"#;
+        for (group, expected) in [(None, true), (Some("decode"), false)] {
+            let config = UnifiedConfig::parse(yaml, group, &defaults).unwrap();
+            assert_eq!(config.routing.router_honor_draining, expected, "{group:?}");
+        }
     }
 
     #[test]

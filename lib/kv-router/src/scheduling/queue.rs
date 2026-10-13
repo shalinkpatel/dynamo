@@ -32,6 +32,9 @@ use crate::sequences::{
     ActiveSequencesMultiWorker, RequestId, SequenceError, SequencePublisher, SequenceRequest,
 };
 
+pub mod b10_draining;
+use b10_draining::B10DrainingCounters;
+
 /// Large default for max_num_batched_tokens when not configured (effectively disables queueing for that worker)
 pub const DEFAULT_MAX_BATCHED_TOKENS: u64 = 10_000_000;
 
@@ -259,6 +262,7 @@ struct SchedulerQueueActor<
     pending_load: PendingRequestsLoad,
     cancelled_requests: Arc<AtomicUsize>,
     eval_gauges: Arc<B10QueueEvalGauges>,
+    b10_draining_counters: Arc<B10DrainingCounters>,
     slots: Arc<ActiveSequencesMultiWorker<P>>,
     workers_with_configs: watch::Receiver<HashMap<WorkerId, C>>,
     threshold_frac: Option<f64>,
@@ -298,6 +302,7 @@ pub struct SchedulerQueue<
     cancelled_requests: Arc<AtomicUsize>,
     /// Last-evaluation snapshots for the threshold/eval gauge exports.
     eval_gauges: Arc<B10QueueEvalGauges>,
+    b10_draining_counters: Arc<B10DrainingCounters>,
     /// Copy of the missing-ISL tiers (immutable after construction) so the
     /// metrics task can export per-rung effective caps without the actor.
     queue_depth_tiers: RouterQueueDepthTiers,
@@ -359,6 +364,7 @@ impl<
         let pending_isl_tokens = Arc::new(AtomicUsize::new(0));
         let cancelled_requests = Arc::new(AtomicUsize::new(0));
         let eval_gauges = Arc::new(B10QueueEvalGauges::new(queue_depth_tiers.b10_tier_count()));
+        let b10_draining_counters = Arc::new(B10DrainingCounters::default());
         let (admission_tx, admission_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let handle_queue_depth_tiers = queue_depth_tiers.clone();
         let actor = SchedulerQueueActor {
@@ -371,6 +377,7 @@ impl<
             ),
             cancelled_requests: Arc::clone(&cancelled_requests),
             eval_gauges: Arc::clone(&eval_gauges),
+            b10_draining_counters: Arc::clone(&b10_draining_counters),
             slots: Arc::clone(&slots),
             workers_with_configs: workers_with_configs.clone(),
             threshold_frac,
@@ -396,6 +403,7 @@ impl<
             pending_isl_tokens,
             cancelled_requests,
             eval_gauges,
+            b10_draining_counters,
             queue_depth_tiers: handle_queue_depth_tiers,
             slots,
             workers_with_configs,
@@ -618,6 +626,11 @@ impl<
         &self.eval_gauges
     }
 
+    /// What `router_honor_draining` did to admitted requests so far (lock-free).
+    pub fn b10_draining_counters(&self) -> &B10DrainingCounters {
+        &self.b10_draining_counters
+    }
+
     /// Per-worker missing-ISL caps: `(missing_isl_floor, max_queue_depth)`
     /// per tier, straight from config so the exported thresholds never move
     /// with fleet size.
@@ -735,8 +748,7 @@ impl<
             return;
         }
 
-        let prefill_busy =
-            self.all_workers_prefill_busy(threshold, request.eligibility(), decay_now);
+        let prefill_busy = self.all_workers_prefill_busy(threshold, &request, decay_now);
         let decode_busy = if prefill_busy {
             None
         } else {
@@ -912,7 +924,7 @@ impl<
             // drain overhead bounded to the heap front. A blocked pinned or
             // otherwise constrained request can temporarily stall later
             // schedulable entries until we adopt a cheaper non-HOL strategy.
-            if self.all_workers_prefill_busy(threshold, front.request.eligibility(), decay_now)
+            if self.all_workers_prefill_busy(threshold, &front.request, decay_now)
                 || self.decode_tokens_busy()
             {
                 break;
@@ -945,7 +957,7 @@ impl<
                 request.effective_cached_tokens = effective_cached_tokens;
             }
             let admit_now = Instant::now();
-            if self.all_workers_prefill_busy(threshold, request.eligibility(), admit_now)
+            if self.all_workers_prefill_busy(threshold, &request, admit_now)
                 || self.decode_tokens_busy()
             {
                 self.pending_load.insert(&request);
@@ -1030,7 +1042,12 @@ impl<
             .overloaded_worker_provider
             .as_ref()
             .and_then(|provider| provider());
-        let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+        let eligibility = self.honoring_draining(
+            request.eligibility_with_overloaded(overloaded_worker_ids.as_ref()),
+            request,
+            &workers,
+        );
+        self.b10_record_draining_outcome(request, &eligibility);
         self.selector
             .select_worker(&workers, request, eligibility, self.block_size)
     }
@@ -1274,14 +1291,16 @@ impl<
     /// otherwise all registered workers are checked.
     /// Returns false when no eligible workers exist so the request falls
     /// through to `schedule`, which returns a proper `NoEndpoints` error.
+    /// With `router_honor_draining`, draining workers count only when selection could use them.
     fn all_workers_prefill_busy(
         &self,
         threshold: f64,
-        eligibility: RoutingEligibility<'_>,
+        request: &SchedulingRequest,
         decay_now: Instant,
     ) -> bool {
         let active_tokens = self.slots.active_tokens(decay_now);
         let configs = self.workers_with_configs.borrow();
+        let eligibility = self.honoring_draining(request.eligibility(), request, &configs);
 
         if let Some(worker) = eligibility.pinned_worker() {
             let Ok(config) = eligibility.validate_worker_rank(&configs, worker) else {
@@ -1595,7 +1614,7 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)]
-    fn make_queue_with_sender(
+    pub(super) fn make_queue_with_sender(
         num_workers: usize,
         block_size: u32,
         isl: usize,
@@ -1884,7 +1903,7 @@ mod tests {
         (queue, slots)
     }
 
-    fn make_request(
+    pub(super) fn make_request(
         request_id: &str,
         isl_tokens: usize,
     ) -> (

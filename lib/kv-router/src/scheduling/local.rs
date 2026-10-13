@@ -414,6 +414,12 @@ where
         self.queue.b10_cancelled_requests_count()
     }
 
+    pub fn b10_draining_counters(
+        &self,
+    ) -> &crate::scheduling::queue::b10_draining::B10DrainingCounters {
+        self.queue.b10_draining_counters()
+    }
+
     pub fn supports_overlap_refresh(&self) -> bool {
         self.queue.supports_overlap_refresh()
     }

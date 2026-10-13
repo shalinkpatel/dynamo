@@ -2787,6 +2787,16 @@ wakeup); the HTTP route, Python and engine changes are left out. Drop when the
 fork advances to an upstream release containing #12620. Details and expected
 conflicts: the backport PR.
 
+## PATCH-024: Worker lame-duck drain and router draining filter
+
+Status: `keep`
+
+Worker `POST /engine/drain {"until": <RFC 3339>}` (`lib/llm/src/local_model/b10_drain.rs`)
+publishes a `b10.drain/until=<RFC 3339>` taint on its base model card (via PATCH-023's
+`update_model_taints`); routers skip workers with that taint for new sessions behind
+`b10_routing_config.router_honor_draining` (`scheduling/{filter,queue}/b10_draining.rs`).
+PR: https://github.com/basetenlabs/dynamo/pull/962.
+
 ## GWP Control Plane (global-routing)
 
 Status: `keep` — Baseten-specific control plane; not upstream.

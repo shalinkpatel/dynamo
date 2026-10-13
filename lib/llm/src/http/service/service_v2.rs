@@ -639,6 +639,11 @@ impl HttpServiceConfigBuilder {
             tracing::warn!("Failed to register router sequence metrics: {}", e);
         }
 
+        if let Err(e) = crate::kv_router::b10_draining_metrics::register_draining_metrics(&registry)
+        {
+            tracing::warn!("Failed to register router draining metrics: {}", e);
+        }
+
         if let Some(ref discovery) = config.drt_discovery {
             let instance_id = discovery.instance_id();
             if let Err(e) = RoutingOverheadMetrics::register(&registry, instance_id) {

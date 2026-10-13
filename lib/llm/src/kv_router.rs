@@ -55,6 +55,7 @@ pub use dynamo_kv_router::scheduling;
 pub use dynamo_kv_router::selector;
 
 mod b10_bid;
+pub mod b10_draining_metrics;
 pub mod b10_metrics_helper;
 mod b10_potential_loads_cache;
 pub mod b10_worker_selector;
