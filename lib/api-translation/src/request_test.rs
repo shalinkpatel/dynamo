@@ -1523,6 +1523,29 @@ fn adapt_responses_client_tool_strict_flag_is_forwarded() {
 }
 
 #[test]
+fn b10_client_tool_defer_loading_is_forwarded() {
+    for (flag, expected) in [(json!(true), Some(true)), (json!(false), Some(false))] {
+        let messages = client_function_tool(json!({
+            "name": "f", "defer_loading": flag, "input_schema": {"type": "object"},
+        }))
+        .unwrap();
+        assert_eq!(messages[0].defer_loading, expected);
+        let responses = responses_client_function_tool(json!({
+            "type": "function", "name": "f", "defer_loading": flag,
+            "parameters": {"type": "object"},
+        }))
+        .unwrap();
+        assert_eq!(responses[0].defer_loading, expected);
+    }
+    let messages =
+        client_function_tool(json!({"name": "f", "input_schema": {"type": "object"}})).unwrap();
+    assert_eq!(messages[0].defer_loading, None);
+    let responses =
+        responses_client_function_tool(json!({"type": "function", "name": "f"})).unwrap();
+    assert_eq!(responses[0].defer_loading, None);
+}
+
+#[test]
 fn b10_adapt_messages_client_tool_strict_flag_is_forwarded() {
     for (strict, expected) in [(json!(true), Some(true)), (json!(false), Some(false))] {
         let cc_tools = client_function_tool(json!({

@@ -1047,6 +1047,7 @@ fn client_function_tool(tool_entry: Value) -> Result<Vec<ChatCompletionTool>, Re
         input_schema,
     );
     cc_tool.function.strict = client_tool.strict;
+    cc_tool.defer_loading = client_tool.defer_loading;
     Ok(vec![cc_tool])
 }
 
@@ -2436,6 +2437,8 @@ fn flatten_responses_namespaces(entries: Vec<Value>) -> Result<Vec<Value>, Reque
 fn responses_client_function_tool(
     tool_entry: Value,
 ) -> Result<Vec<ChatCompletionTool>, RequestRejection> {
+    // The vendored Responses function tool does not model `defer_loading`; read it off the wire.
+    let defer_loading = tool_entry.get("defer_loading").and_then(Value::as_bool);
     let tool: ResponsesTool = serde_json::from_value(tool_entry)
         .map_err(|e| RequestRejection::malformed(format!("invalid tool definition: {e}")))?;
     match tool {
@@ -2446,6 +2449,7 @@ fn responses_client_function_tool(
                 function.parameters.unwrap_or_else(|| json!({})),
             );
             cc_tool.function.strict = function.strict;
+            cc_tool.defer_loading = defer_loading;
             Ok(vec![cc_tool])
         }
         other => {
