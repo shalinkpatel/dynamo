@@ -99,15 +99,15 @@ fn gwp_kv_router_config(ttl_secs: u64) -> KvRouterConfig {
 }
 
 /// GWP keeps etcd as its discovery plane while allowing replica events to use
-/// either direct ZMQ (the backwards-compatible default) or NATS Core pub-sub.
-/// `DYN_EVENT_PLANE=nats` selects NATS and `NATS_SERVER` configures its server.
+/// NATS Core pub-sub (the default) or direct ZMQ.
+/// `NATS_SERVER` configures the broker; `DYN_EVENT_PLANE=zmq` selects ZMQ.
 fn gwp_distributed_config() -> anyhow::Result<DistributedConfig> {
     let event_transport_kind = match std::env::var(
         dynamo_runtime::config::environment_names::event_plane::DYN_EVENT_PLANE,
     ) {
-        Ok(value) if value == "nats" => EventTransportKind::Nats,
-        Ok(value) if value == "zmq" || value.is_empty() => EventTransportKind::Zmq,
-        Err(std::env::VarError::NotPresent) => EventTransportKind::Zmq,
+        Ok(value) if value == "nats" || value.is_empty() => EventTransportKind::Nats,
+        Ok(value) if value == "zmq" => EventTransportKind::Zmq,
+        Err(std::env::VarError::NotPresent) => EventTransportKind::Nats,
         Ok(value) => anyhow::bail!(
             "invalid DYN_EVENT_PLANE value '{value}'; valid values are 'nats' and 'zmq'"
         ),

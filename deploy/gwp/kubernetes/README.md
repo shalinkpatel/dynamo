@@ -82,12 +82,12 @@ All replicas must reach:
 - when `DYN_EVENT_PLANE=nats`, the configured `NATS_SERVER` on its client port.
 
 If a NetworkPolicy is present, allow Alyx and other internal dispatchers to
-reach GWP pods on TCP port 8091. Also allow pod-to-pod TCP between pods labeled
-`app.kubernetes.io/name=dynamo-gwp`. The Service is not used for ZMQ because
-each publisher advertises its own pod address through etcd.
+reach GWP pods on TCP port 8091. For ZMQ, also allow pod-to-pod TCP between pods labeled
+`app.kubernetes.io/name=dynamo-gwp`; each publisher advertises its own pod
+address through etcd.
 
-The checked-in ConfigMap defaults to direct ZMQ. Set its `event-plane` value to
-`nats` to move replica lifecycle events to NATS Core pub-sub; etcd remains the
+The checked-in ConfigMap and GWP runtime default to NATS Core pub-sub. Set
+`event-plane: zmq` to use direct pod-to-pod events instead; etcd remains the
 membership/discovery plane in either mode. The request plane remains TCP.
 Each canonical routable model owns an independent scheduler and event channel;
 aliases resolve to the canonical model before selecting that channel.
@@ -103,9 +103,8 @@ replica from service. The 45-second pod termination grace exceeds GWP's
 For a self-contained development or proof-of-concept deployment, the
 [`gwp-datastores`](../../helm/charts/gwp-datastores/README.md) Helm chart
 installs one shared Redis, etcd, and NATS instance. These are separate cluster
-services rather than per-GWP sidecars. NATS is available for consumers that are
-explicitly configured to use it; installing the chart does not replace GWP's
-ZMQ event plane. The chart is intentionally single-replica and ephemeral; use
+services rather than per-GWP sidecars. GWP uses NATS Core for replica events by default. The chart is intentionally
+single-replica and ephemeral; use
 managed, highly available services in production.
 
 ## Metrics scraping

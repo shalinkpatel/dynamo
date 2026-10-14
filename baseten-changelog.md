@@ -2818,6 +2818,9 @@ PR: https://github.com/basetenlabs/dynamo/pull/962.
 
 ## GWP Control Plane (global-routing)
 
+GWP defaults replica events to NATS Core, retaining explicit ZMQ support
+([#1041](https://github.com/basetenlabs/dynamo/pull/1041)).
+
 Status: `keep` — Baseten-specific control plane; not upstream.
 
 Replay unit covering the GWP Envoy data plane and its loopback control API,

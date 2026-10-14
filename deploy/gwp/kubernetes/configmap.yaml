@@ -9,7 +9,7 @@ data:
   # Router-replica discovery. Session affinity uses Redis (below).
   etcd-endpoints: http://gwp-stores-gwp-datastores-etcd.gwp.svc.cluster.local:2379
   # "zmq" (direct pod-to-pod) or "nats" (NATS Core pub-sub).
-  event-plane: zmq
+  event-plane: nats
   nats-server: nats://gwp-stores-gwp-datastores-nats.gwp.svc.cluster.local:4222
   b10-router.yaml: |
     b10_routing_config:

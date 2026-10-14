@@ -31,8 +31,9 @@ NATS Core pub-sub is available at:
 NATS_SERVER=nats://gwp-stores-gwp-datastores-nats:4222
 ```
 
-Installing NATS does not change GWP's event-plane transport automatically;
-consumers must be configured to use this server. Redis, etcd, and NATS can be
+GWP defaults to NATS Core for replica events; configure `NATS_SERVER` above.
+Set `DYN_EVENT_PLANE=zmq` for direct pod-to-pod events instead.
+Redis, etcd, and NATS can be
 disabled independently with `redis.enabled=false`, `etcd.enabled=false`, and
 `nats.enabled=false`.
 
