@@ -18,6 +18,7 @@ use envoy_types::ext_authz::v3::pb::{
 };
 use envoy_types::pb::google::rpc::{Code as RpcCode, Status as RpcStatus};
 use http::{HeaderValue, StatusCode};
+use tonic::server::NamedService;
 use tonic::{Request, Response, Status};
 use tonic_health::ServingStatus;
 use tonic_health::pb::health_server::HealthServer;
@@ -29,6 +30,8 @@ pub mod pb {
 
 use pb::lifecycle_server::{Lifecycle, LifecycleServer};
 use pb::{RequestFinishedRequest, ResponseStartedRequest};
+
+use dynamo_kv_router::protocols::WorkerWithDpRank;
 
 use crate::control::{ControlError, ControlState, ResolvedSchedule, resolve_schedule};
 use crate::session::{client_session_id, headers};
@@ -94,7 +97,11 @@ impl Lifecycle for GrpcLifecycle {
             .core
             .response_started(
                 &request.request_id,
-                request.actual_worker_id,
+                // The envoy filter reports the engine's worker id; its dp rank
+                // is not carried, so rank 0 is the best identity available.
+                request
+                    .actual_worker_id
+                    .map(WorkerWithDpRank::from_worker_id),
                 upstream_status,
             )
             .await;
@@ -345,16 +352,14 @@ async fn publish_health(reporter: &HealthReporter, lifecycle: &crate::lifecycle:
     reporter
         .set_service_status("gwp-liveness", ServingStatus::Serving)
         .await;
-    reporter
-        .set_service_status(
-            "gwp-readiness",
-            if lifecycle.is_ready() {
-                ServingStatus::Serving
-            } else {
-                ServingStatus::NotServing
-            },
-        )
-        .await;
+    let readiness = if lifecycle.is_ready() {
+        ServingStatus::Serving
+    } else {
+        ServingStatus::NotServing
+    };
+    for service in ["gwp-readiness", crate::kvlocator::LocatorServer::NAME] {
+        reporter.set_service_status(service, readiness).await;
+    }
 }
 
 fn nonempty(value: &str) -> Option<&str> {
@@ -666,7 +671,7 @@ mod tests {
 
         let status = service
             .check(Request::new(HealthCheckRequest {
-                service: "gwp-readiness".into(),
+                service: crate::kvlocator::LocatorServer::NAME.into(),
             }))
             .await
             .unwrap()
@@ -677,7 +682,7 @@ mod tests {
         publish_health(&reporter, &lifecycle).await;
         let status = service
             .check(Request::new(HealthCheckRequest {
-                service: "gwp-readiness".into(),
+                service: crate::kvlocator::LocatorServer::NAME.into(),
             }))
             .await
             .unwrap()
@@ -688,7 +693,7 @@ mod tests {
         publish_health(&reporter, &lifecycle).await;
         let readiness = service
             .check(Request::new(HealthCheckRequest {
-                service: "gwp-readiness".into(),
+                service: crate::kvlocator::LocatorServer::NAME.into(),
             }))
             .await
             .unwrap()
@@ -723,12 +728,17 @@ mod tests {
     async fn tonic_server_serves_schedule_lifecycle_and_health() {
         let state = test_state().await;
         let core = state.core.clone();
+        let readiness_state = state.lifecycle.clone();
         let (health, health_task) = health_server(state.lifecycle.clone()).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let server = tokio::spawn(
             tonic::transport::Server::builder()
+                .add_service(crate::kvlocator::grpc_server(
+                    core.clone(),
+                    state.lifecycle.clone(),
+                ))
                 .add_service(authorization_server(state.clone()))
                 .add_service(lifecycle_server(state))
                 .add_service(health)
@@ -789,7 +799,7 @@ mod tests {
             .clone();
         assert_eq!(core.inflight_len(), 1);
 
-        let mut lifecycle_client = pb::lifecycle_client::LifecycleClient::new(channel);
+        let mut lifecycle_client = pb::lifecycle_client::LifecycleClient::new(channel.clone());
         lifecycle_client
             .response_started(ResponseStartedRequest {
                 request_id: request_id.clone(),
@@ -807,6 +817,64 @@ mod tests {
             .unwrap();
         assert_eq!(core.inflight_len(), 0);
 
+        use dynamo_kvlocator::pb as native;
+        let mut locator = native::kv_locator_service_client::KvLocatorServiceClient::new(channel);
+        let input = native::LocateRequest {
+            model_id: "test-model".into(),
+            bid: Some(native::BidRequest {
+                tokens: vec![1, 2, 3, 4],
+                ..Default::default()
+            }),
+            eligible_endpoint_ids: vec!["test-endpoint".into()],
+            ..Default::default()
+        };
+        let placements = locator.locate(input.clone()).await.unwrap().into_inner();
+        let chosen = placements
+            .placements_v1
+            .unwrap()
+            .candidates
+            .remove(0)
+            .placement
+            .unwrap();
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        locator
+            .commit_intend(native::CommitIntendRequest {
+                attempt_id: attempt_id.clone(),
+                request_id: "native-stream".into(),
+                input: Some(input.clone()),
+                chosen_placement: Some(native::commit_intend_request::ChosenPlacement::Chosen(
+                    chosen.clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        assert_eq!(core.inflight_len(), 1);
+        readiness_state.begin_draining();
+        assert_eq!(
+            locator.locate(input).await.unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        locator
+            .response_open_outcome(native::ResponseOpenOutcomeRequest {
+                attempt_id: attempt_id.clone(),
+                outcome: Some(native::response_open_outcome_request::Outcome::Admitted(
+                    native::Admission {
+                        prefill_worker_id: chosen.worker_id,
+                        prefill_dp_rank: chosen.dp_rank,
+                        ..Default::default()
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        locator
+            .response_finish(native::ResponseFinishRequest {
+                attempt_id,
+                reason: native::response_finish_request::Reason::Completed as i32,
+            })
+            .await
+            .unwrap();
+        assert_eq!(core.inflight_len(), 0);
         health_task.abort();
         server.abort();
     }

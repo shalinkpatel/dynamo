@@ -3,16 +3,26 @@
 This base runs three replicas. Each pod contains:
 
 - Envoy on port 8080, owning client connections and streaming.
-- One GWP process on port 8091, serving Envoy's gRPC ext-authz scheduling
-  checks, asynchronous lifecycle RPCs, and standard gRPC health.
+- One GWP process on port 8091, serving Envoy's gRPC ext-authz scheduling,
+  native `KVLocatorService` placement/accounting for Alyx, and gRPC health.
 - GWP metrics on port 9090.
 - Read-only Envoy Prometheus metrics on port 9902.
 
-The Service exposes Envoy on port 80, GWP metrics on port 9090, and the
-read-only Envoy metrics bridge on port 9902. It deliberately does not expose
-the GWP gRPC port or full Envoy admin API. Envoy returns 404 for `/v1/models`;
-configured routes are authoritative and model discovery does not use that
-endpoint.
+The `dynamo-gwp` Service exposes Envoy on port 80, GWP gRPC on port 8091,
+GWP metrics on port 9090, and read-only Envoy metrics on port 9902. The full
+Envoy admin API stays private. Envoy returns 404 for `/v1/models`; configured
+routes are authoritative and model discovery does not use that endpoint.
+
+Alyx calls `KVLocatorService` directly over gRPC on port 8091. This path does
+not pass through Envoy. The `dynamo-gwp-grpc` headless Service supplies pod
+addresses for replica selection. Select one pod for CommitIntend and retain
+that address for the attempt's admission, finish, and notification retries,
+including reconnects. The cluster IP can serve Locate calls; independently
+load-balancing lifecycle calls breaks accounting. Replica failover remains
+unsupported under the current contract.
+
+Use a GWP image containing `KVLocatorService` and update the image reference
+in `kustomization.yaml` before using the native API.
 
 ## Configure
 
@@ -71,7 +81,8 @@ All replicas must reach:
   ports used by direct publisher/subscriber synchronization;
 - when `DYN_EVENT_PLANE=nats`, the configured `NATS_SERVER` on its client port.
 
-If a NetworkPolicy is present, allow pod-to-pod TCP between pods labeled
+If a NetworkPolicy is present, allow Alyx and other internal dispatchers to
+reach GWP pods on TCP port 8091. Also allow pod-to-pod TCP between pods labeled
 `app.kubernetes.io/name=dynamo-gwp`. The Service is not used for ZMQ because
 each publisher advertises its own pod address through etcd.
 

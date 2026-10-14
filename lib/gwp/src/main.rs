@@ -3,7 +3,7 @@
 
 //! Global Workload Plane entrypoint. Requires the `server` feature.
 //!
-//! Serves Envoy scheduling, lifecycle notifications, and standard health over
+//! Serves native placement, Envoy scheduling, lifecycle notifications, and health over
 //! gRPC on `DYN_GWP_GRPC_PORT` (default 8091).
 
 use dynamo_gwp::GwpConfig;
@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let grpc_graceful = server_shutdown.clone();
     let grpc_served = tonic::transport::Server::builder()
+        .add_service(built.kvlocator_service)
         .add_service(built.authorization_service)
         .add_service(built.lifecycle_service)
         .add_service(built.health_service)

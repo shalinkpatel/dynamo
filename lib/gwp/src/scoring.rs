@@ -311,6 +311,11 @@ impl PreparedScoring {
     }
 }
 
+// A positive baseline lets taint preferences break ties for zero work cost.
+pub(crate) fn selection_cost(logit: f64, taint_multiplier: f64) -> f64 {
+    (logit + 1.0) * taint_multiplier
+}
+
 /// Apply the signed local change since an external observation, while never
 /// scoring below the current local view.
 pub(crate) fn fuse_load(

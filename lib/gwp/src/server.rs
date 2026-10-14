@@ -22,6 +22,7 @@ pub struct BuiltServer {
     pub health_task: tokio::task::JoinHandle<()>,
     pub core: GwpCore,
     pub lifecycle: Lifecycle,
+    pub kvlocator_service: crate::kvlocator::LocatorServer,
     pub authorization_service:
         envoy_types::ext_authz::v3::pb::AuthorizationServer<crate::grpc::GrpcAuthorization>,
     pub lifecycle_service:
@@ -114,11 +115,13 @@ async fn build_inner(
         lifecycle: lifecycle.clone(),
     };
     let (health_service, health_task) = crate::grpc::health_server(lifecycle.clone()).await;
+    let kvlocator_service = crate::kvlocator::grpc_server(core.clone(), lifecycle.clone());
     Ok(BuiltServer {
         topology_handle,
         health_task,
         core,
         lifecycle,
+        kvlocator_service,
         authorization_service: crate::grpc::authorization_server(control_state.clone()),
         lifecycle_service: crate::grpc::lifecycle_server(control_state),
         health_service,

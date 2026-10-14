@@ -35,10 +35,14 @@ server = [
     "dep:tonic",
     "dep:tonic-health",
     "dep:tonic-prost",
+    "dep:dynamo-kvlocator",
 ]
 
 [dependencies]
 baseten-configmap = { workspace = true }
+# The KVLocator contract (Scorer/Lifecycle traits + wire types); the
+# implementations live here, next to the machinery they adapt.
+dynamo-kvlocator = { path = "../kvlocator", optional = true }
 # repo
 dynamo-kv-router = { workspace = true }
 dynamo-runtime = { workspace = true }

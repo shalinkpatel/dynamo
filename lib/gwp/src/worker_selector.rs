@@ -200,7 +200,10 @@ impl WorkerSelector<ModelRuntimeConfig> for GwpWorkerSelector {
                 .preferred_taint_multiplier(worker_config.taints())
                 .unwrap_or(1.0);
             log_score(verbose, worker, score, taint_multiplier);
-            scores.insert(worker, (score.logit + 1.0) * taint_multiplier);
+            scores.insert(
+                worker,
+                crate::scoring::selection_cost(score.logit, taint_multiplier),
+            );
         });
         if scores.is_empty() {
             return Err(KvSchedulerError::NoEndpoints);

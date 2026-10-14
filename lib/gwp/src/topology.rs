@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use dynamo_kv_router::protocols::WorkerId;
+#[cfg(feature = "server")]
+use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_llm::local_model::runtime_config::ModelRuntimeConfig;
 use parking_lot::Mutex;
 #[cfg(feature = "server")]
@@ -270,6 +272,32 @@ impl TopologySnapshot {
     }
 }
 
+#[cfg(feature = "server")]
+pub(crate) fn validate_admission_worker(
+    topology: &TopologySnapshot,
+    endpoint: Option<&EndpointId>,
+    worker: WorkerWithDpRank,
+) -> anyhow::Result<()> {
+    let (start, size) = if let Some(entry) = topology.workers.get(&worker.worker_id) {
+        if endpoint.is_some_and(|endpoint| &entry.endpoint != endpoint) {
+            anyhow::bail!("admission worker does not belong to the routed endpoint");
+        }
+        (
+            entry.runtime.data_parallel_start_rank,
+            entry.runtime.data_parallel_size,
+        )
+    } else {
+        // Unadvertised workers are confirmed with this same default runtime.
+        let runtime: dynamo_llm::local_model::runtime_config::ModelRuntimeConfig =
+            Default::default();
+        (runtime.data_parallel_start_rank, runtime.data_parallel_size)
+    };
+    if worker.dp_rank < start || worker.dp_rank - start >= size {
+        anyhow::bail!("admission DP rank is outside the worker's configured range");
+    }
+    Ok(())
+}
+
 /// Atomic request-path view. The small mutex serializes authoritative replaces
 /// with positive worker confirmations from successful downstream responses.
 #[derive(Clone)]
@@ -298,32 +326,65 @@ impl TopologyStore {
     /// Record positive liveness evidence from the endpoint response. The next
     /// provider snapshot remains authoritative and may remove this worker.
     pub fn confirm_worker(&self, endpoint: &EndpointId, worker_id: WorkerId) -> anyhow::Result<()> {
-        let _guard = self.update.lock();
-        let current = self.inner.load_full();
-        if let Some(worker) = current.workers.get(&worker_id) {
-            anyhow::ensure!(
-                &worker.endpoint == endpoint,
-                "worker {worker_id} is advertised by both {} and {}",
-                worker.endpoint.0,
-                endpoint.0
-            );
+        self.confirm_workers(endpoint, &[worker_id], |_| Ok(()))
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn confirm_admission_workers(
+        &self,
+        endpoint: &EndpointId,
+        workers: &[WorkerWithDpRank],
+    ) -> anyhow::Result<()> {
+        let ids: Vec<_> = workers.iter().map(|worker| worker.worker_id).collect();
+        self.confirm_workers(endpoint, &ids, |current| {
+            for worker in workers {
+                validate_admission_worker(current, Some(endpoint), *worker)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Publish the confirmed workers together only if every validation succeeds.
+    fn confirm_workers(
+        &self,
+        endpoint: &EndpointId,
+        worker_ids: &[WorkerId],
+        validate: impl FnOnce(&TopologySnapshot) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if worker_ids.is_empty() {
             return Ok(());
         }
-        anyhow::ensure!(
-            current.endpoints.contains_key(endpoint),
-            "unknown endpoint {}",
-            endpoint.0
-        );
+        let _guard = self.update.lock();
+        let current = self.inner.load_full();
+        validate(&current)?;
         let mut next = (*current).clone();
-        next.workers.insert(
-            worker_id,
-            TopologyWorker {
-                endpoint: endpoint.clone(),
-                runtime: ModelRuntimeConfig::default(),
-                observed_load: None,
-            },
-        );
-        self.inner.store(Arc::new(next));
+        for &worker_id in worker_ids {
+            if let Some(worker) = next.workers.get(&worker_id) {
+                anyhow::ensure!(
+                    &worker.endpoint == endpoint,
+                    "worker {worker_id} is advertised by both {} and {}",
+                    worker.endpoint.0,
+                    endpoint.0
+                );
+                continue;
+            }
+            anyhow::ensure!(
+                current.endpoints.contains_key(endpoint),
+                "unknown endpoint {}",
+                endpoint.0
+            );
+            next.workers.insert(
+                worker_id,
+                TopologyWorker {
+                    endpoint: endpoint.clone(),
+                    runtime: ModelRuntimeConfig::default(),
+                    observed_load: None,
+                },
+            );
+        }
+        if next.workers.len() != current.workers.len() {
+            self.inner.store(Arc::new(next));
+        }
         Ok(())
     }
 }

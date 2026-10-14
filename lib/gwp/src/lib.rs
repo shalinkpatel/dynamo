@@ -33,6 +33,8 @@ pub mod control;
 pub mod core;
 #[cfg(feature = "server")]
 pub mod grpc;
+#[cfg(feature = "server")]
+pub mod kvlocator;
 pub mod lifecycle;
 pub mod metrics;
 pub mod reflector;

@@ -16,6 +16,10 @@ spec:
       port: 80
       targetPort: http
       protocol: TCP
+    - name: schedule-grpc
+      port: 8091
+      targetPort: schedule-grpc
+      protocol: TCP
     - name: metrics
       port: 9090
       targetPort: metrics
@@ -23,4 +27,22 @@ spec:
     - name: envoy-metrics
       port: 9902
       targetPort: envoy-metrics
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamo-gwp-grpc
+  labels:
+    app.kubernetes.io/name: dynamo-gwp
+    app.kubernetes.io/component: global-workload-plane
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: dynamo-gwp
+  ports:
+    - name: schedule-grpc
+      port: 8091
+      targetPort: schedule-grpc
       protocol: TCP

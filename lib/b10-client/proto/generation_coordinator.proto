@@ -19,7 +19,7 @@ message BidRequest
   repeated uint32 tokens = 1 [packed = true];
   // Required for multimodal requests; may be omitted for text-only requests.
   optional MmRoutingArgs mm_routing_args = 2;
-  // Preserved by coordinator relays; router bids do not yet use cache_salt.
+  // Coordinator relays preserve this salt; GWP includes it in prefix identity.
   optional string cache_salt = 3;
   // Same key as Routing.session_id; the downstream owns affinity decisions.
   optional string session_id = 4;
@@ -38,10 +38,14 @@ message BidResponse
 //
 // Alyx pins CommitIntend, ResponseOpenOutcome, and ResponseFinish for one attempt
 // to the same GWP replica, including retries. Locate does not establish ownership.
-// Mutation acknowledgements mean the notification was accepted, including an
-// identical duplicate or an event retained for later reconciliation. They do
-// not guarantee downstream admission or durable storage. Invalid messages and
-// conflicting reuse of an attempt ID return an error.
+// Opening acknowledgements include events retained for reconciliation. Later
+// openings return ALREADY_EXISTS regardless of payload. Repeated finishes
+// acknowledge without comparing reasons. Acknowledgements do not guarantee
+// downstream admission or durable storage. Once booked, every subsequent
+// commit for that attempt_id returns ALREADY_EXISTS without comparing payloads.
+// This also applies after completion and lets Alyx recognize a lost commit ack.
+// An invalid commit rejected before booking does not consume the attempt ID.
+// A terminal attempt that never booked rejects commits and cannot reactivate.
 //
 // Denial, opening failure, ResponseFinish, and booking expiry are terminal. Each
 // releases any remaining load once and retains a tombstone, even if CommitIntend
@@ -56,10 +60,10 @@ service KVLocatorService
   // The call deadline is the lookup budget; Alyx treats a late answer as a miss.
   rpc Locate(LocateRequest) returns (LocateResponse);
 
-  // Books Alyx's chosen placement once. The same payload may be retried with
-  // the same attempt_id without adding load or extending the booking TTL.
+  // Books Alyx's chosen placement once. Reusing a booked attempt_id returns
+  // ALREADY_EXISTS, regardless of payload; it adds no load and extends no TTL.
   // Does not require an earlier successful Locate. Abandoned bookings expire
-  // on GWP's own TTL; an already-finished attempt must not be booked again.
+  // on GWP's own TTL; a new dispatch always requires a fresh attempt_id.
   rpc CommitIntend(CommitIntendRequest) returns (google.protobuf.Empty);
 
   // Admission reconciles provisional load with the actual workers and keeps the
@@ -67,13 +71,15 @@ service KVLocatorService
   // the attempt immediately; Alyx sends no ResponseFinish for those outcomes.
   // An outcome arriving before CommitIntend is retained. Confirmed admission
   // can update prefix/affinity information, including after termination, but
-  // must never recreate active load for a terminal attempt.
+  // must never recreate active load for a terminal attempt. Once accepted, any
+  // subsequent opening returns ALREADY_EXISTS without comparing payloads.
   rpc ResponseOpenOutcome(ResponseOpenOutcomeRequest) returns (google.protobuf.Empty);
 
   // Terminates a previously admitted response on completion, cancellation, or
   // stream failure. Alyx sends this only after observing an Admission frame.
   // Delivery may precede ResponseOpenOutcome or CommitIntend; GWP applies the
   // terminal transition immediately without waiting for either notification.
+  // First finish wins; subsequent finishes acknowledge regardless of reason.
   rpc ResponseFinish(ResponseFinishRequest) returns (google.protobuf.Empty);
 }
 
@@ -156,6 +162,7 @@ message CommitIntendRequest
   // Required logical NewRequest.request_id, stable across dispatch retries.
   string request_id = 2;
   // Required full context so Commit does not depend on retained Locate state.
+  // Immutable for an attempt_id; changing tokens or metadata requires a fresh ID.
   LocateRequest input = 3;
   // Exactly one supported placement is required. It must satisfy input's
   // eligibility and constraints. Alyx may choose a returned candidate or an

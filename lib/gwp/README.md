@@ -1,8 +1,12 @@
 # dynamo-gwp
 
 Global Workload Plane routes OpenAI-compatible requests across Dynamo ingress
-deployments. Envoy owns client streams; GWP provides gRPC ext-authz scheduling,
+deployments. Envoy and Alyx own client streams; GWP provides scheduling,
 lifecycle accounting, health, planner reflection, and shared session affinity.
+
+Alyx calls `KVLocatorService` on the existing `DYN_GWP_GRPC_PORT` listener
+(default 8091). Native placement and Envoy RPCs share topology, accounting,
+readiness, and shutdown handling.
 
 This crate is an experimental proof of concept. Start with:
 
@@ -17,7 +21,7 @@ This crate is an experimental proof of concept. Start with:
 - `reflector`, `identity` — planner polling and worker ownership.
 - `session`, `tokens` — affinity backends and real/pseudo tokenization.
 - `router`, `core` — selection, booking, reconciliation, and lifecycle state.
-- `grpc`, `server` — Envoy scheduling/lifecycle APIs and process wiring.
+- `grpc`, `server`, `kvlocator` — Envoy and native placement RPCs and process wiring.
 - `metrics`, `lifecycle` — observability, readiness, drain, and cleanup.
 
 ## Build

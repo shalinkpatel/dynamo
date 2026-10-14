@@ -31,7 +31,7 @@ use crate::router::{GwpRouter, GwpRouterRegistry, OracleVersionId};
 use crate::session::{
     AffinityBinding, AffinityStore, mint_session_id, prompt_hash_session_id, request_session_id,
 };
-use crate::tokens::{ApproxTokens, TokenizerRegistry};
+use crate::tokens::{ApproxTokens, RoutingTokenIdentity, TokenizerRegistry};
 #[cfg(test)]
 use crate::tokens::{pseudo_tokens, routing_text};
 use crate::topology::{RoutableEndpoint, TopologySnapshot, TopologyStore};
@@ -66,7 +66,14 @@ struct RequestMetadata {
     routed_at: tokio::time::Instant,
 }
 
+pub(crate) struct NativeAdmission {
+    pub prefill: WorkerWithDpRank,
+    pub decode: Option<WorkerWithDpRank>,
+    pub cached_tokens: usize,
+}
+
 struct Booking {
+    identity: RoutingTokenIdentity,
     router: Arc<GwpRouter>,
     decision: WorkerWithDpRank,
     tokens: Vec<u32>,
@@ -122,6 +129,7 @@ pub struct ScheduleRequest {
 }
 
 struct ScheduledTokenLoad {
+    identity: RoutingTokenIdentity,
     tokens: Vec<u32>,
     cached_tokens: usize,
 }
@@ -129,6 +137,7 @@ struct ScheduledTokenLoad {
 impl ScheduledTokenLoad {
     fn new(tokens: Vec<u32>, cached_tokens: usize) -> Self {
         Self {
+            identity: RoutingTokenIdentity::default(),
             cached_tokens: cached_tokens.min(tokens.len()),
             tokens,
         }
@@ -409,6 +418,114 @@ impl GwpCore {
         }
         reservation.disarm();
         result
+    }
+
+    /// Intend + book, the KVLocator's CommitIntend: the pre-tokenized
+    /// equivalent of the scheduling path's optimistic booking, for attempts
+    /// that arrive with tokens, an endpoint and a worker instead of a JSON
+    /// body. The slot is keyed by `rid` (the caller's kvl-scoped attempt id)
+    /// and completes the same lifecycle afterwards: `response_started`
+    /// reconciles the actual worker, `request_finished` releases. A duplicate
+    /// `rid` is `DuplicateRequestId`, which the caller maps to its idempotent
+    /// retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn book_kvlocator_attempt(
+        &self,
+        rid: &str,
+        model_id: &str,
+        session_id: Option<String>,
+        tokens: Vec<u32>,
+        identity: RoutingTokenIdentity,
+        endpoint_id: &EndpointId,
+        worker: WorkerWithDpRank,
+    ) -> Result<(), ScheduleError> {
+        let topology = self.topology.load();
+        let Some((canonical_model, binding)) = topology.model_binding(model_id) else {
+            return Err(ScheduleError::InvalidModel(format!(
+                "model {model_id:?} is not known to GWP routing"
+            )));
+        };
+        if !binding.endpoints.contains(endpoint_id) {
+            return Err(ScheduleError::InvalidModel(format!(
+                "endpoint {:?} is not eligible for model {canonical_model:?}",
+                endpoint_id.0
+            )));
+        }
+        let oracle_version_id = OracleVersionId::new(canonical_model.clone())
+            .map_err(|error| ScheduleError::Internal(error.to_string()))?;
+        let model = oracle_version_id.as_str().to_string();
+        let Some(model_router) = self.router.model_router(&oracle_version_id) else {
+            return Err(ScheduleError::Internal(format!(
+                "model {model} has no scheduler"
+            )));
+        };
+        let Some(profile) = topology.profile(binding) else {
+            return Err(ScheduleError::Internal(format!(
+                "model {model} has no profile"
+            )));
+        };
+        let Some(endpoint) = topology.endpoint(endpoint_id) else {
+            return Err(ScheduleError::InvalidModel(format!(
+                "endpoint {:?} is not in the live topology",
+                endpoint_id.0
+            )));
+        };
+        if topology.worker_endpoint(worker.worker_id) != Some(endpoint_id) {
+            return Err(ScheduleError::InvalidModel(format!(
+                "worker {} does not belong to endpoint {:?}",
+                worker.worker_id, endpoint_id.0
+            )));
+        }
+
+        let slot = self.reserve_request(rid)?;
+        let mut reservation = ScheduleReservationGuard::new(
+            self.clone(),
+            rid,
+            slot.clone(),
+            std::time::Instant::now(),
+        );
+        // No minting here: an attempt without a session has no caller that
+        // could ever read a binding back, so the sid stays empty and the
+        // affinity bind in response_started skips it instead of writing a
+        // dead entry per sessionless attempt.
+        let sid = session_id.unwrap_or_default();
+        let cached_tokens = model_router
+            .book_attempt(rid, &tokens, &identity, worker, profile.stages.trie)
+            .await;
+        self.activate_booking(
+            &slot,
+            RequestMetadata::new(
+                sid,
+                endpoint_id.clone(),
+                model,
+                downstream_authority(endpoint),
+                worker,
+                profile.stages,
+                model_router,
+            ),
+            rid.to_string(),
+            worker,
+            ScheduledTokenLoad {
+                tokens,
+                cached_tokens,
+                identity,
+            },
+        )
+        .await;
+        reservation.disarm();
+
+        // A terminal notification (denial, failure, finish) that beat the
+        // commit closed the slot while we booked: release immediately
+        // instead of leaking the load.
+        {
+            let mut state = slot.state.lock().await;
+            if state.finished_at.is_some()
+                && let Some(booking) = state.booking.take()
+            {
+                booking.router.free(&booking.accounting_rid).await;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -889,6 +1006,7 @@ impl GwpCore {
         let mut state = slot.state.lock().await;
         state.metadata = Some(metadata);
         state.booking = Some(Booking {
+            identity: load.identity,
             router: state
                 .metadata
                 .as_ref()
@@ -1011,6 +1129,7 @@ impl GwpCore {
         };
         let cached_tokens = selection.cached_tokens;
         state.booking = Some(Booking {
+            identity: RoutingTokenIdentity::default(),
             router: metadata.router.clone(),
             decision: selection.worker,
             tokens,
@@ -1035,9 +1154,10 @@ impl GwpCore {
             if metadata.policy.trie {
                 booking
                     .router
-                    .record_routing_decision(
+                    .record_routing_decision_with_identity(
                         &booking.accounting_rid,
                         &booking.tokens,
+                        &booking.identity,
                         booking.decision,
                     )
                     .await;
@@ -1067,44 +1187,66 @@ impl GwpCore {
     pub async fn response_started(
         &self,
         rid: &str,
-        actual_worker_remote: Option<u64>,
+        actual_worker: Option<WorkerWithDpRank>,
         status: u16,
     ) {
+        if let Err(error) = self
+            .response_started_inner(rid, actual_worker, status, None)
+            .await
+        {
+            tracing::error!(rid, %error, "response reconciliation failed");
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) async fn response_started_for_attempt(
+        &self,
+        rid: &str,
+        admission: NativeAdmission,
+    ) -> Result<(), ScheduleError> {
+        self.response_started_inner(rid, Some(admission.prefill), 200, Some(admission))
+            .await
+    }
+
+    async fn response_started_inner(
+        &self,
+        rid: &str,
+        actual_worker: Option<WorkerWithDpRank>,
+        status: u16,
+        admission: Option<NativeAdmission>,
+    ) -> Result<(), ScheduleError> {
         let Some(slot) = self.inflight.get(rid).map(|entry| entry.clone()) else {
             tracing::warn!(
                 rid,
                 "response_started for unknown request id (swept or mis-pinned)"
             );
-            return;
+            return Ok(());
         };
         let mut state = slot.state.lock().await;
         let Some(metadata) = state.metadata.clone() else {
             tracing::warn!(rid, "response_started before scheduling produced metadata");
-            return;
+            // A denial or failure that beat the commit's booking must still
+            // close the slot: the arriving commit checks finished_at after
+            // installing its booking and releases it immediately instead of
+            // leaking the load until the janitor.
+            if status != 200 {
+                state
+                    .finished_at
+                    .get_or_insert_with(tokio::time::Instant::now);
+                self.mark_inactive(&mut state);
+            }
+            return Ok(());
         };
         let metrics = metadata.router.metrics().clone();
         if state.response.is_some() {
             tracing::debug!(rid, "duplicate response_started ignored");
-            return;
+            return Ok(());
         }
         if state.finished_at.is_some() {
             metrics.record_lifecycle_reconciliation("response_after_finish");
         }
 
-        metrics.record_upstream_response(
-            &metadata.endpoint_id,
-            &metadata.model,
-            &metadata.downstream_authority,
-            status,
-        );
         let outcome = ResponseOutcome::from_status(status);
-        metrics.observe_time_to_first_byte(
-            &metadata.endpoint_id,
-            &metadata.model,
-            &metadata.downstream_authority,
-            outcome,
-            metadata.routed_at.elapsed(),
-        );
 
         let topology = self.topology.load();
         let route_retired = status == 200 && topology.endpoint(&metadata.endpoint_id).is_none();
@@ -1113,14 +1255,16 @@ impl GwpCore {
         }
         let mut confirmed = metadata.planned;
         if status == 200 && !route_retired {
-            if let Some(actual_worker_id) = actual_worker_remote {
-                let actual = WorkerWithDpRank::from_worker_id(actual_worker_id);
-                let valid_owner = match topology.worker_endpoint(actual_worker_id) {
+            if let Some(info) = &admission {
+                // The native backend validates against the accepted admission snapshot.
+                confirmed = info.prefill;
+            } else if let Some(actual) = actual_worker {
+                let valid_owner = match topology.worker_endpoint(actual.worker_id) {
                     Some(owner) if owner == &metadata.endpoint_id => true,
                     Some(owner) => {
                         tracing::error!(
                             rid,
-                            actual_worker_id,
+                            actual.worker_id,
                             expected_endpoint = %metadata.endpoint_id.0,
                             advertised_endpoint = %owner.0,
                             "refusing cross-endpoint worker reassignment"
@@ -1129,11 +1273,11 @@ impl GwpCore {
                     }
                     None => match self
                         .topology
-                        .confirm_worker(&metadata.endpoint_id, actual_worker_id)
+                        .confirm_worker(&metadata.endpoint_id, actual.worker_id)
                     {
                         Ok(()) => true,
                         Err(error) => {
-                            tracing::error!(rid, actual_worker_id, %error);
+                            tracing::error!(rid, actual.worker_id, %error);
                             false
                         }
                     },
@@ -1148,6 +1292,24 @@ impl GwpCore {
                 );
             }
         }
+        let load_worker = admission
+            .as_ref()
+            .and_then(|info| info.decode)
+            .unwrap_or(confirmed);
+        metrics.record_upstream_response(
+            &metadata.endpoint_id,
+            &metadata.model,
+            &metadata.downstream_authority,
+            status,
+        );
+        metrics.observe_time_to_first_byte(
+            &metadata.endpoint_id,
+            &metadata.model,
+            &metadata.downstream_authority,
+            outcome,
+            metadata.routed_at.elapsed(),
+        );
+
         state.response = Some(ResponseStarted {
             status,
             outcome,
@@ -1195,23 +1357,29 @@ impl GwpCore {
                 "routed endpoint retired; released local booking without reconciliation"
             );
         } else if let Some(mut booking) = state.booking.take() {
-            let rebooked = confirmed != booking.decision;
+            let cached_tokens = admission
+                .as_ref()
+                .map(|info| info.cached_tokens.min(booking.tokens.len()))
+                .unwrap_or(booking.cached_tokens);
+            let rebooked =
+                load_worker != booking.decision || cached_tokens != booking.cached_tokens;
             if rebooked {
-                let confirmed_rid = format!("{rid}:confirmed:{}", confirmed.worker_id);
+                let confirmed_rid = format!("{rid}:confirmed:{}", load_worker.worker_id);
                 booking
                     .router
                     .rebook_request(
                         &booking.accounting_rid,
                         &confirmed_rid,
                         &booking.tokens,
-                        booking.cached_tokens,
-                        confirmed,
+                        &booking.identity,
+                        cached_tokens,
+                        load_worker,
                     )
                     .await;
                 tracing::info!(
                     rid,
                     provisional_worker_id = booking.decision.worker_id,
-                    actual_worker_id = confirmed.worker_id,
+                    actual_worker_id = load_worker.worker_id,
                     "re-booked request on downstream worker"
                 );
                 metrics.record_rebooked(
@@ -1219,7 +1387,20 @@ impl GwpCore {
                     &metadata.model,
                     &metadata.downstream_authority,
                 );
-                booking.decision = confirmed;
+                if cached_tokens != booking.cached_tokens {
+                    metrics.scheduler_request_finished(
+                        &metadata.endpoint_id,
+                        booking.tokens.len(),
+                        booking.cached_tokens,
+                    );
+                    metrics.scheduler_request_started(
+                        &metadata.endpoint_id,
+                        booking.tokens.len(),
+                        cached_tokens,
+                    );
+                    booking.cached_tokens = cached_tokens;
+                }
+                booking.decision = load_worker;
                 booking.accounting_rid = confirmed_rid;
             }
             booking
@@ -1229,10 +1410,11 @@ impl GwpCore {
             if metadata.policy.trie {
                 booking
                     .router
-                    .record_routing_decision(
+                    .record_routing_decision_with_identity(
                         &booking.accounting_rid,
                         &booking.tokens,
-                        booking.decision,
+                        &booking.identity,
+                        confirmed,
                     )
                     .await;
             }
@@ -1257,7 +1439,7 @@ impl GwpCore {
             && state.terminal_outcome_recorded;
         drop(state);
 
-        if status == 200 && !route_retired && metadata.policy.affinity {
+        if status == 200 && !route_retired && metadata.policy.affinity && !metadata.sid.is_empty() {
             let affinity = self.affinity.clone();
             let ttl = Duration::from_secs(self.config.load().session.ttl_secs);
             let binding = AffinityBinding::with_endpoint(confirmed, metadata.endpoint_id.clone());
@@ -1275,6 +1457,7 @@ impl GwpCore {
         if remove {
             self.remove_slot_if_same(rid, &slot);
         }
+        Ok(())
     }
 
     /// Lifecycle step 3 (Envoy Wasm `onLog` / RequestFinished): release the
@@ -1311,6 +1494,13 @@ impl GwpCore {
             self.spawn_terminal_cleanup(rid.to_string(), slot.clone());
         }
         tracing::debug!(rid, reason, known = true, "request finished");
+    }
+
+    /// Native terminal events release load immediately even if admission is late.
+    #[cfg(feature = "server")]
+    pub(crate) async fn finish_kvlocator_attempt(&self, rid: &str, reason: &str) {
+        self.request_finished(rid, reason).await;
+        self.force_terminal_cleanup(rid).await;
     }
 
     /// Number of requests currently between `schedule` and `request_finished`.
@@ -1845,6 +2035,61 @@ mod tests {
         core.config.replace(config);
     }
 
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn b10_native_admission_replaces_and_bounds_overlap_on_the_same_worker() {
+        let (core, _) = make_core(true).await;
+        let worker = WorkerWithDpRank::from_worker_id(WORKER);
+        for (rid, estimate, first_token) in [
+            ("admitted-overlap", 4, 1),
+            ("bounded-overlap", usize::MAX, 9),
+        ] {
+            let tokens = vec![first_token, 2, 3, 4, 5, 6, 7, 8];
+            core.book_kvlocator_attempt(
+                rid,
+                "m",
+                None,
+                tokens.clone(),
+                Default::default(),
+                &EndpointId(ENDPOINT.into()),
+                worker,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                core.inflight
+                    .get(rid)
+                    .unwrap()
+                    .state
+                    .lock()
+                    .await
+                    .booking
+                    .as_ref()
+                    .unwrap()
+                    .cached_tokens,
+                0
+            );
+            core.response_started_for_attempt(
+                rid,
+                NativeAdmission {
+                    prefill: worker,
+                    decode: Some(worker),
+                    cached_tokens: estimate,
+                },
+            )
+            .await
+            .unwrap();
+            let slot = core.inflight.get(rid).unwrap().clone();
+            let state = slot.state.lock().await;
+            let booking = state.booking.as_ref().unwrap();
+            assert_eq!(booking.cached_tokens, estimate.min(tokens.len()));
+            assert_ne!(booking.accounting_rid, rid);
+            drop(state);
+            core.finish_kvlocator_attempt(rid, "complete").await;
+        }
+        assert_eq!(core.inflight_len(), 0);
+    }
+
     #[tokio::test]
     async fn affinity_hit_returns_before_background_tokenization() {
         let (mut core, _tx) = make_core(true).await;
@@ -1872,8 +2117,12 @@ mod tests {
 
         gate.add_permits(1);
         wait_for_optimistic_job(&core, "optimistic-latency").await;
-        core.response_started("optimistic-latency", Some(WORKER), 200)
-            .await;
+        core.response_started(
+            "optimistic-latency",
+            Some(WorkerWithDpRank::from_worker_id(WORKER)),
+            200,
+        )
+        .await;
         core.request_finished("optimistic-latency", "complete")
             .await;
         assert_eq!(core.inflight_len(), 0);
@@ -1948,8 +2197,12 @@ mod tests {
         assert!(!state.tokenization_pending);
         assert!(state.booking.is_some());
         drop(state);
-        core.response_started("saturated-optimistic", Some(WORKER), 200)
-            .await;
+        core.response_started(
+            "saturated-optimistic",
+            Some(WorkerWithDpRank::from_worker_id(WORKER)),
+            200,
+        )
+        .await;
         core.request_finished("saturated-optimistic", "complete")
             .await;
 
@@ -1975,8 +2228,12 @@ mod tests {
         .await
         .unwrap();
 
-        core.response_started("response-before-tokenization", Some(20), 200)
-            .await;
+        core.response_started(
+            "response-before-tokenization",
+            Some(WorkerWithDpRank::from_worker_id(20)),
+            200,
+        )
+        .await;
         gate.add_permits(1);
         wait_for_optimistic_job(&core, "response-before-tokenization").await;
 
@@ -2029,7 +2286,8 @@ mod tests {
             .unwrap();
 
         retire_selected_endpoint(&core);
-        core.response_started(rid, Some(20), 200).await;
+        core.response_started(rid, Some(WorkerWithDpRank::from_worker_id(20)), 200)
+            .await;
         gate.add_permits(1);
         wait_for_optimistic_job(&core, rid).await;
 
@@ -2061,8 +2319,12 @@ mod tests {
         )
         .await
         .unwrap();
-        core.response_started("denied-before-tokenization", Some(20), 429)
-            .await;
+        core.response_started(
+            "denied-before-tokenization",
+            Some(WorkerWithDpRank::from_worker_id(20)),
+            429,
+        )
+        .await;
         gate.add_permits(1);
         wait_for_optimistic_job(&core, "denied-before-tokenization").await;
         assert_eq!(core.inflight_len(), 0);
@@ -2132,8 +2394,12 @@ mod tests {
         .unwrap();
         core.request_finished("reversed-lifecycle", "complete")
             .await;
-        core.response_started("reversed-lifecycle", Some(20), 200)
-            .await;
+        core.response_started(
+            "reversed-lifecycle",
+            Some(WorkerWithDpRank::from_worker_id(20)),
+            200,
+        )
+        .await;
         gate.add_permits(1);
         wait_for_optimistic_job(&core, "reversed-lifecycle").await;
         wait_for_binding(&core, sid, 20).await;
@@ -2169,7 +2435,8 @@ mod tests {
             "request-finished must not free before mark-prefill can run"
         );
 
-        core.response_started(rid, Some(20), 200).await;
+        core.response_started(rid, Some(WorkerWithDpRank::from_worker_id(20)), 200)
+            .await;
         assert!(
             !core.inflight.contains_key(rid),
             "response-started marks prefill, frees, and removes the finished request"
@@ -2258,7 +2525,7 @@ mod tests {
                 .await
                 .unwrap();
             tokio::join!(
-                core.response_started(&rid, Some(20), 200),
+                core.response_started(&rid, Some(WorkerWithDpRank::from_worker_id(20)), 200),
                 core.request_finished(&rid, "complete")
             );
         }
@@ -2351,7 +2618,8 @@ mod tests {
         );
 
         // ResponseStarted binds the session to the selected endpoint.
-        core.response_started("rid-1", Some(WORKER), 200).await;
+        core.response_started("rid-1", Some(WorkerWithDpRank::from_worker_id(WORKER)), 200)
+            .await;
         wait_for_binding(&core, &scheduled.session_id, scheduled.worker.worker_id).await;
 
         // RequestFinished: slot + in-flight entry released.
@@ -2452,8 +2720,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!first.sticky);
-        core.response_started("no-affinity-1", Some(WORKER), 200)
-            .await;
+        core.response_started(
+            "no-affinity-1",
+            Some(WorkerWithDpRank::from_worker_id(WORKER)),
+            200,
+        )
+        .await;
         core.request_finished("no-affinity-1", "complete").await;
         tokio::task::yield_now().await;
         assert_eq!(core.affinity.peek(sid).await.unwrap(), None);
@@ -2500,8 +2772,12 @@ mod tests {
 
         // This request captured the old policy and must still complete its
         // affinity write even though the live ConfigMap policy changed.
-        core.response_started("policy-before-reload", Some(WORKER), 200)
-            .await;
+        core.response_started(
+            "policy-before-reload",
+            Some(WorkerWithDpRank::from_worker_id(WORKER)),
+            200,
+        )
+        .await;
         wait_for_binding(&core, sid, first.worker.worker_id).await;
         core.request_finished("policy-before-reload", "complete")
             .await;
@@ -2759,7 +3035,8 @@ mod tests {
 
         // The endpoint's local router served the request on worker 20 instead
         // of GWP's provisional worker 10.
-        core.response_started("rid-1", Some(20), 200).await;
+        core.response_started("rid-1", Some(WorkerWithDpRank::from_worker_id(20)), 200)
+            .await;
         wait_for_binding(&core, &sid, 20).await;
         let tokens = pseudo_tokens(
             &routing_text(CHAT_PATH, &chat_body()),
@@ -2806,7 +3083,8 @@ mod tests {
         assert!(slot.state.lock().await.booking.is_some());
 
         retire_selected_endpoint(&core);
-        core.response_started(rid, Some(20), 200).await;
+        core.response_started(rid, Some(WorkerWithDpRank::from_worker_id(20)), 200)
+            .await;
 
         let state = slot.state.lock().await;
         assert!(state.response.unwrap().route_retired);
@@ -2839,7 +3117,12 @@ mod tests {
 
         // Even if the denied response reports a different worker, it must not
         // become a confirmed booking or session binding.
-        core.response_started("rid-denied", Some(20), 429).await;
+        core.response_started(
+            "rid-denied",
+            Some(WorkerWithDpRank::from_worker_id(20)),
+            429,
+        )
+        .await;
         assert_eq!(core.inflight_len(), 0);
         assert_eq!(
             core.affinity.peek(&scheduled.session_id).await.unwrap(),
@@ -2884,7 +3167,8 @@ mod tests {
     async fn unknown_rid_and_double_finish_are_noops() {
         let (core, _tx) = make_core(true).await;
         // Must not panic or corrupt state.
-        core.response_started("ghost", Some(10), 200).await;
+        core.response_started("ghost", Some(WorkerWithDpRank::from_worker_id(10)), 200)
+            .await;
         core.request_finished("ghost", "reset").await;
 
         let scheduled = core
@@ -2984,8 +3268,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kimi.endpoint_id, EndpointId("kimi-a".into()));
-        core.response_started("kimi-1", Some(kimi.worker.worker_id), 200)
-            .await;
+        core.response_started(
+            "kimi-1",
+            Some(WorkerWithDpRank::from_worker_id(kimi.worker.worker_id)),
+            200,
+        )
+        .await;
         wait_for_binding(&core, &kimi.session_id, kimi.worker.worker_id).await;
         core.request_finished("kimi-1", "complete").await;
 
@@ -3047,8 +3335,12 @@ mod tests {
         let glm_loads = core.router.potential_loads_for_model(&glm_id, &[]).await;
         assert!(glm_loads.iter().all(|load| load.active_requests == 0));
 
-        core.response_started("kimi-isolated", Some(kimi.worker.worker_id), 200)
-            .await;
+        core.response_started(
+            "kimi-isolated",
+            Some(WorkerWithDpRank::from_worker_id(kimi.worker.worker_id)),
+            200,
+        )
+        .await;
         core.request_finished("kimi-isolated", "complete").await;
         assert!(
             core.router
@@ -3083,8 +3375,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hippa.endpoint_id, EndpointId("glm-a".into()));
-        core.response_started("hippa-1", Some(hippa.worker.worker_id), 200)
-            .await;
+        core.response_started(
+            "hippa-1",
+            Some(WorkerWithDpRank::from_worker_id(hippa.worker.worker_id)),
+            200,
+        )
+        .await;
         wait_for_binding(&core, &sid, hippa.worker.worker_id).await;
         core.request_finished("hippa-1", "complete").await;
 

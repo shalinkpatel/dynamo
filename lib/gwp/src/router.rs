@@ -36,9 +36,10 @@ use std::sync::{Arc, Weak};
 use dashmap::DashMap;
 use dynamo_kv_router::config::{KvRouterConfig, RouterConfigOverride};
 use dynamo_kv_router::indexer::RoutingDecisionHashes;
+#[cfg(test)]
+use dynamo_kv_router::protocols::BlockHashOptions;
 use dynamo_kv_router::protocols::{
-    BlockHashOptions, LocalBlockHash, RoutingConstraints, WorkerId, WorkerWithDpRank,
-    compute_block_hash_for_seq,
+    LocalBlockHash, RoutingConstraints, WorkerId, WorkerWithDpRank, compute_block_hash_for_seq,
 };
 use dynamo_llm::kv_router::{
     ACTIVE_SEQUENCES_SUBJECT, FindBestMatchOutcome, KvRouter,
@@ -90,6 +91,8 @@ fn gwp_kv_router_config(ttl_secs: u64) -> KvRouterConfig {
         router_queue_threshold: None,
         router_replica_sync: true,
         router_temperature: 0.0,
+        host_cache_hit_weight: 1.0,
+        disk_cache_hit_weight: 1.0,
         router_ttl_secs: ttl_secs as f64,
         ..Default::default()
     }
@@ -440,6 +443,82 @@ struct DecisionSync {
     ttl: std::time::Duration,
 }
 
+/// Assemble the same SchedulingRequest the scheduler scores against, with
+/// the two read-only differences: `update_states=false` and no request id.
+fn scoring_request(
+    isl_tokens: usize,
+    cached_by_worker: &HashMap<WorkerWithDpRank, usize>,
+    loads: &[dynamo_kv_router::scheduling::PotentialLoad],
+    allowed_worker_ids: Option<std::collections::HashSet<WorkerId>>,
+    block_size: u32,
+) -> dynamo_kv_router::scheduling::SchedulingRequest {
+    let effective_overlap_blocks = cached_by_worker
+        .iter()
+        .map(|(worker, cached)| (*worker, (*cached as f64) / (block_size.max(1) as f64)))
+        .collect();
+    dynamo_kv_router::scheduling::SchedulingRequest {
+        isl_tokens,
+        allowed_worker_ids,
+        effective_overlap_blocks,
+        effective_cached_tokens: cached_by_worker.clone(),
+        prefill_tokens: loads
+            .iter()
+            .map(|load| (worker_of(load), load.potential_prefill_tokens))
+            .collect(),
+        decode_blocks: loads
+            .iter()
+            .map(|load| (worker_of(load), load.potential_decode_blocks))
+            .collect(),
+        active_requests: loads
+            .iter()
+            .map(|load| (worker_of(load), load.active_requests))
+            .collect(),
+        update_states: false,
+        ..Default::default()
+    }
+}
+
+fn worker_of(load: &dynamo_kv_router::scheduling::PotentialLoad) -> WorkerWithDpRank {
+    WorkerWithDpRank::new(load.worker_id, load.dp_rank)
+}
+
+/// Score every candidate and sort by increasing score, then worker id,
+/// then dp rank for ties.
+fn rank_rows(
+    cached_by_worker: HashMap<WorkerWithDpRank, usize>,
+    worker_configs: &HashMap<WorkerId, dynamo_llm::local_model::runtime_config::ModelRuntimeConfig>,
+    prepared: &crate::scoring::PreparedScoring,
+) -> Vec<RankedCandidate> {
+    let mut ranked: Vec<_> = cached_by_worker
+        .into_iter()
+        .map(|(worker, cached_tokens)| {
+            let score = prepared.score(worker_configs, worker);
+            RankedCandidate {
+                worker,
+                cached_tokens,
+                score: score.logit,
+            }
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // WorkerWithDpRank orders by (worker_id, dp_rank).
+            .then(a.worker.cmp(&b.worker))
+    });
+    ranked
+}
+
+/// One candidate of a read-only bid ranking: the worker, the tokens the
+/// indexer believes are already cached there, and the B10 score (a cost;
+/// lower is better) comparable only within one ranking.
+pub struct RankedCandidate {
+    pub worker: WorkerWithDpRank,
+    pub cached_tokens: usize,
+    pub score: f64,
+}
+
 pub struct GwpRouter {
     kv: KvRouter<GwpWorkerSelector>,
     decision_sync: DecisionSync,
@@ -635,6 +714,85 @@ impl GwpRouter {
         Ok(())
     }
 
+    /// Read-only candidate ranking for the KVLocator bid: every given
+    /// candidate's overlap and load, scored with the same B10 scorer the
+    /// scheduler uses, without booking anything or touching scheduler state
+    /// (`update_states=false`, no request id, no sequence tracking).
+    ///
+    /// Reuses the two read-only queries GWP already has —
+    /// `kv.get_overlap_scores` for the per-worker cached-token estimate and
+    /// `kv.get_potential_loads` for the load view — deliberately costing a
+    /// second indexer scan over a fused one, to keep every line of this in
+    /// dynamo-gwp. shortcut: if the double scan ever matters, the fix is an
+    /// upstream one-scan API proposal, not a fork delta.
+    pub async fn rank_candidates(
+        &self,
+        tokens: &[u32],
+        identity: &crate::tokens::RoutingTokenIdentity,
+        candidates: &std::collections::HashSet<WorkerWithDpRank>,
+        worker_configs: &HashMap<
+            WorkerId,
+            dynamo_llm::local_model::runtime_config::ModelRuntimeConfig,
+        >,
+        policy: ModelStagePolicy,
+    ) -> anyhow::Result<Vec<RankedCandidate>> {
+        let isl_tokens = tokens.len();
+        let override_config = RouterConfigOverride {
+            overlap_score_credit: (!policy.trie).then_some(0.0),
+            ..Default::default()
+        };
+        let worker_ids: Option<std::collections::HashSet<WorkerId>> =
+            Some(candidates.iter().map(|worker| worker.worker_id).collect());
+
+        // The cached-token estimate per candidate, from the same indexer the
+        // scheduler scores against. Workers the indexer has never seen rank
+        // with zero overlap.
+        let mut cached_by_worker: HashMap<WorkerWithDpRank, usize> = HashMap::new();
+        if policy.trie && !tokens.is_empty() {
+            let overlap = self
+                .kv
+                .get_overlap_scores(
+                    tokens,
+                    None,
+                    identity.block_mm_infos.as_deref(),
+                    identity.cache_salt.as_deref(),
+                    false,
+                )
+                .await?;
+            for worker in overlap.workers {
+                let cached = ((worker.router_credit_blocks * overlap.block_size as f64).round()
+                    as usize)
+                    .min(isl_tokens);
+                cached_by_worker.insert(
+                    WorkerWithDpRank::new(worker.worker_id, worker.dp_rank),
+                    cached,
+                );
+            }
+        }
+        let candidates: HashMap<WorkerWithDpRank, usize> = candidates
+            .iter()
+            .map(|worker| (*worker, cached_by_worker.get(worker).copied().unwrap_or(0)))
+            .collect();
+
+        let loads = self
+            .kv
+            .get_potential_loads(
+                tokens,
+                Some(&override_config),
+                identity.block_mm_infos.as_deref(),
+                identity.cache_salt.as_deref(),
+                true,
+            )
+            .await?;
+
+        let mut request =
+            scoring_request(isl_tokens, &candidates, &loads, worker_ids, self.block_size);
+        request.router_config_override = Some(override_config);
+        let scorer = crate::scoring::B10Scorer::new(self.observed_loads.clone());
+        let prepared = scorer.prepare(&request, policy.load_balancing, self.block_size);
+        Ok(rank_rows(candidates, worker_configs, &prepared))
+    }
+
     /// Fall-through decision: score all live workers and provisionally
     /// register the request in the scheduler (`update_states=true` — do NOT
     /// also call `Self::add_request`, that would double-count). The
@@ -749,15 +907,27 @@ impl GwpRouter {
         cached_tokens: usize,
         worker: WorkerWithDpRank,
     ) {
+        self.add_request_with_identity(rid, tokens, &Default::default(), cached_tokens, worker)
+            .await;
+    }
+
+    async fn add_request_with_identity(
+        &self,
+        rid: &str,
+        tokens: &[u32],
+        identity: &crate::tokens::RoutingTokenIdentity,
+        cached_tokens: usize,
+        worker: WorkerWithDpRank,
+    ) {
         self.kv
             .add_request(
                 rid.to_string(),
                 tokens,
-                None,
+                identity.block_mm_infos.as_deref(),
                 cached_tokens.min(tokens.len()),
                 None,
                 worker,
-                None,
+                identity.cache_salt.clone(),
                 None,
             )
             .await;
@@ -773,11 +943,12 @@ impl GwpRouter {
         provisional_rid: &str,
         confirmed_rid: &str,
         tokens: &[u32],
+        identity: &crate::tokens::RoutingTokenIdentity,
         cached_tokens: usize,
         worker: WorkerWithDpRank,
     ) {
         self.free(provisional_rid).await;
-        self.add_request(confirmed_rid, tokens, cached_tokens, worker)
+        self.add_request_with_identity(confirmed_rid, tokens, identity, cached_tokens, worker)
             .await;
     }
 
@@ -788,8 +959,19 @@ impl GwpRouter {
         tokens: &[u32],
         worker: WorkerWithDpRank,
     ) {
+        self.record_routing_decision_with_identity(rid, tokens, &Default::default(), worker)
+            .await;
+    }
+
+    pub async fn record_routing_decision_with_identity(
+        &self,
+        rid: &str,
+        tokens: &[u32],
+        identity: &crate::tokens::RoutingTokenIdentity,
+        worker: WorkerWithDpRank,
+    ) {
         let local_hashes =
-            compute_block_hash_for_seq(tokens, self.block_size, BlockHashOptions::default());
+            compute_block_hash_for_seq(tokens, self.block_size, identity.hash_options());
         if local_hashes.is_empty() {
             return;
         }
@@ -819,6 +1001,57 @@ impl GwpRouter {
             .get_overlap_blocks(tokens, None, worker, None)
             .await
             .unwrap()
+    }
+
+    /// Test view of the scheduler slot count, for pinning that the bid
+    /// ranking books nothing.
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.kv.pending_count()
+    }
+
+    /// Intend + book for the KVLocator lifecycle: provisionally book the
+    /// chosen worker under `rid` with the indexer's cached-token estimate —
+    /// the sticky booking shape (estimate then add_request), no scoring. The
+    /// trie policy matches book_pinned: a model with the trie stage off
+    /// books with zero cached tokens, the way the envoy sticky path does.
+    pub async fn book_attempt(
+        &self,
+        rid: &str,
+        tokens: &[u32],
+        identity: &crate::tokens::RoutingTokenIdentity,
+        worker: WorkerWithDpRank,
+        trie: bool,
+    ) -> usize {
+        let cached_tokens = if trie {
+            self.cached_tokens(tokens, identity, worker).await
+        } else {
+            0
+        };
+        self.add_request_with_identity(rid, tokens, identity, cached_tokens, worker)
+            .await;
+        cached_tokens
+    }
+
+    /// The cached-token estimate for one worker, preserving routing identity.
+    pub async fn cached_tokens(
+        &self,
+        tokens: &[u32],
+        identity: &crate::tokens::RoutingTokenIdentity,
+        worker: WorkerWithDpRank,
+    ) -> usize {
+        (self
+            .kv
+            .get_overlap_blocks(
+                tokens,
+                identity.block_mm_infos.as_deref(),
+                worker,
+                identity.cache_salt.as_deref(),
+            )
+            .await
+            .unwrap_or(0) as usize)
+            .saturating_mul(self.block_size as usize)
+            .min(tokens.len())
     }
 
     /// Upstream response headers: prefill is done, decode load begins.
@@ -909,9 +1142,11 @@ mod tests {
             WorkerWithDpRank::from_worker_id(2),
         );
 
-        // Republish until receipt: discovery and ZMQ's slow-joiner window are async.
+        // Republish until receipt: discovery and ZMQ's slow-joiner window are
+        // async, and the KVLocator lifecycle tests run their own registries
+        // in parallel, so the budget is generous rather than tight.
         let tokens: Vec<u32> = (0..16).collect();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while rb.cached_blocks(&tokens, worker).await == 0 {
                 ra.record_routing_decision("rid-a", &tokens, worker).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -983,8 +1218,12 @@ mod tests {
     }
 
     #[test]
-    fn production_router_enables_replica_sync() {
-        assert!(gwp_kv_router_config(120).router_replica_sync);
+    fn b10_production_router_enables_replica_sync_and_full_cache_tier_credit() {
+        let config = gwp_kv_router_config(120);
+        assert!(config.router_replica_sync);
+        assert_eq!(config.overlap_score_credit, 1.0);
+        assert_eq!(config.host_cache_hit_weight, 1.0);
+        assert_eq!(config.disk_cache_hit_weight, 1.0);
     }
 
     #[test]

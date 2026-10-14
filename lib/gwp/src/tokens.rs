@@ -33,6 +33,25 @@ use serde_json::{Map, Value};
 
 use crate::config::{GwpConfig, ModelTokenizationConfig};
 
+/// Extra identity shared by prefix lookup, booking, and cache confirmation.
+#[derive(Clone, Debug, Default)]
+pub struct RoutingTokenIdentity {
+    pub block_mm_infos: Option<Vec<Option<dynamo_kv_router::protocols::BlockExtraInfo>>>,
+    pub cache_salt: Option<String>,
+}
+
+impl RoutingTokenIdentity {
+    pub fn hash_options(&self) -> dynamo_kv_router::protocols::BlockHashOptions<'_> {
+        dynamo_kv_router::protocols::BlockHashOptions {
+            block_mm_infos: self.block_mm_infos.as_deref(),
+            // GWP's approximate index uses the router's existing hash namespace
+            // for cache salt; native bids do not carry LoRA adapter identities.
+            lora_name: self.cache_salt.as_deref(),
+            ..Default::default()
+        }
+    }
+}
+
 /// Which implementation produced a token vector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tier {

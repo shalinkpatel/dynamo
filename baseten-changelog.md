@@ -2836,6 +2836,16 @@ resets another's baseline; the reflector polls each endpoint on its own cadence
 ending in `/v1`; `api_key` is ascii-validated (CRLF guard) and, when empty,
 client `authorization` is explicitly removed rather than inherited.
 
+Native Locate honors model policy, taint scoring, and MM/cache-salt identity;
+GWP gives all cache tiers full credit through the shared overlap calculation;
+it returns every scored placement without booking ([#1029](https://github.com/basetenlabs/dynamo/pull/1029)).
+Native attempts validate commits, opening metadata, and DP ranks before mutation,
+account decoder load and overlap from validated snapshots and retained routers,
+bind deferred denials before booking, and atomically validate and confirm admission worker/rank pairs ([#1033](https://github.com/basetenlabs/dynamo/pull/1033)).
+
+Native commits and openings are single-use by attempt ID; repeated finishes
+acknowledge without payload comparisons, retaining only accounting context ([#1021](https://github.com/basetenlabs/dynamo/pull/1021)).
+
 The Alyx locator contract is defined alongside the generation messages in
 `lib/b10-client/proto/generation_coordinator.proto`. `KVLocatorService` defines
 `Locate`, `CommitIntend`, `ResponseOpenOutcome`, and `ResponseFinish`, reusing bid,
@@ -2854,8 +2864,8 @@ versions to coexist in one response. A present empty result means no candidates,
 while absence means the version was not returned. Scores are comparable within
 one version's result. `CommitIntend.chosen_placement` selects exactly one version
 to book and preserves the V1 `chosen` field number.
-This adds the schema only; transport exposure and runtime handlers remain to be
-implemented, and existing generation message definitions are unchanged.
+`KVLocatorService` shares GWP's listener, readiness, health, and shutdown;
+Kubernetes exposes 8091 and replica discovery for direct Alyx calls ([#1039](https://github.com/basetenlabs/dynamo/pull/1039)).
 `dynamo_b10_client::protocol` re-exports the generated locator messages, enums, and
 oneof modules so they are available to Rust callers and pass strict dead-code
 checks before runtime integration.

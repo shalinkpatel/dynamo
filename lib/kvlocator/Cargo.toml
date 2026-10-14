@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Baseten. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dynamo-kvlocator"
+description = "KVLocator - the placement and attempt-accounting service Alyx consults (Grid / GWP successor)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[package.metadata.cargo-machete]
+# Referenced by generated messages and service code in OUT_DIR.
+ignored = ["prost", "tonic-prost"]
+
+[lib]
+name = "dynamo_kvlocator"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+prost = "0.14.3"
+tokio = { workspace = true }
+tonic = { version = "0.14.5", features = ["transport"] }
+tonic-prost = "0.14.5"
+
+[build-dependencies]
+tonic-prost-build = "0.14.5"

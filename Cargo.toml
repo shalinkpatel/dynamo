@@ -15,6 +15,7 @@ members = [
     "lib/mocker",
     "lib/kv-router",
     "lib/gwp",
+    "lib/kvlocator",
     "lib/memory",
     "lib/g2direct",
     "lib/kvbm-common",
