@@ -589,7 +589,14 @@ pub fn chat_completion_to_response(
         }
 
         // Handle text content -- also parse <tool_call> blocks from models
-        // that emit tool calls as text (e.g. Qwen3)
+        // that emit tool calls as text (e.g. Qwen3), but only when the
+        // request declared tools the model may call. Without them the
+        // block is plain text, as on chat completions.
+        let tools_callable = params.tools.as_ref().is_some_and(|t| !t.is_empty())
+            && !matches!(
+                params.tool_choice,
+                Some(ToolChoiceParam::Mode(ToolChoiceOptions::None))
+            );
         let content_text = match choice.message.content {
             Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) => Some(text),
             Some(dynamo_protocols::types::ChatCompletionMessageContent::Parts(_)) => {
@@ -603,7 +610,11 @@ pub fn chat_completion_to_response(
         if let Some(content_text) = content_text
             && !content_text.is_empty()
         {
-            let parsed_calls = parse_tool_call_text(&content_text);
+            let parsed_calls = if tools_callable {
+                parse_tool_call_text(&content_text)
+            } else {
+                Vec::new()
+            };
             if !parsed_calls.is_empty() {
                 for (name, arguments) in parsed_calls {
                     let (name, namespace) = resolve_tool_identity(params.tools.as_deref(), &name);
@@ -2364,6 +2375,91 @@ Let me check the weather.
         let text = "Just a regular message with no tool calls.";
         let calls = parse_tool_call_text(text);
         assert!(calls.is_empty());
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_text_tool_call_parsed_only_with_callable_tools() {
+        // MOD2-310: a <tool_call> block in text must stay text unless the
+        // request declared tools and did not set tool_choice=none.
+        let text =
+            r#"<tool_call>{"name": "write_file", "arguments": {"path": "notes.md"}}</tool_call>"#;
+        let convert = |params: &ResponseParams| {
+            let chat_resp = NvCreateChatCompletionResponse {
+                inner: dynamo_protocols::types::CreateChatCompletionResponse {
+                    id: "chatcmpl-xyz".into(),
+                    choices: vec![dynamo_protocols::types::ChatChoice {
+                        index: 0,
+                        message: dynamo_protocols::types::ChatCompletionResponseMessage {
+                            content: Some(
+                                dynamo_protocols::types::ChatCompletionMessageContent::Text(
+                                    text.to_string(),
+                                ),
+                            ),
+                            refusal: None,
+                            tool_calls: None,
+                            role: dynamo_protocols::types::Role::Assistant,
+                            function_call: None,
+                            audio: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                    created: 1_726_000_000,
+                    model: "test-model".into(),
+                    service_tier: None,
+                    system_fingerprint: None,
+                    object: "chat.completion".to_string(),
+                    usage: None,
+                },
+                nvext: None,
+            };
+            chat_completion_to_response(chat_resp, params, None)
+                .unwrap()
+                .inner
+                .output
+        };
+        let as_text = |output: Vec<OutputItem>| match output.as_slice() {
+            [OutputItem::Message(m)] => match &m.content[0] {
+                OutputMessageContent::OutputText(t) => t.text.clone(),
+                _ => panic!("expected output_text"),
+            },
+            other => panic!("expected one message, got {other:?}"),
+        };
+
+        // No tools declared (default params, and an explicit empty list).
+        assert_eq!(as_text(convert(&ResponseParams::default())), text);
+        let empty = ResponseParams {
+            tools: Some(vec![]),
+            ..Default::default()
+        };
+        assert_eq!(as_text(convert(&empty)), text);
+
+        let tool = Tool::Function(FunctionTool {
+            name: "write_file".into(),
+            parameters: None,
+            strict: None,
+            description: None,
+            defer_loading: None,
+        });
+        // Tools declared but tool_choice=none.
+        let none = ResponseParams {
+            tools: Some(vec![tool.clone()]),
+            tool_choice: Some(ToolChoiceParam::Mode(ToolChoiceOptions::None)),
+            ..Default::default()
+        };
+        assert_eq!(as_text(convert(&none)), text);
+
+        // Tools declared: text fallback still produces a function_call.
+        let with_tools = ResponseParams {
+            tools: Some(vec![tool]),
+            ..Default::default()
+        };
+        match convert(&with_tools).as_slice() {
+            [OutputItem::FunctionCall(fc)] => assert_eq!(fc.name, "write_file"),
+            other => panic!("expected one function_call, got {other:?}"),
+        }
     }
 
     #[test]
