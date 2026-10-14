@@ -6,6 +6,8 @@
 //! GWP implements the scorer and attempt lifecycle and serves these handlers
 //! on its existing gRPC listener, using its shared readiness and accounting.
 
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("kvlocator_descriptor");
+
 pub mod pb {
     tonic::include_proto!("dynamo.b10.generation.v1");
 }

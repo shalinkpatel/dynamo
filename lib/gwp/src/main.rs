@@ -39,7 +39,13 @@ async fn main() -> anyhow::Result<()> {
         server_shutdown.clone(),
     ));
     let grpc_graceful = server_shutdown.clone();
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(dynamo_kvlocator::FILE_DESCRIPTOR_SET)
+        .register_encoded_file_descriptor_set(tonic::include_file_descriptor_set!("gwp_descriptor"))
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
     let grpc_served = tonic::transport::Server::builder()
+        .add_service(reflection)
         .add_service(built.kvlocator_service)
         .add_service(built.authorization_service)
         .add_service(built.lifecycle_service)

@@ -57,6 +57,46 @@ tokenization:
       directory: /workspace/lib/gwp/vendored_tokenizers/glm5.2
 ```
 
+## Call GWP with grpcurl
+
+GWP exposes gRPC v1 reflection for native placement, lifecycle, and health on
+port 8091. Use a recent `grpcurl`; no local proto files or generated client are
+needed. For Kubernetes, pin one pod so lifecycle calls use the same replica:
+
+```bash
+kubectl -n gwp port-forward pod/<gwp-pod> 8091:8091
+```
+
+In another terminal:
+
+```bash
+# List services and native placement methods.
+grpcurl -plaintext localhost:8091 list
+grpcurl -plaintext localhost:8091 list dynamo.b10.generation.v1.KVLocatorService
+
+# Inspect a request and print a JSON template.
+grpcurl -plaintext -msg-template localhost:8091 describe dynamo.b10.generation.v1.LocateRequest
+
+# Check whether this replica is ready for placement.
+grpcurl -plaintext -d '{"service":"gwp-readiness"}' localhost:8091 grpc.health.v1.Health/Check
+
+# Read-only placement lookup. Replace model and endpoint with configured IDs.
+grpcurl -plaintext -d '{
+  "modelId": "composer-2-5",
+  "bid": {"tokens": [1, 2, 3, 4], "sessionId": "manual-test"},
+  "eligibleEndpointIds": ["prod-fast"]
+}' localhost:8091 dynamo.b10.generation.v1.KVLocatorService/Locate
+
+# Export the protocol, including imported message definitions, for offline use.
+grpcurl -plaintext -protoset-out /tmp/gwp.protoset localhost:8091 describe dynamo.b10.generation.v1.KVLocatorService
+```
+
+`Locate` needs ready, eligible workers to return candidates; reflection itself
+is available while the process is warming up. `CommitIntend`,
+`ResponseOpenOutcome`, and `ResponseFinish` use the same JSON command pattern;
+inspect their request types with `describe`. These methods change accounting:
+use a fresh attempt UUID per dispatch and the same pod for its lifecycle calls.
+
 ## MCM discovery through Redis
 
 Set `discovery.type: mcm_redis` to use the Redis view already maintained by
