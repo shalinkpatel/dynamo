@@ -101,7 +101,7 @@ async fn build_inner(
     });
 
     let affinity = Arc::new(InstrumentedAffinityStore::new(
-        make_affinity(&initial).await?,
+        make_affinity(&initial, &router).await?,
         router.metrics().clone(),
     ));
     let core = GwpCore::with_tokenizers(router, affinity, topology, config.clone(), tokenizers);
@@ -128,8 +128,17 @@ async fn build_inner(
     })
 }
 
-async fn make_affinity(config: &GwpConfig) -> anyhow::Result<Arc<dyn AffinityStore>> {
+async fn make_affinity(
+    config: &GwpConfig,
+    router: &crate::router::GwpRouterRegistry,
+) -> anyhow::Result<Arc<dyn AffinityStore>> {
     match config.session.resolved_backend()? {
+        SessionBackendConfig::Pubsub => {
+            let ttl = Duration::from_secs(config.session.ttl_secs);
+            let coordinator = router.affinity_coordinator(ttl).await?;
+            tracing::info!("session affinity: pubsub coordinator");
+            Ok(Arc::new(coordinator))
+        }
         SessionBackendConfig::Etcd { endpoints } => {
             #[cfg(feature = "etcd")]
             {

@@ -129,6 +129,8 @@ pub struct PromptHashFallbackConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionBackendConfig {
+    /// Best-effort replica sync over the configured event transport.
+    Pubsub,
     Etcd {
         endpoints: Vec<String>,
     },
@@ -413,6 +415,11 @@ impl GwpConfig {
             "routing.approx_indexer_ttl_secs must be positive"
         );
         match self.session.resolved_backend()? {
+            SessionBackendConfig::Pubsub => anyhow::ensure!(
+                (1..=dynamo_llm::session_affinity::MAX_SESSION_AFFINITY_TTL_SECS)
+                    .contains(&self.session.ttl_secs),
+                "pubsub session TTL must be between 1 and 31536000 seconds"
+            ),
             SessionBackendConfig::Etcd { endpoints } => anyhow::ensure!(
                 !endpoints.is_empty() && endpoints.iter().all(|e| !e.trim().is_empty()),
                 "session.backend etcd endpoints must contain at least one non-empty endpoint"
@@ -789,6 +796,15 @@ impl ConfigStore {
                             next.session.backend = previous.session.backend.clone();
                             next.session.etcd_endpoints = previous.session.etcd_endpoints.clone();
                         }
+                        if previous.session.resolved_backend().ok()
+                            == Some(SessionBackendConfig::Pubsub)
+                            && next.session.ttl_secs != previous.session.ttl_secs
+                        {
+                            tracing::warn!(
+                                "pubsub session.ttl_secs is startup-only; retaining current value"
+                            );
+                            next.session.ttl_secs = previous.session.ttl_secs;
+                        }
                         if let Err(error) = next.validate() {
                             tracing::warn!(%error, "config update conflicts with startup-only settings; retaining current config");
                             continue;
@@ -1036,6 +1052,16 @@ session:
     #[test]
     fn rejects_empty_endpoint_map() {
         assert!(GwpConfig::load_from_str("endpoints: {}").is_err());
+    }
+
+    #[test]
+    fn pubsub_affinity_validates_ttl_without_external_store_config() {
+        let mut config = GwpConfig::load_from_str(SAMPLE).unwrap();
+        config.session.backend = Some(SessionBackendConfig::Pubsub);
+        config.session.etcd_endpoints = None;
+        config.validate().unwrap();
+        config.session.ttl_secs = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -30,8 +30,8 @@ Edit `configmap.yaml` before deployment:
 
 1. Set `data.etcd-endpoints` to the etcd cluster used for GWP replica
    discovery.
-2. Configure `session.backend` as shared etcd or Redis affinity. It is
-   independent of discovery and may use a different service.
+2. Use `session.backend.type: pubsub` for coordinator-backed affinity. Set
+   `data.nats-server` to the NATS Core service; no Redis is needed for affinity.
 3. Set endpoint ingress and planner URLs.
 4. Declare every external model alias under `routes`.
 5. Add dimensioned endpoint `properties` (for example `region: [us]`) when
@@ -40,6 +40,11 @@ Edit `configmap.yaml` before deployment:
    planner/local source weights and scoring terms per canonical model under
    `model_policies.models.<model>.load_balancing` in `gwp.yaml`. Both files are
    hot-reloaded.
+
+Pub-sub affinity is advisory: updates can be dropped and a restarted replica
+starts empty. Successful admissions refresh bindings; reads do not. Worker
+liveness and model eligibility still gate their use. This does not replicate
+attempt accounting or remove the lifecycle replica-affinity requirement above.
 
 The ConfigMap name is stable so mounted `gwp.yaml` and `b10-router.yaml`
 updates are hot-reloaded. Changing endpoint and route references in one update
@@ -102,9 +107,9 @@ replica from service. The 45-second pod termination grace exceeds GWP's
 
 For a self-contained development or proof-of-concept deployment, the
 [`gwp-datastores`](../../helm/charts/gwp-datastores/README.md) Helm chart
-installs one shared Redis, etcd, and NATS instance. These are separate cluster
-services rather than per-GWP sidecars. GWP uses NATS Core for replica events by default. The chart is intentionally
-single-replica and ephemeral; use
+installs etcd and NATS, with optional Redis disabled by default. These are
+separate cluster services rather than per-GWP sidecars. The chart is
+intentionally single-replica and ephemeral; use
 managed, highly available services in production.
 
 ## Metrics scraping

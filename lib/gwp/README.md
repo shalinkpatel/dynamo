@@ -32,7 +32,8 @@ cargo test -p dynamo-gwp --features server,etcd,redis
 ```
 
 Features are opt-in: `server` enables the Tonic entrypoint, while `etcd` and
-`redis` enable the corresponding shared affinity stores. The sidecar image
+`redis` enable legacy shared affinity stores (`redis` also enables MCM discovery).
+The `pubsub` affinity backend needs neither feature for affinity. The sidecar image
 enables all three:
 
 ```console
@@ -116,3 +117,21 @@ metrics. The Redis integration test uses an isolated database:
 DYN_GWP_TEST_REDIS=redis://127.0.0.1:6379/ cargo test -p dynamo-gwp \
   --features server,redis,etcd --lib b10_discovery:: -- --include-ignored
 ```
+
+## Coordinator-backed session affinity
+
+Set `session.backend.type: pubsub` to use Dynamo's `AffinityCoordinator`.
+Confirmed successful placements refresh a local, bounded, TTL-based binding and
+publish it through the existing event transport. Session IDs over 256 bytes are hashed
+to 64-character internal keys; shorter and forwarded IDs remain unchanged. Locate reads do not refresh TTL.
+The configured `session.ttl_secs` is fixed at startup for this backend.
+
+Affinity updates use the same configured ZMQ or NATS transport as scheduler events.
+etcd remains responsible for replica discovery. Redis is unnecessary for affinity;
+MCM discovery, if enabled, still needs its separate Redis view.
+
+Affinity is best effort: updates may be dropped and restarting replicas start with
+empty bindings until new placements arrive. No durable snapshot or distributed
+delete is provided. Existing worker liveness and model eligibility checks still
+apply. Bindings retain worker/rank; optional previous-endpoint migration metrics
+are unavailable. This does not provide cross-replica attempt accounting.

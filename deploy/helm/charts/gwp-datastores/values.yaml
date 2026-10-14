@@ -19,7 +19,7 @@ etcd:
       memory: 2Gi
 
 redis:
-  enabled: true
+  enabled: false
   image:
     repository: redis
     tag: 7.4-alpine

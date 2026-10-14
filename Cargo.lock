@@ -2737,6 +2737,7 @@ dependencies = [
  "async-trait",
  "baseten-configmap",
  "basetenkenizer",
+ "blake3",
  "bytes",
  "chrono",
  "dashmap",

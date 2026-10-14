@@ -6,7 +6,7 @@ kind: ConfigMap
 metadata:
   name: dynamo-gwp
 data:
-  # Router-replica discovery. Session affinity uses Redis (below).
+  # Router-replica discovery. Session affinity uses the event plane below.
   etcd-endpoints: http://gwp-stores-gwp-datastores-etcd.gwp.svc.cluster.local:2379
   # "zmq" (direct pod-to-pod) or "nats" (NATS Core pub-sub).
   event-plane: nats
@@ -40,11 +40,9 @@ data:
       ttl_secs: 1800
       prompt_hash_fallback:
         token_position: 100000
-      # Must use Redis; etcd is reserved for router-replica discovery.
+      # Advisory bindings replicate through the configured event plane.
       backend:
-        type: redis
-        url: redis://gwp-stores-gwp-datastores-redis.gwp.svc.cluster.local:6379/
-        key_prefix: "gwp:affinity:"
+        type: pubsub
     routing:
       pseudo_stride: 4
       block_size: 32

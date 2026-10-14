@@ -2818,6 +2818,9 @@ PR: https://github.com/basetenlabs/dynamo/pull/962.
 
 ## GWP Control Plane (global-routing)
 
+GWP supports coordinator-backed pub-sub affinity; deployment affinity no longer
+requires Redis ([#1040](https://github.com/basetenlabs/dynamo/pull/1040)).
+
 GWP defaults replica events to NATS Core, retaining explicit ZMQ support
 ([#1041](https://github.com/basetenlabs/dynamo/pull/1041)).
 

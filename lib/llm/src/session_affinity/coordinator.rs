@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod b10_confirmed;
+
 use std::{
     sync::{
         Arc, Mutex, OnceLock, Weak,

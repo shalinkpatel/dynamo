@@ -15,12 +15,15 @@
 //! The trait is **async**, diverging from the sync
 //! `dynamo_llm::kv_router::sticky::AffinityStore`: etcd is a network round
 //! trip, and a sync trait would force the async scheduling service to block.
-//! Semantics otherwise mirror the llm trait.
+//! Semantics otherwise mirror the llm trait. The coordinator backend uses local
+//! reads and best-effort pub-sub writes instead of an external datastore.
 //!
 //! Affinity is an optimization, not a correctness requirement. An etcd read
 //! error is therefore treated as an affinity miss and normal routing proceeds;
-//! failed writes are logged and dropped. GWP never invents replica-local
-//! affinity while configured for a shared backend.
+//! failed writes are logged and dropped. The coordinator backend intentionally
+//! uses replica-local state that converges through best-effort updates.
+
+mod coordinator;
 
 use std::fmt::Write;
 use std::future::Future;
@@ -65,7 +68,7 @@ impl AffinityBinding {
 }
 
 /// Trait abstraction over the affinity store. Production GWP uses a shared
-/// etcd or Redis backend; the test-only implementation keeps unit and CI tests
+/// coordinator pub-sub, etcd, or Redis backend; the test-only implementation keeps tests
 /// self-contained.
 ///
 /// Semantics (mirroring `dynamo_llm::kv_router::sticky::AffinityStore`):

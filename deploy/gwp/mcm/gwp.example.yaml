@@ -29,8 +29,7 @@ discovery:
       workload_plane: us-west
 session:
   backend:
-    type: redis
-    url: redis://gwp-affinity.example.internal:6379/
+    type: pubsub
 routing:
   block_size: 32
   planner_staleness_grace_secs: 30

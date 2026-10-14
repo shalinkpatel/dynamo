@@ -174,6 +174,7 @@ pub struct GwpRouterRegistry {
     dormant: DashMap<OracleVersionId, Arc<GwpRouter>>,
     create_lock: tokio::sync::Mutex<()>,
     drt: DistributedRuntime,
+    affinity_workers: watch::Sender<Vec<u64>>,
     metrics: GwpMetrics,
     block_size: u32,
     approx_indexer_ttl_secs: u64,
@@ -218,11 +219,29 @@ impl GwpRouterRegistry {
             dormant: DashMap::new(),
             create_lock: tokio::sync::Mutex::new(()),
             drt,
+            affinity_workers: watch::channel(Vec::new()).0,
             metrics,
             block_size,
             approx_indexer_ttl_secs,
         });
         Ok(registry)
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) async fn affinity_coordinator(
+        &self,
+        ttl: std::time::Duration,
+    ) -> anyhow::Result<dynamo_llm::session_affinity::AffinityCoordinator> {
+        let coordinator = dynamo_llm::session_affinity::AffinityCoordinator::new(ttl)?;
+        let component = self.drt.namespace("gwp")?.component("router")?;
+        coordinator
+            .enable_replica_sync_for_pool(
+                &component,
+                "session_affinity_events",
+                self.affinity_workers.subscribe(),
+            )
+            .await?;
+        Ok(coordinator)
     }
 
     async fn ensure_model(
@@ -328,6 +347,8 @@ impl GwpRouterRegistry {
             }
             router.metrics.replace_scheduler_live_workers(per_endpoint);
         }
+        self.affinity_workers
+            .send_replace(topology.workers.keys().copied().collect());
         Ok(())
     }
 
