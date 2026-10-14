@@ -413,6 +413,9 @@ struct VerificationFailure {
     /// Indices into the run, ascending.
     stale_pages: Vec<usize>,
     total_pages: usize,
+    /// Checksums of the pages before the first stale one, which verified and
+    /// are kept; see [`fetch_runs`].
+    verified_checksums: Vec<u64>,
 }
 
 impl std::fmt::Display for VerificationFailure {
@@ -743,6 +746,9 @@ pub struct HiCacheG2Metrics {
     pub lookup_misses: AtomicU64,
     pub fetched_pages: AtomicU64,
     pub fetched_bytes: AtomicU64,
+    /// Fetched pages this replica then published itself, so peers can read
+    /// them from here too. Also counted in `published_pages`.
+    pub published_pulled_pages: AtomicU64,
     pub fetch_failures: AtomicU64,
     /// Fetches that returned with reads still in flight (handed to the reaper).
     pub unsettled_fetches: AtomicU64,
@@ -842,6 +848,10 @@ impl HiCacheG2Metrics {
             ("lookup_misses", self.lookup_misses.load(Ordering::Relaxed)),
             ("fetched_pages", self.fetched_pages.load(Ordering::Relaxed)),
             ("fetched_bytes", self.fetched_bytes.load(Ordering::Relaxed)),
+            (
+                "published_pulled_pages",
+                self.published_pulled_pages.load(Ordering::Relaxed),
+            ),
             (
                 "fetch_failures",
                 self.fetch_failures.load(Ordering::Relaxed),
@@ -1199,10 +1209,28 @@ impl HiCacheG2State {
             keys.len(),
             pages.len()
         );
+        let checksums = self.checksum_batch(&pages)?;
+        self.publish_checksummed(keys, pages, checksums)
+    }
+
+    /// Record and advertise pages whose checksums the caller already holds:
+    /// hashed just now by `publish`, or verified by the fetch that pulled them.
+    fn publish_checksummed(
+        &self,
+        keys: &[SequenceHash],
+        pages: Vec<HiCachePageSegments>,
+        checksums: Vec<u64>,
+    ) -> Result<Vec<bool>> {
+        anyhow::ensure!(
+            keys.len() == pages.len() && keys.len() == checksums.len(),
+            "HiCache G2 publish got {} keys for {} pages and {} checksums",
+            keys.len(),
+            pages.len(),
+            checksums.len()
+        );
         let mut advertised = Vec::with_capacity(keys.len());
         let mut results = Vec::with_capacity(keys.len());
         let mut entries = Vec::with_capacity(keys.len());
-        let checksums = self.checksum_batch(&pages)?;
         for ((key, segments), checksum) in keys.iter().zip(pages).zip(checksums) {
             let size_bytes = segments.total_bytes();
             entries.push((*key, PublishedPage { segments, checksum }));
@@ -1366,6 +1394,12 @@ impl HiCacheG2State {
         deadline: Instant,
     ) -> Result<u64> {
         anyhow::ensure!(
+            response.checksums.len() == destination.len(),
+            "HiCache G2 peer returned {} checksums for {} pages",
+            response.checksums.len(),
+            destination.len()
+        );
+        anyhow::ensure!(
             response.pages.len() == destination.len(),
             "HiCache G2 peer returned {} pages for {} destinations",
             response.pages.len(),
@@ -1444,12 +1478,6 @@ impl HiCacheG2State {
                  using the pages",
                 response.agent_name
             );
-            anyhow::ensure!(
-                response.checksums.len() == destination.len(),
-                "HiCache G2 peer returned {} checksums for {} pages",
-                response.checksums.len(),
-                destination.len()
-            );
             // Hash what actually landed: the only check that sees a source page
             // the engine recycled between publication and the read, and it also
             // catches a corrupted transfer.
@@ -1494,6 +1522,7 @@ impl HiCacheG2State {
                 return Err(VerificationFailure {
                     source_agent: response.agent_name.clone(),
                     source_instance: response.instance_id,
+                    verified_checksums: response.checksums[..stale_pages[0]].to_vec(),
                     stale_pages,
                     total_pages: destination.len(),
                 }
@@ -2398,6 +2427,9 @@ impl HiCacheG2Direct {
     /// Errs only on malformed arguments, before any read is posted; a peer or
     /// transport failure shortens `completed` instead. The engine relies on
     /// this to treat an error as "nothing was written".
+    ///
+    /// The completed pages are published from this replica before it returns;
+    /// see [`Self::publish_pulled`].
     pub fn fetch(
         &self,
         keys: &[SequenceHash],
@@ -2415,10 +2447,10 @@ impl HiCacheG2Direct {
                 unsettled_ticket: None,
             });
         }
-        // A fetched page is not published, so whatever this replica advertised
-        // at a destination slot would outlive its bytes. Withdraw it before any
-        // read is posted, whether or not the fetch then completes: HiCache has
-        // handed these slots over for new tokens either way.
+        // The slot's previous key must go before any read is posted, whether or
+        // not the fetch then completes: HiCache has handed these slots over for
+        // new tokens either way. A pulled page is published only after its bytes
+        // land and verify (publish_pulled).
         self.state
             .invalidate_slots(destination, &self.state.metrics.invalidated_by_fetch)?;
         let deadline = Instant::now() + self.state.config.lease_ttl;
@@ -2429,10 +2461,8 @@ impl HiCacheG2Direct {
             .map(|(_, len)| *len)
             .sum::<u64>();
         let mut locations = self.query_locations(keys, Some(page_bytes));
-        Ok(fetch_runs(
-            &mut locations,
-            deadline,
-            |instance_id, range| {
+        let FetchedRuns { outcome, checksums } =
+            fetch_runs(&mut locations, deadline, |instance_id, range| {
                 let pool = PeerPoolKey {
                     instance_id,
                     page_bytes,
@@ -2444,7 +2474,7 @@ impl HiCacheG2Direct {
                     deadline,
                 );
                 match &result {
-                    Ok(()) => self.state.record_peer_success(pool),
+                    Ok(_) => self.state.record_peer_success(pool),
                     Err(error) => {
                         self.state
                             .metrics
@@ -2456,8 +2486,70 @@ impl HiCacheG2Direct {
                     }
                 }
                 result
-            },
-        ))
+            });
+        self.publish_pulled(
+            &keys[..outcome.completed],
+            &destination[..outcome.completed],
+            checksums,
+        );
+        Ok(outcome)
+    }
+
+    /// Advertise the pages a fetch pulled, so peers can read them from this
+    /// replica too and not only from the replica that computed them.
+    ///
+    /// Only the completed prefix is passed in: every page in it landed and, with
+    /// destination verification, matched the checksum it was published with,
+    /// which is reused here instead of hashing the page again. A page that
+    /// failed or failed verification ends the prefix (or is re-read from
+    /// another candidate first). Pages under an unsettled ticket are past the
+    /// prefix and are never published, not even once the ticket settles: the
+    /// fetch reported them as misses, so the engine frees them on settlement,
+    /// and the reaper never verified them.
+    ///
+    /// Publishing before `fetch` returns is what makes this sound. Until the
+    /// engine sees the result, nothing can free or rewrite these slots, so the
+    /// entry describes bytes that are there. The engine may free a fetched page
+    /// right afterwards (SGLang drops a prefetched page that duplicates a tree
+    /// node, cut back to the prefix every TP rank fetched, or of an aborted
+    /// request, and buffer mode frees its bounce pages after loading them), so
+    /// the entry can outlive the page, exactly as for a backed-up page the host
+    /// tier evicts. That heals: the slot is next filled either from the GPU,
+    /// whose backup republishes the slot and replaces the entry, or by a fetch
+    /// or L3 load, which withdraws the slot's entry before writing. A peer that
+    /// reads the slot in between receives bytes that fail verification against
+    /// the advertised checksum: a miss, never wrong tokens.
+    ///
+    /// Like `fetch`'s other failures, a failed publication only costs peers a
+    /// hit; it is logged and the fetch still reports its pages.
+    fn publish_pulled(
+        &self,
+        keys: &[SequenceHash],
+        destination: &[HiCachePageSegments],
+        checksums: Vec<u64>,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        match self
+            .state
+            .publish_checksummed(keys, destination.to_vec(), checksums)
+        {
+            Ok(_) => {
+                self.state
+                    .metrics
+                    .published_pulled_pages
+                    .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    pages = keys.len(),
+                    "HiCache G2 could not publish pages it fetched; peers will not read them \
+                     from this replica"
+                );
+            }
+        }
     }
 
     /// Whether the reads left in flight under `ticket` have all reached a
@@ -2475,13 +2567,16 @@ impl HiCacheG2Direct {
     /// spawned on the runtime and bounded by `release_fetch_lease_bounded`;
     /// HiCache's prefetch thread never waits on a stalled source after a
     /// finished transfer.
+    ///
+    /// Returns the checksum each page was published with, which the read
+    /// verified against what landed (unless verification is off).
     fn fetch_run(
         &self,
         instance_id: u64,
         keys: &[SequenceHash],
         destination: &[HiCachePageSegments],
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<Vec<u64>> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(
             !remaining.is_zero(),
@@ -2553,7 +2648,7 @@ impl HiCacheG2Direct {
             .metrics
             .fetched_bytes
             .fetch_add(moved, Ordering::Relaxed);
-        Ok(())
+        Ok(response.checksums)
     }
 
     /// Ask the directory where each key lives, dropping this replica's own
@@ -2678,12 +2773,17 @@ fn without_suspended_candidates(
 /// Terminates: every iteration advances `completed`, halves the run, or removes
 /// a candidate from the first unfinished page. No run starts past `deadline`;
 /// the pages fetched so far are still returned.
+///
+/// `fetch_run` returns the verified checksum of each page of a successful run
+/// (a verification failure carries those of its verified prefix), and the
+/// result holds one per completed page, for publishing them.
 fn fetch_runs(
     locations: &mut [Vec<ReplicaLocation>],
     deadline: Instant,
-    mut fetch_run: impl FnMut(u64, Range<usize>) -> Result<()>,
-) -> HiCacheFetchOutcome {
+    mut fetch_run: impl FnMut(u64, Range<usize>) -> Result<Vec<u64>>,
+) -> FetchedRuns {
     let mut completed = 0usize;
+    let mut checksums = Vec::with_capacity(locations.len());
     let mut run_cap = usize::MAX;
     while completed < locations.len() {
         if Instant::now() >= deadline {
@@ -2711,7 +2811,19 @@ fn fetch_runs(
         }
         let run_len = end - completed;
         match fetch_run(instance_id, completed..end) {
-            Ok(()) => {
+            Ok(run_checksums) => {
+                if run_checksums.len() != run_len {
+                    // Never publish under a checksum that may belong to another
+                    // page; read_from_peer rules this out.
+                    tracing::warn!(
+                        instance_id,
+                        pages = run_len,
+                        checksums = run_checksums.len(),
+                        "HiCache G2 peer run returned the wrong number of checksums"
+                    );
+                    break;
+                }
+                checksums.extend(run_checksums);
                 completed = end;
                 run_cap = usize::MAX;
             }
@@ -2719,9 +2831,12 @@ fn fetch_runs(
                 // The run's destination may still be written: stop here rather
                 // than reading those pages again from another candidate.
                 if let Some(unsettled) = error.downcast_ref::<UnsettledReads>() {
-                    return HiCacheFetchOutcome {
-                        completed,
-                        unsettled_ticket: Some(unsettled.ticket),
+                    return FetchedRuns {
+                        outcome: HiCacheFetchOutcome {
+                            completed,
+                            unsettled_ticket: Some(unsettled.ticket),
+                        },
+                        checksums,
                     };
                 }
                 if let Some(failure) = error.downcast_ref::<VerificationFailure>()
@@ -2741,6 +2856,11 @@ fn fetch_runs(
                         locations[completed + page]
                             .retain(|location| location.source.key.instance_id != instance_id);
                     }
+                    let Some(verified) = failure.verified_checksums.get(..stale_pages[0]) else {
+                        // read_from_peer rules this out; see the Ok arm.
+                        break;
+                    };
+                    checksums.extend_from_slice(verified);
                     completed += stale_pages[0];
                     run_cap = usize::MAX;
                 } else if error.downcast_ref::<UnaddressablePeer>().is_some() {
@@ -2783,10 +2903,21 @@ fn fetch_runs(
             }
         }
     }
-    HiCacheFetchOutcome {
-        completed,
-        unsettled_ticket: None,
+    FetchedRuns {
+        outcome: HiCacheFetchOutcome {
+            completed,
+            unsettled_ticket: None,
+        },
+        checksums,
     }
+}
+
+/// What [`fetch_runs`] did, plus the checksum of each completed page.
+#[derive(Debug, PartialEq, Eq)]
+struct FetchedRuns {
+    outcome: HiCacheFetchOutcome,
+    /// One per completed page, in order: `checksums.len() == outcome.completed`.
+    checksums: Vec<u64>,
 }
 
 fn start_peer_service(component: &Component, state: Arc<HiCacheG2State>) -> Result<()> {
@@ -3345,6 +3476,106 @@ mod tests {
         assert!(HiCachePageSegments::split_flat(&[1, 2, 3], &[1, 2, 3], 2).is_err());
     }
 
+    #[test]
+    fn a_page_pulled_into_a_slot_replaces_what_the_slot_advertised() {
+        let mut index = PublishedIndex::default();
+        assert_eq!(index.insert(1, page(0x1000)), None);
+        // A fetch read key 2 into the same slot and publishes it with the
+        // checksum it verified.
+        let pulled = PublishedPage {
+            checksum: 0xfeed,
+            ..page(0x1000)
+        };
+        assert_eq!(index.insert(2, pulled.clone()), Some(1));
+        assert!(index.get(&1).is_none());
+        assert_eq!(index.get(&2), Some(&pulled));
+    }
+
+    #[test]
+    fn published_pulled_pages_is_exported() {
+        let metrics = HiCacheG2Metrics::default();
+        metrics
+            .published_pulled_pages
+            .fetch_add(3, Ordering::Relaxed);
+        assert!(metrics.snapshot().contains(&("published_pulled_pages", 3)));
+    }
+
+    /// Stand-in verified checksums: `instance_id * 100 + page`.
+    fn sums(instance_id: u64, range: Range<usize>) -> Vec<u64> {
+        range.map(|page| instance_id * 100 + page as u64).collect()
+    }
+
+    #[test]
+    fn every_completed_page_carries_the_checksum_its_run_verified() {
+        let mut locations = vec![
+            vec![location(7, 0)],
+            vec![location(7, 1)],
+            vec![location(9, 2)],
+        ];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            Ok(sums(instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 3);
+        assert_eq!(fetched.checksums, vec![700, 701, 902]);
+    }
+
+    #[test]
+    fn pages_that_failed_or_have_no_candidate_are_not_in_the_published_prefix() {
+        let mut locations = vec![
+            vec![location(7, 0)],
+            vec![location(9, 1)],
+            vec![location(7, 2)],
+        ];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            anyhow::ensure!(instance_id != 9, "transfer failed");
+            Ok(sums(instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 1);
+        assert_eq!(fetched.checksums, vec![700]);
+    }
+
+    #[test]
+    fn only_the_prefix_before_an_unsettled_run_is_published() {
+        let mut locations = vec![
+            vec![location(7, 0)],
+            vec![location(7, 1)],
+            vec![location(9, 2)],
+            vec![location(9, 3)],
+        ];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            if instance_id == 9 {
+                return Err(UnsettledReads { ticket: 4 }.into());
+            }
+            Ok(sums(instance_id, range))
+        });
+        // Pages 2 and 3 may still be written and the engine counts them as
+        // misses: no checksum, so they are never published.
+        assert_eq!(
+            fetched,
+            FetchedRuns {
+                outcome: HiCacheFetchOutcome {
+                    completed: 2,
+                    unsettled_ticket: Some(4),
+                },
+                checksums: vec![700, 701],
+            }
+        );
+    }
+
+    #[test]
+    fn a_run_with_the_wrong_number_of_checksums_ends_the_prefix() {
+        let mut locations = vec![vec![location(7, 0)], vec![location(9, 1)]];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            Ok(if instance_id == 9 {
+                Vec::new()
+            } else {
+                sums(instance_id, range)
+            })
+        });
+        assert_eq!(fetched.outcome.completed, 1);
+        assert_eq!(fetched.checksums, vec![700]);
+    }
+
     fn location(instance_id: u64, key: SequenceHash) -> ReplicaLocation {
         ReplicaLocation {
             source: ReplicaSource {
@@ -3398,9 +3629,10 @@ mod tests {
         .0;
         let mut calls = Vec::new();
         let completed = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
-            calls.push((instance_id, range));
-            Ok(())
+            calls.push((instance_id, range.clone()));
+            Ok(sums(instance_id, range))
         })
+        .outcome
         .completed;
         assert_eq!(completed, 1);
         assert_eq!(calls, vec![(7, 0..1)]);
@@ -3413,8 +3645,9 @@ mod tests {
         let completed = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
             calls.push((instance_id, range.clone()));
             anyhow::ensure!(instance_id != 7 || !range.contains(&1), "stale tail");
-            Ok(())
+            Ok(sums(instance_id, range))
         })
+        .outcome
         .completed;
         assert_eq!(completed, 2);
         assert_eq!(calls, vec![(7, 0..2), (7, 0..1), (7, 1..2), (9, 1..2)]);
@@ -3427,7 +3660,7 @@ mod tests {
             .map(|key| vec![location(7, key), location(9, key)])
             .collect();
         let mut calls = Vec::new();
-        let completed = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
             calls.push((instance_id, range.clone()));
             if instance_id == 7 {
                 return Err(VerificationFailure {
@@ -3435,13 +3668,16 @@ mod tests {
                     source_instance: 7,
                     stale_pages: vec![1],
                     total_pages: 4,
+                    verified_checksums: sums(7, 0..1),
                 }
                 .into());
             }
-            Ok(())
-        })
-        .completed;
-        assert_eq!(completed, 4);
+            Ok(sums(instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 4);
+        // The verified page keeps the checksum it was read with; the stale ones
+        // take those of the candidate that served them.
+        assert_eq!(fetched.checksums, vec![700, 901, 902, 903]);
         assert_eq!(calls, vec![(7, 0..4), (9, 1..4)]);
         assert_eq!(
             locations.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -3459,8 +3695,9 @@ mod tests {
         let completed = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
             assert!(range.start < 2);
             anyhow::ensure!(instance_id != 7, "peer unavailable");
-            Ok(())
+            Ok(sums(instance_id, range))
         })
+        .outcome
         .completed;
         assert_eq!(completed, 1);
         assert!(locations[1].is_empty());
@@ -3472,7 +3709,8 @@ mod tests {
         assert_eq!(
             fetch_runs(&mut locations, Instant::now(), |_, _| panic!(
                 "deadline passed"
-            )),
+            ))
+            .outcome,
             HiCacheFetchOutcome {
                 completed: 0,
                 unsettled_ticket: None,
@@ -3496,8 +3734,9 @@ mod tests {
                 }
                 .into());
             }
-            Ok(())
+            Ok(sums(instance_id, range))
         })
+        .outcome
         .completed;
         assert_eq!(completed, 4);
         assert_eq!(calls, vec![(7, 0..4), (9, 0..4)]);
@@ -3619,13 +3858,16 @@ mod tests {
             if std::mem::take(&mut first) {
                 return Err(UnsettledReads { ticket: 5 }.into());
             }
-            Ok(())
+            Ok(sums(instance_id, range))
         });
         assert_eq!(
             outcome,
-            HiCacheFetchOutcome {
-                completed: 0,
-                unsettled_ticket: Some(5),
+            FetchedRuns {
+                outcome: HiCacheFetchOutcome {
+                    completed: 0,
+                    unsettled_ticket: Some(5),
+                },
+                checksums: vec![],
             }
         );
         // No second read into the pages the first one may still be writing.

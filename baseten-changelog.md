@@ -2749,6 +2749,7 @@ Source commits:
 - fix(g2direct): purge directory entries of peers that leave discovery
 - fix(g2direct): unique NIXL agent names; suspend peer pools readers cannot address
 - fix(g2direct): drop index entries for host slots refilled by a fetch
+- feat(g2direct): publish pages a replica pulls from peers
 
 Purpose:
 
@@ -2774,7 +2775,11 @@ republish replaces it, and `fetch` withdraws it (locally and from the replica
 index) before posting reads into the slot. `invalidate_slots(ptrs, sizes,
 ptrs_per_page)` does the same for slots the adapter refills from L3; without it
 peers leased slots that had been refilled and failed verification
-(`invalidated_by_fetch` / `invalidated_by_caller` count the withdrawals). The SGLang adapter, the deferred host release
+(`invalidated_by_fetch` / `invalidated_by_caller` count the withdrawals).
+A page a fetch pulls from a peer is published from the puller too, before the
+fetch returns, with the checksum it verified (counted in
+`published_pulled_pages`). Pages under an unsettled ticket are misses and are
+never published. The SGLang adapter, the deferred host release
 patch, and MLA host dedup live in the monorepo.
 
 Shared pieces outside the crates: `dynamo-memory` registration chunking
