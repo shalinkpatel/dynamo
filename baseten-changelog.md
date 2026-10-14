@@ -1871,6 +1871,9 @@ carry the client's auth to Alyx. When replaying, keep the capture in the OpenAI
 context builder (`context_from_headers_with_body_session`) and the Anthropic
 messages handler together with the `.direct()` drop.
 
+Emit resolved sessions as `X-Session-Affinity` on native coordinator requests
+only when present ([#1036](https://github.com/basetenlabs/dynamo/pull/1036)).
+
 Frontend serves `/v1/coordinate`:
 
 A started local-mode `GenerationCoordinatorRuntime` registers its coordinate route

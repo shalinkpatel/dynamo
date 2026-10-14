@@ -81,7 +81,7 @@ impl RemoteGenerationCoordinator {
     ) -> Result<GenerationOutcome> {
         validate_remote_options(&options)?;
         let mut wire_request = encode_request(&context, request)?;
-        let headers = forwarded_headers::take(&mut wire_request.metadata)?;
+        let mut headers = forwarded_headers::take(&mut wire_request.metadata)?;
         let request_context = context.inner();
         let session = wire_request
             .metadata
@@ -94,6 +94,9 @@ impl RemoteGenerationCoordinator {
                     .as_ref()
                     .and_then(|routing| routing.session_id.as_deref())
             });
+        if let Some(session_id) = session {
+            headers.insert("x-session-affinity", session_id.parse()?);
+        }
         let (endpoint, affinity) = match &self.endpoints {
             RemoteEndpoints::Pool(pool) => {
                 let bid = protocol::BidRequestV1 {
@@ -381,7 +384,7 @@ mod tests {
     use axum::Router;
     use axum::body::{Body, Bytes};
     use axum::extract::State;
-    use axum::http::{Response, StatusCode, header};
+    use axum::http::{HeaderMap, Response, StatusCode, header};
     use axum::routing::post;
     use dynamo_kv_router::protocols::{BlockExtraInfo, BlockMmObjectInfo, RoutingConstraints};
     use dynamo_runtime::logging::DistributedTraceContext;
@@ -394,14 +397,18 @@ mod tests {
 
     #[derive(Clone)]
     struct TestServerState {
-        captured: Arc<Mutex<Option<NewRequestV1>>>,
+        captured: Arc<Mutex<Option<(NewRequestV1, HeaderMap)>>>,
         response: Vec<u8>,
     }
 
-    async fn coordinate(State(state): State<TestServerState>, body: Bytes) -> Response<Body> {
+    async fn coordinate(
+        State(state): State<TestServerState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response<Body> {
         let request = NewRequestV1::decode(body).expect("valid request protobuf");
         protocol::validate_request(&request).expect("semantically valid request");
-        *state.captured.lock().unwrap() = Some(request);
+        *state.captured.lock().unwrap() = Some((request, headers));
 
         // Deliberately split both the frame header and payload. This exercises
         // the real streaming decoder rather than relying on HTTP chunk boundaries.
@@ -426,6 +433,12 @@ mod tests {
 
     #[tokio::test]
     async fn remote_client_sends_typed_request_and_streams_framed_response() {
+        for session_id in [Some("session-a"), None] {
+            b10_remote_client_roundtrip(session_id).await;
+        }
+    }
+
+    async fn b10_remote_client_roundtrip(session_id: Option<&str>) {
         let first_chunk = Annotated::from_data(value(serde_json::json!({"token": 17})));
         let second_chunk = Annotated::from_data(value(serde_json::json!({"finish": true})));
         let frames = [
@@ -496,7 +509,7 @@ mod tests {
             "cache_salt": "salt-a",
             "priority": -4,
             "service_tier": "priority",
-            "user": "session-a",
+            "user": session_id,
             "mm_args": {
                 "mm_kwargs": ["image-kwargs"],
                 "media_token_id": 32000,
@@ -555,7 +568,13 @@ mod tests {
         );
         assert!(generated.stream.next().await.is_none());
 
-        let captured = captured.lock().unwrap().take().unwrap();
+        let (captured, headers) = captured.lock().unwrap().take().unwrap();
+        assert_eq!(
+            headers
+                .get("x-session-affinity")
+                .map(|value| value.to_str().unwrap()),
+            session_id
+        );
         assert_eq!(captured.request_id, "request-123");
         assert_eq!(
             captured
@@ -576,7 +595,7 @@ mod tests {
         assert_eq!(request.tokens, vec![1, 2, 3, 4]);
         assert_eq!(worker["lora"].as_str(), Some("adapter-a"));
         let routing = request.routing.unwrap();
-        assert_eq!(routing.session_id.as_deref(), Some("session-a"));
+        assert_eq!(routing.session_id.as_deref(), session_id);
         assert!(routing.do_not_queue);
         assert_eq!(routing.allowed_worker_ids, vec![5, 7]);
         assert_eq!(request.mm_routing_args.unwrap().blocks.len(), 2);
