@@ -155,6 +155,36 @@ impl HiCachePageSegments {
     pub fn total_bytes(&self) -> u64 {
         self.segments.iter().map(|(_, len)| *len).sum()
     }
+
+    /// Split a flat `(ptrs, sizes)` pair, as SGLang's `get_page_buffer_meta`
+    /// returns it, into one descriptor per page of `ptrs_per_page` segments.
+    /// `publish`, `fetch` and `invalidate_slots` all describe a host slot this
+    /// way, which is what lets the published index match a slot across them.
+    pub fn split_flat(ptrs: &[u64], sizes: &[u64], ptrs_per_page: usize) -> Result<Vec<Self>> {
+        anyhow::ensure!(ptrs_per_page != 0, "segments per page must be positive");
+        anyhow::ensure!(
+            ptrs.len() == sizes.len(),
+            "got {} pointers and {} sizes",
+            ptrs.len(),
+            sizes.len()
+        );
+        anyhow::ensure!(
+            ptrs.len().is_multiple_of(ptrs_per_page),
+            "{} pointers is not a multiple of {ptrs_per_page} segments per page",
+            ptrs.len()
+        );
+        Ok(ptrs
+            .chunks(ptrs_per_page)
+            .zip(sizes.chunks(ptrs_per_page))
+            .map(|(page_ptrs, page_sizes)| Self {
+                segments: page_ptrs
+                    .iter()
+                    .copied()
+                    .zip(page_sizes.iter().copied())
+                    .collect(),
+            })
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -573,10 +603,20 @@ struct PublishedPage {
 
 /// This replica's advertised pages, indexed by key and by host slot.
 ///
-/// The reverse map is what keeps the index from filling with dead keys: HiCache
-/// reuses a host slot for new tokens without telling this backend, so the next
-/// `publish` of that slot is the only signal that its previous key is gone.
-/// Same pattern as `PeerServingState::prepare` for the KVBM host tier.
+/// A slot is identified by its full segment list, exactly as `publish`, `fetch`
+/// and `invalidate_slots` describe it (see [`HiCachePageSegments::split_flat`]).
+/// Each slot names at most one key, and the entry is kept in step with what the
+/// slot holds:
+/// - republishing a slot under another key replaces its entry;
+/// - refilling it by a peer `fetch` removes its entry before any read is posted
+///   into it, since a fetched page is not published;
+/// - refilling it with bytes that do not come through this backend (an L3
+///   load) removes its entry when the caller first calls `invalidate_slots`;
+/// - `unpublish` removes the entry for a key.
+///
+/// HiCache reuses a host slot without telling this backend, so these are the
+/// only signals that a slot's previous key is gone. Same pattern as
+/// `PeerServingState::prepare` for the KVBM host tier.
 #[derive(Default)]
 struct PublishedIndex {
     by_key: HashMap<SequenceHash, PublishedPage>,
@@ -616,6 +656,43 @@ impl PublishedIndex {
     fn get(&self, key: &SequenceHash) -> Option<&PublishedPage> {
         self.by_key.get(key)
     }
+
+    /// Drop whatever key each of `slots` holds, because the slot is about to be
+    /// overwritten. Returns the removed keys, which must leave the replica index.
+    fn remove_slots(&mut self, slots: &[HiCachePageSegments]) -> Vec<SequenceHash> {
+        let mut removed = Vec::new();
+        for slot in slots {
+            if let Some(key) = self.by_slot.remove(slot) {
+                // `insert` keeps `by_key[key]` pointing at this slot whenever
+                // `by_slot[slot] == key`, so the key goes with the slot.
+                self.by_key.remove(&key);
+                removed.push(key);
+            }
+        }
+        removed
+    }
+}
+
+/// Remove the keys `published` holds at `slots`, count them on `counter`, and
+/// hand them to `withdraw` (the replica-index removal) when there are any.
+/// The local removal finishes before `withdraw` runs and before this returns,
+/// i.e. before the caller writes into the slots.
+fn withdraw_slots(
+    published: &Mutex<PublishedIndex>,
+    slots: &[HiCachePageSegments],
+    counter: &AtomicU64,
+    withdraw: impl FnOnce(Vec<SequenceHash>),
+) -> Result<usize> {
+    let removed = published
+        .lock()
+        .map_err(|_| anyhow::anyhow!("HiCache G2 published map poisoned"))?
+        .remove_slots(slots);
+    let count = removed.len();
+    if count != 0 {
+        counter.fetch_add(count as u64, Ordering::Relaxed);
+        withdraw(removed);
+    }
+    Ok(count)
 }
 
 /// Quarantine accounting for reads that outlive their deadline, in NIXL chunks
@@ -657,6 +734,11 @@ pub struct HiCacheG2Metrics {
     pub unpublished_pages: AtomicU64,
     /// Keys dropped because their host slot was republished under another key.
     pub evicted_by_republish: AtomicU64,
+    /// Keys dropped because a peer fetch was about to write into their slot.
+    pub invalidated_by_fetch: AtomicU64,
+    /// Keys dropped by `invalidate_slots`: the engine was about to fill their
+    /// slot with bytes from outside this backend (an L3 load).
+    pub invalidated_by_caller: AtomicU64,
     pub lookup_hits: AtomicU64,
     pub lookup_misses: AtomicU64,
     pub fetched_pages: AtomicU64,
@@ -731,6 +813,14 @@ impl HiCacheG2Metrics {
             (
                 "evicted_by_republish",
                 self.evicted_by_republish.load(Ordering::Relaxed),
+            ),
+            (
+                "invalidated_by_fetch",
+                self.invalidated_by_fetch.load(Ordering::Relaxed),
+            ),
+            (
+                "invalidated_by_caller",
+                self.invalidated_by_caller.load(Ordering::Relaxed),
             ),
             (
                 "dead_source_candidates",
@@ -1190,6 +1280,26 @@ impl HiCacheG2State {
             .fetch_add(removed.len() as u64, Ordering::Relaxed);
         self.advertise("removal", self.publisher.remove(removed));
         Ok(())
+    }
+
+    /// Withdraw every key advertised at one of `slots`, locally and from the
+    /// replica index, ahead of the slots being overwritten. Returns how many
+    /// keys were withdrawn and adds that to `counter`.
+    ///
+    /// The local removal is synchronous, so from here on `serve_fetch` no longer
+    /// leases these keys. The replica-index removal is queued to the publisher
+    /// and reaches peers asynchronously; until it does, a peer can still pick
+    /// this replica as a candidate, and its lease fails. A lease granted before
+    /// this call keeps its snapshot (see `unpublish`), so its read can race the
+    /// overwrite; destination verification rejects what it gets.
+    fn invalidate_slots(
+        &self,
+        slots: &[HiCachePageSegments],
+        counter: &AtomicU64,
+    ) -> Result<usize> {
+        withdraw_slots(&self.published, slots, counter, |keys| {
+            self.advertise("removal", self.publisher.remove(keys))
+        })
     }
 
     /// Answer a peer's fetch: lease the pages and hand back this agent's
@@ -2205,6 +2315,23 @@ impl HiCacheG2Direct {
         self.state.unpublish(keys)
     }
 
+    /// Withdraw whatever this replica advertises at the given host slots, before
+    /// the engine overwrites them with bytes that do not come through this
+    /// backend (an L3 load). Slots are described as for `publish`/`fetch`: a
+    /// flat `(ptrs, sizes)` pair with `ptrs_per_page` segments per page. Returns
+    /// the number of index entries removed. `fetch` does this itself for its
+    /// destination pages.
+    pub fn invalidate_slots(
+        &self,
+        ptrs: &[u64],
+        sizes: &[u64],
+        ptrs_per_page: usize,
+    ) -> Result<usize> {
+        let slots = HiCachePageSegments::split_flat(ptrs, sizes, ptrs_per_page)?;
+        self.state
+            .invalidate_slots(&slots, &self.state.metrics.invalidated_by_caller)
+    }
+
     /// Which of `keys` some *other* replica advertises, key by key.
     ///
     /// The hybrid pools need this rather than a prefix: a `TRAILING_PAGES` pool
@@ -2288,6 +2415,12 @@ impl HiCacheG2Direct {
                 unsettled_ticket: None,
             });
         }
+        // A fetched page is not published, so whatever this replica advertised
+        // at a destination slot would outlive its bytes. Withdraw it before any
+        // read is posted, whether or not the fetch then completes: HiCache has
+        // handed these slots over for new tokens either way.
+        self.state
+            .invalidate_slots(destination, &self.state.metrics.invalidated_by_fetch)?;
         let deadline = Instant::now() + self.state.config.lease_ttl;
         // Every page of one fetch belongs to the same engine pool.
         let page_bytes = destination[0]
@@ -3086,6 +3219,130 @@ mod tests {
         assert!(index.remove(&3).is_some());
         assert!(index.by_key.is_empty());
         assert!(index.by_slot.is_empty());
+    }
+
+    fn slot(segments: &[(u64, u64)]) -> HiCachePageSegments {
+        HiCachePageSegments {
+            segments: segments.to_vec(),
+        }
+    }
+
+    fn published_at(segments: &[(u64, u64)]) -> PublishedPage {
+        PublishedPage {
+            segments: slot(segments),
+            checksum: 1,
+        }
+    }
+
+    #[test]
+    fn remove_slots_drops_only_the_keys_at_destination_slots() {
+        let mut index = PublishedIndex::default();
+        index.insert(1, page(0x1000));
+        index.insert(2, page(0x2000));
+        index.insert(3, page(0x3000));
+        let mut removed = index.remove_slots(&[page(0x1000).segments, page(0x3000).segments]);
+        removed.sort_unstable();
+        assert_eq!(removed, vec![1, 3]);
+        assert!(index.get(&1).is_none());
+        assert!(index.get(&3).is_none());
+        // The unrelated slot is untouched.
+        assert_eq!(index.get(&2), Some(&page(0x2000)));
+        assert_eq!(index.by_slot.len(), 1);
+        assert_eq!(index.by_key.len(), 1);
+        // Slots that hold nothing, and slots already invalidated, are no-ops.
+        assert!(
+            index
+                .remove_slots(&[page(0x1000).segments, page(0x4000).segments])
+                .is_empty()
+        );
+        // A slot refilled by a fetch and later republished is advertised again.
+        assert_eq!(index.insert(4, page(0x1000)), None);
+        assert_eq!(index.get(&4), Some(&page(0x1000)));
+    }
+
+    #[test]
+    fn remove_slots_matches_multi_segment_pages_by_whole_slot() {
+        let mut index = PublishedIndex::default();
+        // Split k/v pool: one k and one v segment per page.
+        let kv_a = [(0x1_0000, 64), (0x9_0000, 64)];
+        let kv_b = [(0x1_0040, 64), (0x9_0040, 64)];
+        index.insert(1, published_at(&kv_a));
+        index.insert(2, published_at(&kv_b));
+        // The same slot description as `publish` used is matched.
+        assert_eq!(index.remove_slots(&[slot(&kv_a)]), vec![1]);
+        assert!(index.get(&1).is_none());
+        assert_eq!(index.get(&2), Some(&published_at(&kv_b)));
+        // A key that moved slots is only removed by its current slot.
+        let kv_c = [(0x1_0080, 64), (0x9_0080, 64)];
+        index.insert(2, published_at(&kv_c));
+        assert!(index.remove_slots(&[slot(&kv_b)]).is_empty());
+        assert_eq!(index.remove_slots(&[slot(&kv_c)]), vec![2]);
+        assert!(index.by_key.is_empty());
+        assert!(index.by_slot.is_empty());
+    }
+
+    #[test]
+    fn withdraw_slots_counts_and_withdraws_from_the_replica_index() {
+        let published = Mutex::new(PublishedIndex::default());
+        {
+            let mut index = published.lock().unwrap();
+            index.insert(1, page(0x1000));
+            index.insert(2, page(0x2000));
+        }
+        let metrics = HiCacheG2Metrics::default();
+        let mut withdrawn = Vec::new();
+        let count = withdraw_slots(
+            &published,
+            &[page(0x1000).segments, page(0x5000).segments],
+            &metrics.invalidated_by_fetch,
+            |keys| withdrawn.extend(keys),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(withdrawn, vec![1]);
+        assert!(published.lock().unwrap().get(&1).is_none());
+        assert!(published.lock().unwrap().get(&2).is_some());
+
+        // Nothing removed: nothing counted and nothing sent to the index.
+        let count = withdraw_slots(
+            &published,
+            &[page(0x1000).segments],
+            &metrics.invalidated_by_caller,
+            |_| panic!("no key to withdraw"),
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+
+        let count = withdraw_slots(
+            &published,
+            &[page(0x2000).segments],
+            &metrics.invalidated_by_caller,
+            |keys| withdrawn.extend(keys),
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(withdrawn, vec![1, 2]);
+
+        let snapshot = metrics.snapshot().into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(snapshot["invalidated_by_fetch"], 1);
+        assert_eq!(snapshot["invalidated_by_caller"], 1);
+    }
+
+    #[test]
+    fn split_flat_groups_pointers_into_pages() {
+        let pages = HiCachePageSegments::split_flat(&[1, 2, 3, 4], &[10, 20, 30, 40], 2).unwrap();
+        assert_eq!(
+            pages,
+            vec![slot(&[(1, 10), (2, 20)]), slot(&[(3, 30), (4, 40)])]
+        );
+        assert!(
+            HiCachePageSegments::split_flat(&[], &[], 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(HiCachePageSegments::split_flat(&[1], &[10], 0).is_err());
+        assert!(HiCachePageSegments::split_flat(&[1, 2], &[10], 1).is_err());
+        assert!(HiCachePageSegments::split_flat(&[1, 2, 3], &[1, 2, 3], 2).is_err());
     }
 
     fn location(instance_id: u64, key: SequenceHash) -> ReplicaLocation {

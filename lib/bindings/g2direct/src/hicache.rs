@@ -34,33 +34,8 @@ fn page_segments(
     sizes: &[u64],
     segments_per_page: usize,
 ) -> PyResult<Vec<HiCachePageSegments>> {
-    if segments_per_page == 0 {
-        return Err(PyValueError::new_err("segments_per_page must be positive"));
-    }
-    if ptrs.len() != sizes.len() {
-        return Err(PyValueError::new_err(format!(
-            "got {} pointers and {} sizes",
-            ptrs.len(),
-            sizes.len()
-        )));
-    }
-    if !ptrs.len().is_multiple_of(segments_per_page) {
-        return Err(PyValueError::new_err(format!(
-            "{} pointers is not a multiple of {segments_per_page} segments per page",
-            ptrs.len()
-        )));
-    }
-    Ok(ptrs
-        .chunks(segments_per_page)
-        .zip(sizes.chunks(segments_per_page))
-        .map(|(page_ptrs, page_sizes)| HiCachePageSegments {
-            segments: page_ptrs
-                .iter()
-                .copied()
-                .zip(page_sizes.iter().copied())
-                .collect(),
-        })
-        .collect())
+    HiCachePageSegments::split_flat(ptrs, sizes, segments_per_page)
+        .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
 #[pyclass(name = "HiCacheG2Direct")]
@@ -174,6 +149,23 @@ impl PyHiCacheG2Direct {
     fn unpublish(&self, py: Python<'_>, page_hashes: Vec<String>) -> PyResult<()> {
         let keys = self.keys(&page_hashes);
         py.allow_threads(|| self.inner.unpublish(&keys))
+            .map_err(to_pyerr)
+    }
+
+    /// Withdraw whatever this replica advertises at the given host slots. Call
+    /// it before writing bytes that do not come through G2Direct (an L3 load)
+    /// into host slots; `fetch` does this itself. Slots are described as for
+    /// `publish`. Returns the number of index entries removed.
+    fn invalidate_slots(
+        &self,
+        py: Python<'_>,
+        ptrs: Vec<u64>,
+        sizes: Vec<u64>,
+        ptrs_per_page: usize,
+    ) -> PyResult<usize> {
+        // Validate here so malformed arguments raise ValueError, as for `publish`.
+        page_segments(&ptrs, &sizes, ptrs_per_page)?;
+        py.allow_threads(|| self.inner.invalidate_slots(&ptrs, &sizes, ptrs_per_page))
             .map_err(to_pyerr)
     }
 

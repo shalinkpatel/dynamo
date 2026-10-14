@@ -2748,6 +2748,7 @@ Source commits:
   resiliency fixes from #958.
 - fix(g2direct): purge directory entries of peers that leave discovery
 - fix(g2direct): unique NIXL agent names; suspend peer pools readers cannot address
+- fix(g2direct): drop index entries for host slots refilled by a fetch
 
 Purpose:
 
@@ -2767,7 +2768,13 @@ is imported over the one NIXL holds and never invalidated at runtime
 (invalidating disconnects UCX endpoints still in use). Readers count
 unaddressable failures per (peer, page size): after 3 they re-import the map,
 after 6 they suspend that pool with 30 s to 10 min backoff and skip it in
-lookups and fetches. `DYN_HICACHE_G2_TEST_FREEZE_METADATA_RANK` is test only. The SGLang adapter, the deferred host release
+lookups and fetches. `DYN_HICACHE_G2_TEST_FREEZE_METADATA_RANK` is test only.
+A replica's advertisement for a host slot follows the slot's contents: a
+republish replaces it, and `fetch` withdraws it (locally and from the replica
+index) before posting reads into the slot. `invalidate_slots(ptrs, sizes,
+ptrs_per_page)` does the same for slots the adapter refills from L3; without it
+peers leased slots that had been refilled and failed verification
+(`invalidated_by_fetch` / `invalidated_by_caller` count the withdrawals). The SGLang adapter, the deferred host release
 patch, and MLA host dedup live in the monorepo.
 
 Shared pieces outside the crates: `dynamo-memory` registration chunking

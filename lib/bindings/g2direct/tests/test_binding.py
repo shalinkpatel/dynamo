@@ -17,6 +17,7 @@ class StandaloneBindingTest(unittest.TestCase):
             "register_host_region",
             "publish",
             "unpublish",
+            "invalidate_slots",
             "lookup_prefix",
             "lookup_mask",
             "fetch",

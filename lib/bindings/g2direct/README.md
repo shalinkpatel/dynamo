@@ -54,9 +54,8 @@ relies on.
 source replica: the source hands back the descriptors and published checksums
 it holds for those keys, and keeps that snapshot until the reader releases the
 lease or it expires (bounded by the reader's fetch deadline). The lease does
-not stop HiCache from evicting or reusing the slot, and an advertisement can
-outlive the page it names (the transport only learns a slot was reused when it
-is republished under another key). Every page read is therefore re-hashed at the
+not stop HiCache from evicting or reusing the slot, and a lease granted before
+the slot is reused still points at it. Every page read is therefore re-hashed at the
 destination and compared with the checksum published for it; a mismatch fails
 that page and the reader falls back to another peer or a miss. The verification
 mode is `destination` by default; `off` exists for measurement only.
@@ -70,6 +69,18 @@ key. In the SGLang adapter, HiCache provides this ordering: a node is backed up
 to storage (and so published) only after its device-to-host write is
 acknowledged, and its host pages hold a host lock until the backup completes.
 The key is the node's token-chain hash.
+
+**Withdraw a slot before refilling it.** HiCache reuses host slots without
+telling the transport, so a replica's advertisement for a slot is kept in step
+with the slot's contents by the calls that change them: `publish()` of the slot
+under another key replaces its entry; `fetch()` withdraws whatever the replica
+advertised at each destination slot before it posts any read into it; and
+`invalidate_slots(ptrs, sizes, ptrs_per_page)`, which the caller must invoke
+before writing any other bytes into host slots (an L3 load), withdraws the
+entries at those slots and returns how many it removed. Slots are described
+exactly as for `publish()`. The local withdrawal is immediate, so this replica
+stops leasing the old key at once; peers' copies of the index drop it when the
+removal event reaches them, and until then their leases for it fail.
 
 **Destination pages stay owned until their reads settle.** `fetch()` returns
 the leading pages that completed and, if reads were still in flight at the
