@@ -1150,6 +1150,7 @@ dependencies = [
  "futures",
  "image",
  "ipnet",
+ "percent-encoding",
  "reqwest 0.12.28",
  "rmp-serde",
  "rmpv",

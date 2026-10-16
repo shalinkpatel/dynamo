@@ -17,6 +17,7 @@ dynamo-multimodal = { git = "https://github.com/ai-dynamo/frontend-crates", rev 
 futures = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ipnet = { workspace = true }
+percent-encoding = "2"
 reqwest = { workspace = true }
 rmpv = { version = "1", features = ["with-serde"] }
 serde = { workspace = true }

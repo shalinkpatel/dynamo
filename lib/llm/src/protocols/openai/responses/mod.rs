@@ -595,7 +595,7 @@ pub fn chat_completion_to_response(
         let tools_callable = params.tools.as_ref().is_some_and(|t| !t.is_empty())
             && !matches!(
                 params.tool_choice,
-                Some(ToolChoiceParam::Mode(ToolChoiceOptions::None))
+                Some(ToolChoiceParam::Option(ToolChoiceOptions::None))
             );
         let content_text = match choice.message.content {
             Some(dynamo_protocols::types::ChatCompletionMessageContent::Text(text)) => Some(text),
@@ -2442,11 +2442,12 @@ Let me check the weather.
             strict: None,
             description: None,
             defer_loading: None,
+            ..Default::default()
         });
         // Tools declared but tool_choice=none.
         let none = ResponseParams {
             tools: Some(vec![tool.clone()]),
-            tool_choice: Some(ToolChoiceParam::Mode(ToolChoiceOptions::None)),
+            tool_choice: Some(ToolChoiceParam::Option(ToolChoiceOptions::None)),
             ..Default::default()
         };
         assert_eq!(as_text(convert(&none)), text);

@@ -1913,6 +1913,9 @@ or smoke-test the router and OpenAI service examples.
 
 ## PATCH-008: Model, Parser, vLLM, and Multimodal Compatibility
 
+Reject revision-pinned and development encoder/cache URLs at client construction;
+require stable environment routes, with `DYNAMO_ALLOW_UNSTABLE_ENCODER_URL` as a warned emergency bypass. Treat `headless.org-` ETCD addresses as production for BDN enforcement (`keep`, [PR #1055](https://github.com/basetenlabs/dynamo/pull/1055)).
+
 `/v1/messages` and `/v1/responses` client tools carry `defer_loading` to the Chat Completions
 tool, so deferred tools reach the worker's `tool_reference_render` placement instead of
 rendering eagerly.

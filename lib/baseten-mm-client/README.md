@@ -197,9 +197,20 @@ the transparent-route header. `proxy` enables cacheable PUT requests. When unset
 the client reads `BDN_PROXY` unless `DYNAMO_DISABLE_BDN_PROXY` is `1` or `true`
 (case-insensitive). BDN URLs without credentials get the standard BDN credentials;
 existing credentials are preserved. An explicit `proxy` overrides the environment.
-If `ETCD_ENDPOINTS` contains `.svc.localnet`, client construction fails unless a
+If `ETCD_ENDPOINTS` contains `.svc.localnet` or `headless.org-` (for example,
+`etcd-dynamo-headless.org-c167caf9787040038b01934dba3089f7:2379`), client construction fails unless a
 proxy is configured or `DYNAMO_DISABLE_BDN_PROXY` is set. Production multimodal
 encoder calls must pass through BDN; the disable switch is an emergency bypass.
+Encoder URLs and every `cache_urls` hop must target production or a stable
+environment. Client construction rejects `/deployment/<revision>/...`,
+`/development/...`, and `/environments/development/...` routes, including when
+BDN or a cache fronts the encoder. Use `/environments/production/sync/<endpoint>`,
+`/environments/<environment>/sync/<endpoint>`, or a stable environment hostname
+such as `https://model-q047oly3-apac.api.baseten.co/sync/<endpoint>`.
+This check applies in every runtime environment; local HTTP encoders remain
+supported. `DYNAMO_ALLOW_UNSTABLE_ENCODER_URL=1` (or `true`, case-insensitive)
+is an emergency bypass that logs a warning; do not use it for routine deployments.
+It is independent of `DYNAMO_DISABLE_BDN_PROXY`.
 Response order matches input order. Dropping the batch future cancels pending work.
 
 `ReplayRequest` serializes the original encoder input together with its expected

@@ -3,12 +3,14 @@
 
 #![doc = include_str!("../README.md")]
 
+mod b10_endpoint_policy;
 mod dsv41;
 mod kimi;
 mod media;
 mod media_fetcher;
 mod planning;
 mod types;
+pub use b10_endpoint_policy::StableEncoderEndpointRequired;
 pub use dsv41::{Dsv41ImageConfig, Dsv41ImagePlan};
 pub use dynamo_multimodal as multimodal;
 pub use kimi::{KimiImageConfig, KimiImagePlan};
@@ -58,7 +60,7 @@ impl std::fmt::Display for ProductionBdnProxyRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "This deployment is configured for multimodal encoding and ETCD_ENDPOINTS indicates production (.svc.localnet). Unbuffered calls to the image encoder are not permitted. Deploy with BDN as a proxy (BDN_PROXY, Helm bdnProxy.enabled, or BIS bdn_proxy_config.enabled). For an emergency bypass, set DYNAMO_DISABLE_BDN_PROXY=1; this is not recommended."
+            "This deployment is configured for multimodal encoding and ETCD_ENDPOINTS indicates production (.svc.localnet or headless.org-). Unbuffered calls to the image encoder are not permitted. Deploy with BDN as a proxy (BDN_PROXY, Helm bdnProxy.enabled, or BIS bdn_proxy_config.enabled). For an emergency bypass, set DYNAMO_DISABLE_BDN_PROXY=1; this is not recommended."
         )
     }
 }
@@ -147,6 +149,12 @@ pub struct EncoderBatch {
 
 impl MultiModalClient {
     pub fn new(config: HttpEncoderConfig) -> Result<Self> {
+        b10_endpoint_policy::validate_endpoints(
+            &config,
+            std::env::var("DYNAMO_ALLOW_UNSTABLE_ENCODER_URL")
+                .ok()
+                .as_deref(),
+        )?;
         let proxy = match config.proxy {
             Some(proxy) if !proxy.is_empty() => Some(proxy),
             _ => bdn_proxy(
@@ -254,7 +262,7 @@ fn bdn_proxy(
         return Ok(None);
     }
     let Some(proxy) = proxy.filter(|value| !value.is_empty()) else {
-        if etcd_endpoints.is_some_and(|endpoints| endpoints.contains(".svc.localnet")) {
+        if b10_endpoint_policy::is_production(etcd_endpoints) {
             return Err(ProductionBdnProxyRequired.into());
         }
         return Ok(None);

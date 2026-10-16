@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use baseten_mm_client::{
     HttpEncoderConfig, Media, MediaResolver, MediaResolverConfig, MultiModalClient, PlannedMedia,
-    PlanningRequest, ProductionBdnProxyRequired, TokenPlannerSpec,
+    PlanningRequest, ProductionBdnProxyRequired, StableEncoderEndpointRequired, TokenPlannerSpec,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -262,7 +262,11 @@ impl MultiModalEncoderClient {
             max_concurrent_requests,
         })
         .map_err(|error| {
-            if error.downcast_ref::<ProductionBdnProxyRequired>().is_some() {
+            if error.downcast_ref::<ProductionBdnProxyRequired>().is_some()
+                || error
+                    .downcast_ref::<StableEncoderEndpointRequired>()
+                    .is_some()
+            {
                 PyValueError::new_err(error.to_string())
             } else {
                 to_pyerr(error)
