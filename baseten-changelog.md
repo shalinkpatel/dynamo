@@ -3060,6 +3060,9 @@ are omitted when no tools survive. Malformed declarations remain rejected and
 strict consumer hooks retain their rejection policy. This restores graceful
 dropping, not custom-tool execution support.
 
+Loss-kind and ReAct-cap-source labels derive from strum instead of hand-written
+match arms, labels unchanged ([#1051](https://github.com/basetenlabs/dynamo/pull/1051)).
+
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
 
 The Messages and Responses handlers in lib/llm canonicalize through the shared

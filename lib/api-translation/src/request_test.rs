@@ -2865,3 +2865,15 @@ fn messages_output_config_carries_a_non_string_effort_like_the_other_surfaces() 
         );
     }
 }
+
+/// `error_code` is a telemetry label: renaming a variant must not change it silently.
+#[test]
+fn react_cap_source_error_codes_are_stable() {
+    for (source, error_code) in [
+        (ReactCapSource::ServerDefault, "react_cap_server_default"),
+        (ReactCapSource::Request, "react_cap_request"),
+        (ReactCapSource::ServiceCeiling, "react_cap_service_ceiling"),
+    ] {
+        assert_eq!(source.error_code(), error_code);
+    }
+}

@@ -21,14 +21,24 @@ fn summary_lists_kinds_in_declaration_order_and_skips_zeroes() {
 
 #[test]
 fn labels_are_unique_snake_case_and_cover_every_kind() {
-    let labels: std::collections::HashSet<_> =
-        LossKind::ALL.iter().map(|kind| kind.as_label()).collect();
-    assert_eq!(labels.len(), LossKind::ALL.len());
+    let labels: std::collections::HashSet<_> = LossKind::VARIANTS
+        .iter()
+        .map(|kind| kind.as_label())
+        .collect();
+    assert_eq!(labels.len(), LossKind::VARIANTS.len());
     for label in labels {
         assert!(
             label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
             "{label}"
         );
+    }
+}
+
+/// The metric label and the serialized `kind` come from two derives; they must stay one name.
+#[test]
+fn label_matches_the_serialized_kind() {
+    for kind in LossKind::VARIANTS {
+        assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_label());
     }
 }
 

@@ -27,6 +27,7 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 # Names the offending JSON member in a rejection: serde omits it, and an untagged
 # enum discards the inner error entirely.
 serde_path_to_error = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 # SseFrameTx is a tokio mpsc sender; nothing else async lives here. An
 # independent requirement (not workspace-inherited): the workspace pins

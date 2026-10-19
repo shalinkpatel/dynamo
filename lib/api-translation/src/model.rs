@@ -239,7 +239,8 @@ pub enum Termination {
 }
 
 /// Which setting fixed a request's ReAct iteration cap; the caller's loop telemetry reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case", prefix = "react_cap_")]
 pub enum ReactCapSource {
     /// The hooks' default; the request named no cap. Raisable per request.
     ServerDefault,
@@ -254,11 +255,7 @@ pub enum ReactCapSource {
 impl ReactCapSource {
     /// Stable label for a `react_cap_exhausted` disposition's `error_code`.
     pub fn error_code(self) -> &'static str {
-        match self {
-            Self::ServerDefault => "react_cap_server_default",
-            Self::Request => "react_cap_request",
-            Self::ServiceCeiling => "react_cap_service_ceiling",
-        }
+        self.into()
     }
 }
 

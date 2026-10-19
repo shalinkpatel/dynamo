@@ -10,9 +10,22 @@
 
 use std::fmt;
 
+use strum::VariantArray;
+
 /// Loss categories. Adding a variant is additive for consumers that count by kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum LossKind {
     /// A server-tool-shaped `tools[]` entry was dropped: nothing on this endpoint executes it.
     ServerToolDropped,
@@ -41,38 +54,9 @@ pub enum LossKind {
 }
 
 impl LossKind {
-    /// Every kind, for consumers that pre-register one metric series per label.
-    pub const ALL: [LossKind; 12] = [
-        Self::ServerToolDropped,
-        Self::ToolChoiceDegraded,
-        Self::RequestFieldDropped,
-        Self::ExtensionFieldDropped,
-        Self::ContentBlockSkipped,
-        Self::ToolResultBlockOmitted,
-        Self::InputItemSkipped,
-        Self::ReplayItemIgnored,
-        Self::AgentMessageDropped,
-        Self::IncludeIgnored,
-        Self::DuplicateToolDropped,
-        Self::NonJsonEchoedArguments,
-    ];
-
     /// snake_case label, `&'static` so it can be a metric label.
     pub fn as_label(self) -> &'static str {
-        match self {
-            Self::ServerToolDropped => "server_tool_dropped",
-            Self::ToolChoiceDegraded => "tool_choice_degraded",
-            Self::RequestFieldDropped => "request_field_dropped",
-            Self::ExtensionFieldDropped => "extension_field_dropped",
-            Self::ContentBlockSkipped => "content_block_skipped",
-            Self::ToolResultBlockOmitted => "tool_result_block_omitted",
-            Self::InputItemSkipped => "input_item_skipped",
-            Self::ReplayItemIgnored => "replay_item_ignored",
-            Self::AgentMessageDropped => "agent_message_dropped",
-            Self::IncludeIgnored => "include_ignored",
-            Self::DuplicateToolDropped => "duplicate_tool_dropped",
-            Self::NonJsonEchoedArguments => "non_json_echoed_arguments",
-        }
+        self.into()
     }
 }
 
@@ -142,10 +126,10 @@ impl Losses {
         self.entries
     }
 
-    /// `kind=n` pairs in [`LossKind::ALL`] order, kinds with no occurrences omitted; the shape the
+    /// `kind=n` pairs in [`LossKind::VARIANTS`] order, kinds with no occurrences omitted; the shape the
     /// stage line carries.
     pub fn summary(&self) -> String {
-        LossKind::ALL
+        LossKind::VARIANTS
             .iter()
             .filter_map(|kind| {
                 let n = self
@@ -162,7 +146,7 @@ impl Losses {
 
 /// Per-kind occurrence counts over a recorded list, for consumers that hold the `Vec<Loss>`.
 pub fn count_by_kind(losses: &[Loss]) -> Vec<(LossKind, usize)> {
-    LossKind::ALL
+    LossKind::VARIANTS
         .iter()
         .filter_map(|kind| {
             let n = losses.iter().filter(|loss| loss.kind == *kind).count();
