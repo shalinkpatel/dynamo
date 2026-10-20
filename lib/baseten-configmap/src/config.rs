@@ -364,11 +364,11 @@ impl Default for B10RoutingConfig {
 }
 
 fn default_router_temperature() -> f64 {
-    0.01
+    0.001
 }
 
 fn default_router_overlap_score_weight() -> f64 {
-    3.5
+    5.5
 }
 
 fn default_router_decode_block_weight() -> f64 {
@@ -376,7 +376,7 @@ fn default_router_decode_block_weight() -> f64 {
 }
 
 fn default_router_prefill_token_discount() -> f64 {
-    0.35
+    0.225
 }
 
 fn default_router_decode_token_discount() -> f64 {
@@ -384,7 +384,7 @@ fn default_router_decode_token_discount() -> f64 {
 }
 
 fn default_router_active_request_weight() -> f64 {
-    0.0
+    0.1
 }
 
 fn default_router_active_request_dp_blend() -> f64 {
@@ -419,15 +419,15 @@ fn sanitize_router_active_request_dp_blend(blend: f64) -> f64 {
 }
 
 fn default_router_cache_miss_weight() -> f64 {
-    0.02
+    0.03
 }
 
 fn default_router_cache_miss_min_isl() -> usize {
-    4096
+    25000
 }
 
 fn default_router_session_affinity_score_multiplier() -> f64 {
-    0.5
+    0.7
 }
 
 fn default_router_residency_eviction_cost() -> f64 {
@@ -913,16 +913,16 @@ override_args:
     fn test_default_config() {
         let unified_config = UnifiedConfig::default();
 
-        assert_eq!(unified_config.routing.router_temperature, 0.01);
-        assert_eq!(unified_config.routing.router_overlap_score_weight, 3.5);
+        assert_eq!(unified_config.routing.router_temperature, 0.001);
+        assert_eq!(unified_config.routing.router_overlap_score_weight, 5.5);
         assert_eq!(unified_config.routing.router_decode_block_weight, 1.0);
-        assert_eq!(unified_config.routing.router_prefill_token_discount, 0.35);
+        assert_eq!(unified_config.routing.router_prefill_token_discount, 0.225);
         assert_eq!(unified_config.routing.router_decode_token_discount, 0.8);
         assert_eq!(
             unified_config
                 .routing
                 .router_session_affinity_score_multiplier,
-            0.5
+            0.7
         );
         assert_eq!(
             unified_config.routing.router_active_request_dp_blend,

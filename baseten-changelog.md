@@ -846,6 +846,8 @@ default-config path while `get_config()` reported the serde defaults.
 
 Heuristic and selector parity note:
 
+- Retune Baseten routing defaults for temperature, overlap weight, prefill discount,
+  active-request/cache-miss weights, minimum ISL, and session affinity ([#1067](https://github.com/basetenlabs/dynamo/pull/1067)); preserve when replaying the B10 configuration.
 - `softmax_sample` accepts any worker-logit map that can be iterated as
   `(&WorkerWithDpRank, &f64)`, instead of requiring `FxHashMap`.
 - The B10 worker selector can use the standard `HashMap` for its local logits
