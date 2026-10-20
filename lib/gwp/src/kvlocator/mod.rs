@@ -9,6 +9,9 @@
 //! (intend+book is one step: committing *is* booking), [`lifecycle`] is
 //! intend+book, open, and finish over GwpCore's slot machinery.
 
+use crate::config::EndpointId;
+use crate::topology::TopologySnapshot;
+
 pub mod lifecycle;
 pub mod scoring;
 
@@ -33,4 +36,25 @@ pub fn grpc_server(
         )))
         .with_lifecycle(std::sync::Arc::new(GwpLifecycle::new(core)));
     LocatorServer::new(service).max_decoding_message_size(dynamo_kvlocator::GRPC_MAX_MESSAGE_BYTES)
+}
+
+/// Discovered `<model>/<plane>` ids travel as the plane alone.
+fn wire_to_endpoint(topology: &TopologySnapshot, model: &str, id: &str) -> EndpointId {
+    if topology.discovered_endpoints {
+        EndpointId(format!("{}/{id}", topology.canonical_model(model)))
+    } else {
+        EndpointId(id.to_string())
+    }
+}
+
+fn endpoint_to_wire(topology: &TopologySnapshot, model: &str, endpoint: &EndpointId) -> String {
+    if !topology.discovered_endpoints {
+        return endpoint.0.clone();
+    }
+    endpoint
+        .0
+        .strip_prefix(model)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(&endpoint.0)
+        .to_string()
 }

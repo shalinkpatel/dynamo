@@ -121,7 +121,11 @@ impl GwpLifecycle {
     fn validate_commit<'a>(
         &self,
         request: &'a pb::CommitIntendRequest,
-    ) -> anyhow::Result<(&'a pb::Placement, crate::tokens::RoutingTokenIdentity)> {
+    ) -> anyhow::Result<(
+        &'a pb::Placement,
+        EndpointId,
+        crate::tokens::RoutingTokenIdentity,
+    )> {
         let input = request
             .input
             .as_ref()
@@ -140,16 +144,14 @@ impl GwpLifecycle {
         let worker = WorkerWithDpRank::new(chosen.worker_id, chosen.dp_rank);
         let eligible = super::scoring::eligible_workers(&topology, binding, input)
             .is_some_and(|(workers, _)| workers.contains(&worker));
-        if !eligible
-            || topology.worker_endpoint(worker.worker_id)
-                != Some(&EndpointId(chosen.endpoint_id.clone()))
-        {
+        let endpoint = super::wire_to_endpoint(&topology, &input.model_id, &chosen.endpoint_id);
+        if !eligible || topology.worker_endpoint(worker.worker_id) != Some(&endpoint) {
             return Err(InvalidAttempt(
                 "chosen placement does not satisfy input eligibility and constraints".into(),
             )
             .into());
         }
-        Ok((chosen, identity))
+        Ok((chosen, endpoint, identity))
     }
 
     async fn intend_inner(&self, request: &pb::CommitIntendRequest) -> anyhow::Result<()> {
@@ -169,7 +171,7 @@ impl GwpLifecycle {
         if request.request_id.is_empty() {
             return Err(InvalidAttempt("request_id must not be empty".into()).into());
         }
-        let (chosen, identity) = self.validate_commit(request)?;
+        let (chosen, endpoint, identity) = self.validate_commit(request)?;
         let input = request.input.as_ref().expect("validated input");
         let tokens = &input.bid.as_ref().expect("validated bid").tokens;
         let worker = WorkerWithDpRank::new(chosen.worker_id, chosen.dp_rank);
@@ -180,7 +182,7 @@ impl GwpLifecycle {
             .filter(|sid| !sid.is_empty());
         let context = CommitContext {
             model_id: input.model_id.clone(),
-            endpoint: EndpointId(chosen.endpoint_id.clone()),
+            endpoint: endpoint.clone(),
             tokens: tokens.to_vec(),
             identity: identity.clone(),
             session_id: session_id.clone(),
@@ -223,7 +225,7 @@ impl GwpLifecycle {
                 session_id,
                 tokens.to_vec(),
                 identity,
-                &EndpointId(chosen.endpoint_id.clone()),
+                &endpoint,
                 worker,
             )
             .await;
@@ -649,20 +651,28 @@ mod lifecycle_tests {
     async fn make_lifecycle_with_store(
         store: std::sync::Arc<dyn crate::session::AffinityStore>,
     ) -> GwpLifecycle {
+        make_lifecycle_with(store, ENDPOINT, false).await
+    }
+
+    async fn make_lifecycle_with(
+        store: std::sync::Arc<dyn crate::session::AffinityStore>,
+        endpoint: &str,
+        discovered: bool,
+    ) -> GwpLifecycle {
         let config = GwpConfig {
             endpoints: BTreeMap::from([(
-                EndpointId(ENDPOINT.into()),
+                EndpointId(endpoint.into()),
                 EndpointConfig {
-                    ingress_url: url::Url::parse("https://endpoint.example.com:8443/v1").unwrap(),
+                    ingress_url: None,
                     api_key: "ck".into(),
-                    planner_url: url::Url::parse("http://localhost:0/deep/health").unwrap(),
+                    planner_url: None,
                     planner_api_key: None,
                     properties: Default::default(),
                 },
             )]),
             routes: vec![ModelRoute {
                 models: vec!["m".into()],
-                endpoints: vec![EndpointId(ENDPOINT.into())],
+                endpoints: vec![EndpointId(endpoint.into())],
             }],
             routing: RoutingConfig {
                 block_size: 4,
@@ -675,13 +685,15 @@ mod lifecycle_tests {
             HashMap::from([(
                 WORKER,
                 TopologyWorker {
-                    endpoint: EndpointId(ENDPOINT.into()),
+                    endpoint: EndpointId(endpoint.into()),
                     runtime: dynamo_llm::local_model::runtime_config::ModelRuntimeConfig::default(),
                     observed_load: None,
                 },
             )]),
         )
         .unwrap();
+        let mut snapshot = snapshot;
+        snapshot.discovered_endpoints = discovered;
         let router = GwpRouterRegistry::new_process_local(4, 120).await.unwrap();
         router
             .reconcile_topology(&snapshot, &snapshot.workers.keys().copied().collect())
@@ -717,6 +729,21 @@ mod lifecycle_tests {
             .unwrap()
             .session_id = Some(sid.into());
         commit
+    }
+
+    #[tokio::test]
+    async fn discovered_commit_accepts_plane_name_and_empty_list() {
+        let lifecycle =
+            make_lifecycle_with(Arc::new(InMemoryAffinityStore::new()), "m/us-east", true).await;
+        let mut request = commit("plane", "r1", "us-east");
+        request
+            .input
+            .as_mut()
+            .unwrap()
+            .eligible_endpoint_ids
+            .clear();
+        lifecycle.intend(&request).await.expect("plane-name commit");
+        assert_eq!(active_requests(&lifecycle).await, 1);
     }
 
     #[tokio::test]

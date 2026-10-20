@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Canonical routing topology and the publication boundary between topology
-//! producers (currently the ConfigMap/planner reflector) and request routing.
+//! producers (planner or MCM Redis) and request routing.
 //!
 //! Producers publish complete snapshots. The controller validates and fans a
 //! snapshot out to the scheduler worker watch, observed-load store, readiness,
@@ -34,7 +34,7 @@ use crate::router::{GwpRouterRegistry, ObservedLoadStore, ObservedWorkerLoad, Wo
 /// absent: they belong to the current topology producer, not routing state.
 #[derive(Clone, Debug)]
 pub struct RoutableEndpoint {
-    pub ingress_url: url::Url,
+    pub ingress_url: Option<url::Url>,
     pub api_key: String,
     pub properties: BTreeMap<String, std::collections::BTreeSet<String>>,
 }
@@ -67,7 +67,7 @@ pub struct ModelBinding {
 }
 
 /// One externally observed scheduler worker.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TopologyWorker {
     pub endpoint: EndpointId,
     pub runtime: ModelRuntimeConfig,
@@ -95,6 +95,9 @@ pub struct TopologySnapshot {
     pub models: HashMap<String, ModelBinding>,
     pub profiles: HashMap<ProfileId, ResolvedModelProfile>,
     pub workers: HashMap<WorkerId, TopologyWorker>,
+    /// Endpoints come from MCM namespace discovery: `<model>/<plane>` ids that
+    /// KVLocator exchanges as bare plane names.
+    pub discovered_endpoints: bool,
 }
 
 impl TopologySnapshot {
@@ -142,6 +145,7 @@ impl TopologySnapshot {
             models,
             profiles,
             workers,
+            discovered_endpoints: config.discovery.discovers_endpoints(),
         };
         snapshot.validate()?;
         Ok(snapshot)
@@ -514,9 +518,11 @@ mod tests {
             endpoints: BTreeMap::from([(
                 EndpointId("a".into()),
                 EndpointConfig {
-                    ingress_url: url::Url::parse("http://a.example/v1").unwrap(),
+                    ingress_url: Some(url::Url::parse("http://a.example/v1").unwrap()),
                     api_key: String::new(),
-                    planner_url: url::Url::parse("http://planner.example/deep/health").unwrap(),
+                    planner_url: Some(
+                        url::Url::parse("http://planner.example/deep/health").unwrap(),
+                    ),
                     planner_api_key: None,
                     properties: Default::default(),
                 },
@@ -569,9 +575,9 @@ mod tests {
         config.endpoints.insert(
             EndpointId("b".into()),
             EndpointConfig {
-                ingress_url: url::Url::parse("http://b.example/v1").unwrap(),
+                ingress_url: Some(url::Url::parse("http://b.example/v1").unwrap()),
                 api_key: String::new(),
-                planner_url: url::Url::parse("http://planner-b.example/deep/health").unwrap(),
+                planner_url: Some(url::Url::parse("http://planner-b.example/deep/health").unwrap()),
                 planner_api_key: None,
                 properties: Default::default(),
             },

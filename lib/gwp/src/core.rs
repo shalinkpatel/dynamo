@@ -309,14 +309,17 @@ impl Drop for ScheduleReservationGuard {
 }
 
 fn downstream_authority(endpoint: &RoutableEndpoint) -> String {
-    let host = endpoint.ingress_url.host_str().unwrap_or("unknown");
+    // KVLocator-only endpoints have no ingress; their callers dial the worker.
+    let Some(ingress_url) = &endpoint.ingress_url else {
+        return "none".into();
+    };
+    let host = ingress_url.host_str().unwrap_or("unknown");
     let host = if host.contains(':') {
         format!("[{host}]")
     } else {
         host.to_string()
     };
-    endpoint
-        .ingress_url
+    ingress_url
         .port_or_known_default()
         .map_or(host.clone(), |port| format!("{host}:{port}"))
 }
@@ -376,6 +379,12 @@ impl GwpCore {
                 endpoint_id.0
             ))
         })?;
+        if endpoint.ingress_url.is_none() {
+            return Err(ScheduleError::UnknownEndpoint(format!(
+                "endpoint {} has no ingress_url; it serves KVLocator only",
+                endpoint_id.0
+            )));
+        }
         Ok((endpoint_id, endpoint))
     }
 
@@ -1838,9 +1847,11 @@ mod tests {
             endpoints: BTreeMap::from([(
                 EndpointId(ENDPOINT.into()),
                 EndpointConfig {
-                    ingress_url: url::Url::parse("https://endpoint.example.com:8443/v1").unwrap(),
+                    ingress_url: Some(
+                        url::Url::parse("https://endpoint.example.com:8443/v1").unwrap(),
+                    ),
                     api_key: "ck".into(),
-                    planner_url: url::Url::parse("http://localhost:0/deep/health").unwrap(),
+                    planner_url: Some(url::Url::parse("http://localhost:0/deep/health").unwrap()),
                     planner_api_key: None,
                     properties: Default::default(),
                 },
@@ -1892,9 +1903,9 @@ mod tests {
 
     async fn make_multi_model_core() -> (GwpCore, ()) {
         let endpoint = |host: &str| EndpointConfig {
-            ingress_url: url::Url::parse(&format!("http://{host}/v1")).unwrap(),
+            ingress_url: Some(url::Url::parse(&format!("http://{host}/v1")).unwrap()),
             api_key: String::new(),
-            planner_url: url::Url::parse(&format!("http://{host}/deep/health")).unwrap(),
+            planner_url: Some(url::Url::parse(&format!("http://{host}/deep/health")).unwrap()),
             planner_api_key: None,
             properties: Default::default(),
         };
@@ -2021,9 +2032,9 @@ mod tests {
     fn retire_selected_endpoint(core: &GwpCore) {
         let mut config = (*core.config.load()).clone();
         let mut replacement = config.endpoints.values().next().unwrap().clone();
-        replacement.ingress_url = url::Url::parse("https://replacement.example/v1").unwrap();
+        replacement.ingress_url = Some(url::Url::parse("https://replacement.example/v1").unwrap());
         replacement.planner_url =
-            url::Url::parse("http://replacement.example/deep/health").unwrap();
+            Some(url::Url::parse("http://replacement.example/deep/health").unwrap());
         let replacement_id = EndpointId("replacement".into());
         config.endpoints = BTreeMap::from([(replacement_id.clone(), replacement)]);
         config.routes = vec![ModelRoute {
@@ -2126,6 +2137,46 @@ mod tests {
         core.request_finished("optimistic-latency", "complete")
             .await;
         assert_eq!(core.inflight_len(), 0);
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn envoy_schedule_rejects_kvlocator_only_endpoints() {
+        let (core, _) = make_core(true).await;
+        let mut config = (*core.config.load()).clone();
+        for endpoint in config.endpoints.values_mut() {
+            endpoint.ingress_url = None;
+        }
+        let workers = core.topology.load().workers.clone();
+        core.topology
+            .replace(TopologySnapshot::from_config(&config, workers).unwrap());
+        core.config.replace(config);
+
+        let error = core
+            .schedule_for_test("no-ingress", None, CHAT_PATH, &chat_body())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, ScheduleError::UnknownEndpoint(message) if message.contains("KVLocator only")),
+            "{error}"
+        );
+        assert_eq!(
+            core.inflight_len(),
+            0,
+            "rejected schedule left a slot behind"
+        );
+
+        core.book_kvlocator_attempt(
+            "native-without-ingress",
+            "m",
+            None,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            Default::default(),
+            &EndpointId(ENDPOINT.into()),
+            WorkerWithDpRank::from_worker_id(WORKER),
+        )
+        .await
+        .expect("KVLocator booking needs no ingress");
     }
 
     #[tokio::test]

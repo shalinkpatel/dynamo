@@ -460,9 +460,9 @@ mod tests {
             endpoints: BTreeMap::from([(
                 endpoint.clone(),
                 EndpointConfig {
-                    ingress_url: url::Url::parse("http://example.test/v1").unwrap(),
+                    ingress_url: Some(url::Url::parse("http://example.test/v1").unwrap()),
                     api_key: String::new(),
-                    planner_url: url::Url::parse("http://planner.test/deep/health").unwrap(),
+                    planner_url: Some(url::Url::parse("http://planner.test/deep/health").unwrap()),
                     planner_api_key: None,
                     properties: Default::default(),
                 },

@@ -288,7 +288,11 @@ impl Reflector {
         http: reqwest::Client,
         endpoint: EndpointConfig,
     ) -> anyhow::Result<DeepHealthResponse> {
-        let mut request = http.get(endpoint.planner_url.clone());
+        let planner_url = endpoint
+            .planner_url
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("planner discovery requires planner_url"))?;
+        let mut request = http.get(planner_url.clone());
         if !endpoint.planner_api_key().is_empty() {
             request = request.bearer_auth(endpoint.planner_api_key());
         }
@@ -495,9 +499,9 @@ mod tests {
 
     fn endpoint_config() -> EndpointConfig {
         EndpointConfig {
-            ingress_url: url::Url::parse("http://localhost:0/v1").unwrap(),
+            ingress_url: Some(url::Url::parse("http://localhost:0/v1").unwrap()),
             api_key: "ck".into(),
-            planner_url: url::Url::parse("http://localhost:0/deep/health").unwrap(),
+            planner_url: Some(url::Url::parse("http://localhost:0/deep/health").unwrap()),
             planner_api_key: None,
             properties: Default::default(),
         }
@@ -834,7 +838,7 @@ mod tests {
             .endpoints
             .get_mut(&eid("us-east"))
             .unwrap()
-            .planner_url = planner;
+            .planner_url = Some(planner);
         reflector.config.replace(config);
 
         reflector.poll_once().await;
@@ -859,8 +863,8 @@ mod tests {
         )
         .await;
         let mut config = test_config(&["fast", "slow"]);
-        config.endpoints.get_mut(&eid("fast")).unwrap().planner_url = fast;
-        config.endpoints.get_mut(&eid("slow")).unwrap().planner_url = slow;
+        config.endpoints.get_mut(&eid("fast")).unwrap().planner_url = Some(fast);
+        config.endpoints.get_mut(&eid("slow")).unwrap().planner_url = Some(slow);
         let (mut reflector, _topology, mut rx) = make_reflector_with_config(config, None);
 
         let poll = tokio::spawn(async move { reflector.poll_once().await });
@@ -888,8 +892,8 @@ mod tests {
         let slow =
             spawn_repeating_planner(SLOW_BODY, Duration::from_secs(5), slow_hits.clone()).await;
         let mut config = test_config(&["fast", "slow"]);
-        config.endpoints.get_mut(&eid("fast")).unwrap().planner_url = fast;
-        config.endpoints.get_mut(&eid("slow")).unwrap().planner_url = slow;
+        config.endpoints.get_mut(&eid("fast")).unwrap().planner_url = Some(fast);
+        config.endpoints.get_mut(&eid("slow")).unwrap().planner_url = Some(slow);
         let (reflector, _topology, rx) = make_reflector_with_config(config, None);
         let handle = reflector.spawn();
 
@@ -918,7 +922,7 @@ mod tests {
             .endpoints
             .get_mut(&eid("removed"))
             .unwrap()
-            .planner_url = planner;
+            .planner_url = Some(planner);
         let store = ConfigStore::new(config);
         let (mut reflector, topology, rx) =
             make_reflector_with_config((*store.load()).clone(), None);
@@ -944,7 +948,7 @@ mod tests {
     async fn planner_content_length_over_limit_is_rejected() {
         let planner = spawn_planner("", Duration::ZERO, Some(MAX_PLANNER_BODY_BYTES + 1)).await;
         let mut endpoint = endpoint_config();
-        endpoint.planner_url = planner;
+        endpoint.planner_url = Some(planner);
 
         let error = Reflector::fetch(reqwest::Client::new(), endpoint)
             .await

@@ -55,7 +55,11 @@ impl Scorer for GwpScorer {
         let Some((candidates, worker_configs)) = eligible_workers(&topology, binding, request)
         else {
             // No eligible destination answers as an empty ranking, not an error.
-            return Ok(resolve_placements(Vec::new(), &topology));
+            return Ok(resolve_placements(
+                Vec::new(),
+                &topology,
+                topology.canonical_model(&request.model_id),
+            ));
         };
 
         let policy = topology
@@ -92,7 +96,11 @@ impl Scorer for GwpScorer {
                 .unwrap_or(1.0);
             candidate.score = crate::scoring::selection_cost(candidate.score, multiplier);
         }
-        let mut response = resolve_placements(ranked, &topology);
+        let mut response = resolve_placements(
+            ranked,
+            &topology,
+            topology.canonical_model(&request.model_id),
+        );
         for candidate in &mut response
             .placements_v1
             .as_mut()
@@ -255,15 +263,19 @@ pub(super) fn eligible_workers(
     // the other side. Both sides are config-sized (a handful of endpoints),
     // so this is a set intersection: compare by string, clone once for the
     // owned set workers_in_endpoints takes.
-    let requested: HashSet<&str> = request
+    // No requested destinations means every endpoint of the model.
+    let requested: HashSet<EndpointId> = request
         .eligible_endpoint_ids
         .iter()
-        .map(String::as_str)
+        .map(|id| super::wire_to_endpoint(topology, &request.model_id, id))
         .collect();
     let eligible_endpoints: HashSet<EndpointId> = binding
         .endpoints
         .iter()
-        .filter(|endpoint| requested.contains(endpoint.0.as_str()))
+        // Namespace discovery owns the destinations: no list means all of them.
+        .filter(|endpoint| {
+            (requested.is_empty() && topology.discovered_endpoints) || requested.contains(endpoint)
+        })
         .cloned()
         .collect();
     if eligible_endpoints.is_empty() {
@@ -322,6 +334,7 @@ fn session_id_of(request: &pb::LocateRequest) -> Option<&str> {
 fn resolve_placements(
     ranked: Vec<RankedCandidate>,
     topology: &TopologySnapshot,
+    model: &str,
 ) -> pb::LocateResponse {
     let mut candidates: Vec<pb::LocateCandidate> = ranked
         .into_iter()
@@ -329,7 +342,7 @@ fn resolve_placements(
             let endpoint_id = topology.worker_endpoint(candidate.worker.worker_id)?;
             Some(pb::LocateCandidate {
                 placement: Some(pb::Placement {
-                    endpoint_id: endpoint_id.0.clone(),
+                    endpoint_id: super::endpoint_to_wire(topology, model, endpoint_id),
                     worker_id: candidate.worker.worker_id,
                     dp_rank: candidate.worker.dp_rank,
                 }),
@@ -373,20 +386,24 @@ mod tests {
     const WORKER: u64 = 10;
 
     async fn make_scorer() -> GwpScorer {
+        make_scorer_with(ENDPOINT, false).await
+    }
+
+    async fn make_scorer_with(endpoint: &str, discovered: bool) -> GwpScorer {
         let config = GwpConfig {
             endpoints: BTreeMap::from([(
-                EndpointId(ENDPOINT.into()),
+                EndpointId(endpoint.into()),
                 EndpointConfig {
-                    ingress_url: url::Url::parse("https://endpoint.example.com:8443/v1").unwrap(),
+                    ingress_url: None,
                     api_key: "ck".into(),
-                    planner_url: url::Url::parse("http://localhost:0/deep/health").unwrap(),
+                    planner_url: None,
                     planner_api_key: None,
                     properties: Default::default(),
                 },
             )]),
             routes: vec![ModelRoute {
                 models: vec!["m".into()],
-                endpoints: vec![EndpointId(ENDPOINT.into())],
+                endpoints: vec![EndpointId(endpoint.into())],
             }],
             routing: RoutingConfig {
                 block_size: 4,
@@ -400,7 +417,7 @@ mod tests {
                 (
                     WORKER,
                     TopologyWorker {
-                        endpoint: EndpointId(ENDPOINT.into()),
+                        endpoint: EndpointId(endpoint.into()),
                         runtime:
                             dynamo_llm::local_model::runtime_config::ModelRuntimeConfig::default(),
                         observed_load: None,
@@ -409,7 +426,7 @@ mod tests {
                 (
                     WORKER + 1,
                     TopologyWorker {
-                        endpoint: EndpointId(ENDPOINT.into()),
+                        endpoint: EndpointId(endpoint.into()),
                         runtime:
                             dynamo_llm::local_model::runtime_config::ModelRuntimeConfig::default(),
                         observed_load: None,
@@ -418,6 +435,8 @@ mod tests {
             ]),
         )
         .unwrap();
+        let mut snapshot = snapshot;
+        snapshot.discovered_endpoints = discovered;
         let router = GwpRouterRegistry::new_process_local(4, 120).await.unwrap();
         router
             .reconcile_topology(&snapshot, &snapshot.workers.keys().copied().collect())
@@ -438,6 +457,63 @@ mod tests {
             eligible_endpoint_ids: vec![endpoint.into()],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn discovered_endpoints_travel_as_planes_and_empty_means_all() {
+        let scorer = make_scorer_with("m/us-east", true).await;
+        let mut request = locate_request("unused", vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        request.eligible_endpoint_ids.clear();
+        let candidates = scorer
+            .rank(&request)
+            .await
+            .unwrap()
+            .placements_v1
+            .unwrap()
+            .candidates;
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.placement.as_ref().unwrap().endpoint_id == "us-east")
+        );
+        request.eligible_endpoint_ids = vec!["us-east".into()];
+        assert_eq!(
+            scorer
+                .rank(&request)
+                .await
+                .unwrap()
+                .placements_v1
+                .unwrap()
+                .candidates
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_endpoints_are_not_translated_and_need_a_list() {
+        let scorer = make_scorer_with("m/x", false).await;
+        let mut request = locate_request("m/x", vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let candidates = scorer
+            .rank(&request)
+            .await
+            .unwrap()
+            .placements_v1
+            .unwrap()
+            .candidates;
+        assert_eq!(candidates[0].placement.as_ref().unwrap().endpoint_id, "m/x");
+        request.eligible_endpoint_ids.clear();
+        assert!(
+            scorer
+                .rank(&request)
+                .await
+                .unwrap()
+                .placements_v1
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -664,6 +740,7 @@ mod tests {
                 },
             ],
             &topology,
+            "m",
         );
         assert_eq!(
             response.placements_v1.unwrap().candidates[0]

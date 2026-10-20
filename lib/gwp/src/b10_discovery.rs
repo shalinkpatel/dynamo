@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Topology acquisition adapters. MCM's existing Kafka consumers materialize
-//! routing records in Redis; this layer joins them with planner observations.
+//! worker inventories in Redis. Each backend publishes complete topology snapshots.
 
-use crate::config::{EndpointId, GwpConfig};
+use crate::config::{ConfigStore, EndpointId, GwpConfig};
 use crate::metrics::GwpMetrics;
-use crate::topology::{TopologyUpdate, TopologyUpdateSender};
+use crate::topology::TopologyUpdateSender;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -26,7 +26,12 @@ pub enum DiscoveryConfig {
 pub struct McmRedisConfig {
     /// Name of the environment variable holding the credential-bearing URL.
     pub url_env: String,
+    #[serde(default)]
     pub endpoints: BTreeMap<EndpointId, McmEndpoint>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default = "default_rescan_secs")]
+    pub rescan_interval_secs: u64,
     #[serde(default = "default_poll_ms")]
     pub poll_interval_ms: u64,
     #[serde(default = "default_timeout_ms")]
@@ -45,6 +50,9 @@ pub struct McmEndpoint {
     #[serde(default)]
     pub namespace: Option<String>,
 }
+fn default_rescan_secs() -> u64 {
+    30
+}
 fn default_poll_ms() -> u64 {
     1000
 }
@@ -56,6 +64,10 @@ fn default_sample_age_secs() -> u64 {
 }
 
 impl DiscoveryConfig {
+    pub(crate) fn discovers_endpoints(&self) -> bool {
+        matches!(self, Self::McmRedis(mcm) if mcm.namespace.is_some())
+    }
+
     pub(crate) fn validate(&self, config: &GwpConfig) -> anyhow::Result<()> {
         let Self::McmRedis(mcm) = self else {
             return Ok(());
@@ -68,6 +80,21 @@ impl DiscoveryConfig {
             mcm.poll_interval_ms > 0 && mcm.timeout_ms > 0 && mcm.max_sample_age_secs > 0,
             "discovery intervals must be positive"
         );
+        if let Some(namespace) = &mcm.namespace {
+            anyhow::ensure!(
+                !namespace.is_empty(),
+                "discovery.namespace must be nonempty"
+            );
+            anyhow::ensure!(
+                mcm.rescan_interval_secs > 0,
+                "discovery intervals must be positive"
+            );
+            anyhow::ensure!(
+                mcm.endpoints.is_empty() && config.endpoints.is_empty() && config.routes.is_empty(),
+                "namespace discovery derives endpoints and routes; do not configure them"
+            );
+            return Ok(());
+        }
         anyhow::ensure!(
             mcm.endpoints.keys().eq(config.endpoints.keys()),
             "MCM discovery must map every configured endpoint exactly once"
@@ -100,30 +127,25 @@ impl DiscoveryConfig {
     }
 }
 
-/// Connect a topology producer to the controller through the chosen discovery
-/// adapter. No request handler performs Redis or Kafka reads.
+/// Start exactly one topology producer. MCM discovery has no planner client.
 pub async fn spawn(
-    config: DiscoveryConfig,
-    mut planner: tokio::sync::mpsc::Receiver<TopologyUpdate>,
+    config: ConfigStore,
     output: TopologyUpdateSender,
     metrics: GwpMetrics,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    match config {
-        DiscoveryConfig::Planner => Ok(tokio::spawn(async move {
-            while let Some(update) = planner.recv().await {
-                if output.send(update).await.is_err() {
-                    break;
-                }
-            }
-        })),
-        DiscoveryConfig::McmRedis(config) => {
+    let discovery = config.load().discovery.clone();
+    match discovery {
+        DiscoveryConfig::Planner => Ok(crate::reflector::Reflector::new(config, output)
+            .with_metrics(metrics)
+            .spawn()),
+        DiscoveryConfig::McmRedis(mcm) => {
             #[cfg(feature = "redis")]
             {
-                Ok(b10_mcm::McmDiscovery::new(config, metrics)?.spawn(planner, output))
+                Ok(b10_mcm::McmDiscovery::new(mcm, metrics)?.spawn(config, output))
             }
             #[cfg(not(feature = "redis"))]
             {
-                let _ = (config, metrics);
+                let _ = (mcm, metrics);
                 anyhow::bail!("MCM discovery requires the dynamo-gwp redis feature")
             }
         }

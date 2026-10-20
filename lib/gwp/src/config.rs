@@ -30,12 +30,14 @@ pub struct EndpointId(pub String);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EndpointConfig {
     /// OpenAI-compatible ingress the data plane forwards to.
-    pub ingress_url: url::Url,
+    #[serde(default)]
+    pub ingress_url: Option<url::Url>,
     /// Bearer/API key used for ingress.
     #[serde(default)]
     pub api_key: String,
-    /// This deployment's planner `/deep/health` URL.
-    pub planner_url: url::Url,
+    /// Required only by the planner discovery backend.
+    #[serde(default)]
+    pub planner_url: Option<url::Url>,
     /// Planner bearer/API key; falls back to `api_key` when absent.
     #[serde(default)]
     pub planner_api_key: Option<String>,
@@ -318,6 +320,7 @@ pub struct ModelPoliciesConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GwpConfig {
     /// Named, independently routable deployment endpoints.
+    #[serde(default)]
     pub endpoints: BTreeMap<EndpointId, EndpointConfig>,
     /// Authoritative external model-to-endpoint policy.
     #[serde(default)]
@@ -384,7 +387,7 @@ impl GwpConfig {
     fn validate(&self) -> anyhow::Result<()> {
         self.discovery.validate(self)?;
         anyhow::ensure!(
-            !self.endpoints.is_empty(),
+            !self.endpoints.is_empty() || self.discovery.discovers_endpoints(),
             "GWP config must define at least one endpoint"
         );
         anyhow::ensure!(
@@ -439,26 +442,28 @@ impl GwpConfig {
         // reflector (including on hot reload).
         let mut planner_urls: HashMap<&url::Url, &EndpointId> = HashMap::new();
         for (endpoint_id, endpoint) in &self.endpoints {
-            anyhow::ensure!(
-                endpoint.ingress_url.scheme() == "http",
-                "endpoint {} ingress_url must use http for the Envoy dynamic-forward-proxy data plane",
-                endpoint_id.0
-            );
-            anyhow::ensure!(
-                endpoint.ingress_url.host_str().is_some(),
-                "endpoint {} ingress_url must include a host",
-                endpoint_id.0
-            );
-            anyhow::ensure!(
-                endpoint.ingress_url.path() == "/v1",
-                "endpoint {} ingress_url path must be /v1",
-                endpoint_id.0
-            );
-            anyhow::ensure!(
-                endpoint.ingress_url.query().is_none() && endpoint.ingress_url.fragment().is_none(),
-                "endpoint {} ingress_url must not include a query or fragment",
-                endpoint_id.0
-            );
+            if let Some(ingress_url) = &endpoint.ingress_url {
+                anyhow::ensure!(
+                    ingress_url.scheme() == "http",
+                    "endpoint {} ingress_url must use http for the Envoy dynamic-forward-proxy data plane",
+                    endpoint_id.0
+                );
+                anyhow::ensure!(
+                    ingress_url.host_str().is_some(),
+                    "endpoint {} ingress_url must include a host",
+                    endpoint_id.0
+                );
+                anyhow::ensure!(
+                    ingress_url.path() == "/v1",
+                    "endpoint {} ingress_url path must be /v1",
+                    endpoint_id.0
+                );
+                anyhow::ensure!(
+                    ingress_url.query().is_none() && ingress_url.fragment().is_none(),
+                    "endpoint {} ingress_url must not include a query or fragment",
+                    endpoint_id.0
+                );
+            }
             anyhow::ensure!(
                 endpoint.api_key.is_ascii()
                     && !endpoint.api_key.contains('\r')
@@ -466,14 +471,24 @@ impl GwpConfig {
                 "endpoint {} api_key contains invalid header characters",
                 endpoint_id.0
             );
-            if let Some(previous_endpoint) = planner_urls.insert(&endpoint.planner_url, endpoint_id)
-            {
-                anyhow::bail!(
-                    "endpoints {} and {} share planner_url {}; each endpoint must use a distinct planner URL",
-                    previous_endpoint.0,
-                    endpoint_id.0,
-                    endpoint.planner_url
-                );
+            if matches!(
+                self.discovery,
+                crate::b10_discovery::DiscoveryConfig::Planner
+            ) {
+                let planner_url = endpoint.planner_url.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "endpoint {} requires planner_url for planner discovery",
+                        endpoint_id.0
+                    )
+                })?;
+                if let Some(previous_endpoint) = planner_urls.insert(planner_url, endpoint_id) {
+                    anyhow::bail!(
+                        "endpoints {} and {} share planner_url {}; each endpoint must use a distinct planner URL",
+                        previous_endpoint.0,
+                        endpoint_id.0,
+                        planner_url
+                    );
+                }
             }
         }
         for route in &self.routes {
@@ -1034,6 +1049,23 @@ session:
   etcd_endpoints: ["http://127.0.0.1:2379"]
 "#;
         assert!(GwpConfig::load_from_str(invalid).is_err());
+    }
+
+    #[test]
+    fn accepts_endpoints_without_ingress_url() {
+        let kvlocator_only =
+            SAMPLE.replace("    ingress_url: \"http://eu-west.example.com/v1\"\n", "");
+        let config = GwpConfig::load_from_str(&kvlocator_only).unwrap();
+        assert!(
+            config.endpoints[&EndpointId("eu-west".into())]
+                .ingress_url
+                .is_none()
+        );
+        assert!(
+            config.endpoints[&EndpointId("us-east".into())]
+                .ingress_url
+                .is_some()
+        );
     }
 
     #[test]

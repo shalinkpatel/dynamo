@@ -95,7 +95,11 @@ pub(crate) async fn resolve_schedule(
         })
         .await
         .map_err(ControlError::from)?;
-    let ingress = &scheduled.endpoint.ingress_url;
+    let ingress = scheduled
+        .endpoint
+        .ingress_url
+        .as_ref()
+        .expect("GwpCore::endpoint_for rejects endpoints without ingress_url");
     let authority = match (ingress.host_str(), ingress.port_or_known_default()) {
         (Some(host), Some(port)) if host.contains(':') => format!("[{host}]:{port}"),
         (Some(host), Some(port)) => format!("{host}:{port}"),

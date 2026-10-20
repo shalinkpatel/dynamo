@@ -101,30 +101,44 @@ use a fresh attempt UUID per dispatch and the same pod for its lifecycle calls.
 
 Set `discovery.type: mcm_redis` to use the Redis view already maintained by
 MCM/Beefeater's Kafka consumers. This adapter feeds the existing GWP topology
-independently of the request transport. The default remains
-`discovery.type: planner`.
+independently of the request transport. It publishes complete worker snapshots
+from Redis and never starts the workload-plane planner poller. The default
+remains `discovery.type: planner`; select that backend explicitly to retain
+direct planner discovery.
 
-For each configured deployment it pipelines these reads in the background:
+Set `discovery.namespace` to track every BIS deployment in one org namespace
+(`deploy/gwp/mcm/gwp.example.yaml`). Every `rescan_interval_secs` (default 30)
+GWP scans `rt:*` and keeps the route tables in that namespace whose deployment
+publishes LSM samples. Each (deployment, workload plane) becomes endpoint
+`<deployment>/<plane>`, routed under model `<deployment>`, and `endpoints` and
+`routes` must not be configured. KVLocator callers send the deployment as
+`model_id`; an empty `eligible_endpoint_ids` means every plane, and placements
+name the bare plane. Unchanged topology is republished once per rescan interval.
+
+For each tracked deployment it pipelines these reads in the background:
 
 - `GET rt:<model_deployment_id>` for MCM's `RouteTable` protobuf JSON.
 - `HGETALL bis:<model_deployment_id>:v1:metrics` for relayed LSM samples.
 - Optionally, `HGETALL bis:<model_deployment_id>:v1:metrics:observed` for the
   newer samples Alyx has collected through responses.
 
-The endpoint directory and credentials remain operator configuration. Each
-endpoint maps explicitly to one deployment and workload plane; its canonical
-GWP model ID must equal `model_deployment_id`. Optional `namespace` additionally
-checks both route and sample identity. Every configured endpoint needs a
-mapping. See `deploy/gwp/mcm/gwp.example.yaml`.
+Without `discovery.namespace`, the endpoint directory is operator
+configuration: list `endpoints` and `routes`, and map every endpoint under
+`discovery.endpoints` to one deployment and workload plane. Its canonical GWP
+model ID must equal `model_deployment_id`; an optional per-endpoint `namespace`
+additionally checks route and sample identity.
 
-A destination must have both an MCM route and fresh positive capacity.
+A destination must have an MCM route, fresh positive capacity, and usable worker
+IDs in a fresh relayed sample.
 Weighted routes require positive weight and replicas other than explicit zero;
-fill-first routes require positive replicas and container concurrency. This
+fill-first routes only need to list the plane, because their replica counts lag
+migrations; fresh relayed samples decide where workers are. This
 adapter determines membership; it does not implement MCM traffic weights or
 request-specific region/compliance policy. Existing GWP routing-requirement
 filtering and worker scoring still apply.
 
-The newest valid relayed/observed sample wins. Identity mismatches, malformed
+The newest valid relayed/observed sample supplies capacity and drain markers.
+Identity mismatches, malformed
 samples, stale timestamps and regressing revisions cannot restore a removed
 route. A missing route, expired hash field, Redis error or read timeout removes
 the affected destinations from the published topology. Redis failures withdraw
@@ -133,11 +147,25 @@ to readiness; dispatchers can fall back to their existing routing. Sample age
 is measured from LSM's timestamp, so reading a delayed Kafka event does not make
 it fresh again.
 
-Planner polling continues to supply worker inventory and detailed load.
-The current MCM capacity message lacks those details; its empty `workerIds`
-field is not interpreted as an authoritative empty worker set. A Redis refresh
-does not reset the scheduler's load-observation anchors. Extending LSM's worker
-snapshot later can replace this planner source without changing request handlers.
+Only the relayed sample's `workerIds` supplies inventory: Alyx's response-header
+samples intentionally omit those IDs. Relayed inventory has independent age and
+monotonicity checks, so fresh observed capacity cannot revive stale or removed
+workers. A newer relayed sample replaces the previous set, including removals.
+Missing or empty IDs yield no candidates: older LSM feeds that omit inventory
+cannot be used for MCM discovery. IDs must be decimal u64 values; IDs advertised
+by multiple endpoints are excluded. `drainingWorkers` maps to the existing drain
+taints, whose routing behavior is controlled by `router_honor_draining`.
+
+The current LSM publisher includes prefill and combined prefill/decode workers
+in `workerIds`, and excludes decode-only workers. This is the candidate inventory
+for prefill placement; it does not provide a separate decode candidate set or
+per-worker DP/runtime metadata.
+
+MCM discovery does not require per-worker load details. GWP uses its scheduler's
+local and replicated attempt accounting for load estimates; no endpoint-level
+capacity is divided into invented per-worker baselines. Inventory refreshes do
+not reset that accounting. Planner URLs and credentials may be omitted in MCM
+mode, and `ingress_url` is needed only for endpoints Envoy routes to.
 
 Build with `server,redis,etcd`. `deploy/gwp/mcm` builds on the existing
 GWP/Envoy deployment, supplies `DYN_GWP_MCM_REDIS_URL` from the
@@ -151,7 +179,8 @@ separate from MCM destination discovery.
 
 Observe `gwp_discovery_polls_total{result="ok"|"error"}` and
 `gwp_discovery_eligible_endpoints`, together with standard readiness and planner
-metrics. The Redis integration test uses an isolated database:
+metrics when using planner discovery. The Redis integration test uses an
+isolated database and checks that MCM mode never contacts a planner:
 
 ```sh
 DYN_GWP_TEST_REDIS=redis://127.0.0.1:6379/ cargo test -p dynamo-gwp \
