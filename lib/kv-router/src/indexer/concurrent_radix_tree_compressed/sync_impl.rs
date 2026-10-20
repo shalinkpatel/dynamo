@@ -15,7 +15,7 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
         event_receiver: flume::Receiver<WorkerTask>,
         metrics: Option<Arc<KvIndexerMetrics>>,
     ) -> anyhow::Result<()> {
-        let mut lookup = FxHashMap::default();
+        let mut lookup = LaneLookup::default();
         let counters = metrics.as_ref().map(|m| m.prebind());
 
         while let Ok(task) = event_receiver.recv() {
@@ -80,11 +80,15 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
                     let _ = sender.send(stats);
                 }
                 WorkerTask::Flush(sender) => {
+                    self.drain_pending_unlinks(&mut lookup, usize::MAX);
                     let _ = sender.send(());
                 }
                 WorkerTask::Terminate => {
                     break;
                 }
+            }
+            while !lookup.pending_unlinks.is_empty() && event_receiver.is_empty() {
+                self.drain_pending_unlinks(&mut lookup, 64);
             }
         }
 
@@ -167,6 +171,12 @@ impl SyncIndexer for ConcurrentRadixTreeCompressed {
         let mut cleanup_guard = CleanupGuard::new(&self.cleanup);
         self.sweep_stale_children();
         cleanup_guard.mark_completed();
+    }
+
+    fn background_cleanup_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(
+            crate::cleanup::CLEANUP_INTERVAL_MS,
+        ))
     }
 
     fn timing_report(&self) -> String {

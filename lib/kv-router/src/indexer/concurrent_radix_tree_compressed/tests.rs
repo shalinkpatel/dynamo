@@ -10,14 +10,14 @@ use crate::test_utils::{
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-type DirectLookup = FxHashMap<WorkerWithDpRank, WorkerLookup>;
+type DirectLookup = LaneLookup;
 
 fn worker(worker_id: u64) -> WorkerWithDpRank {
     WorkerWithDpRank::new(worker_id, 0)
 }
 
 fn direct_lookup() -> DirectLookup {
-    FxHashMap::default()
+    LaneLookup::default()
 }
 
 fn worker_lookup_len(lookup: &DirectLookup, worker: WorkerWithDpRank) -> Option<usize> {
@@ -733,7 +733,7 @@ mod remove_cleanup_tests {
 
         let expected_snapshot = vec![make_store_event(0, &[1, 2, 3])];
         assert_eq!(snapshot_tree(&index).await, expected_snapshot);
-        assert_eq!(index.backend().raw_child_edge_count(), 3);
+        assert_eq!(index.backend().raw_child_edge_count(), 1);
 
         index.backend().run_cleanup_for_test();
 
@@ -776,5 +776,185 @@ mod remove_cleanup_tests {
 
         assert_edge_lengths(index.backend(), &[2, 3]);
         assert_score(&index, &[1, 2, 3, 8, 9], WorkerWithDpRank::new(0, 0), 5).await;
+    }
+}
+
+#[test]
+fn eager_reclamation_covers_split_born_dead_suffix() {
+    let index = ConcurrentRadixTreeCompressed::new();
+    let mut lookup = direct_lookup();
+    apply_direct(&index, &mut lookup, make_store_event(0, &[1, 2, 3, 4]));
+    apply_direct(
+        &index,
+        &mut lookup,
+        make_remove_event_with_parent(0, &[1, 2], &[3, 4]),
+    );
+    apply_direct(
+        &index,
+        &mut lookup,
+        make_store_event_with_parent(0, &[1, 2], &[7, 8]),
+    );
+    assert_eq!(index.raw_child_edge_count(), 3);
+    index.drain_pending_unlinks(&mut lookup, usize::MAX);
+    assert_eq!(index.raw_child_edge_count(), 2);
+    assert_direct_score(&index, &[1, 2, 7, 8], worker(0), 4);
+}
+
+#[test]
+fn eager_reclamation_leaves_pinned_nodes_to_backstop() {
+    let index = ConcurrentRadixTreeCompressed::new();
+    let mut lookup = direct_lookup();
+    apply_direct(&index, &mut lookup, make_store_event(0, &[1, 2, 3]));
+    let pinned = lookup
+        .get(&worker(0))
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    index.remove_or_clear_worker_blocks(&mut lookup, 0, false);
+    index.drain_pending_unlinks(&mut lookup, usize::MAX);
+    assert_eq!(index.raw_child_edge_count(), 1);
+    drop(pinned);
+    index.run_cleanup_for_test();
+    assert_eq!(index.raw_child_edge_count(), 0);
+}
+
+#[test]
+fn eager_reclamation_bounds_pending_prompt_churn() {
+    let index = ConcurrentRadixTreeCompressed::new();
+    let mut lookup = direct_lookup();
+    for token in 1..5001 {
+        apply_direct(&index, &mut lookup, make_store_event(0, &[token]));
+        index.remove_or_clear_worker_blocks(&mut lookup, 0, true);
+        assert!(lookup.pending_unlinks.len() < 4096);
+    }
+    index.drain_pending_unlinks(&mut lookup, usize::MAX);
+    index.run_cleanup_for_test();
+    assert_eq!(index.raw_child_edge_count(), 0);
+}
+
+#[test]
+fn eager_reclamation_does_not_unlink_a_replacement_child() {
+    let index = ConcurrentRadixTreeCompressed::new();
+    let mut lookup = direct_lookup();
+    apply_direct(&index, &mut lookup, make_store_event(0, &[1, 2, 3]));
+    index.remove_or_clear_worker_blocks(&mut lookup, 0, true);
+    let detached = index.root.take_children();
+    apply_direct(&index, &mut lookup, make_store_event(0, &[1, 2, 3]));
+    index.remove_or_clear_worker_blocks(&mut lookup, 0, true);
+    index.drain_pending_unlinks(&mut lookup, 1);
+    assert_eq!(index.raw_child_edge_count(), 1);
+    index.drain_pending_unlinks(&mut lookup, usize::MAX);
+    assert_eq!(index.raw_child_edge_count(), 0);
+    drop(detached);
+}
+
+#[test]
+fn eager_reclamation_preserves_revived_leaf() {
+    let index = ConcurrentRadixTreeCompressed::new();
+    let mut lookup = direct_lookup();
+    apply_direct(&index, &mut lookup, make_store_event(0, &[1, 2, 3]));
+    index.remove_or_clear_worker_blocks(&mut lookup, 0, true);
+    apply_direct(&index, &mut lookup, make_store_event(0, &[1, 2, 3]));
+    index.drain_pending_unlinks(&mut lookup, usize::MAX);
+    assert_eq!(index.raw_child_edge_count(), 1);
+    assert_direct_score(&index, &[1, 2, 3], worker(0), 3);
+}
+
+#[test]
+fn successful_repair_does_not_restore_scrubbed_other_worker_entries() {
+    let index = ConcurrentRadixTreeCompressed::new();
+    let scrubbed_worker = worker(1);
+    let repairing_worker = worker(2);
+    let mut shared_lookup = direct_lookup();
+    let mut splitter_lookup = direct_lookup();
+
+    apply_direct(
+        &index,
+        &mut shared_lookup,
+        make_store_event(1, &[1, 2, 3, 4]),
+    );
+    apply_direct(
+        &index,
+        &mut shared_lookup,
+        make_store_event(2, &[1, 2, 3, 4]),
+    );
+
+    // A split from another event thread leaves both local lookups pointing at
+    // the old prefix node for the [3, 4] suffix.
+    apply_direct(
+        &index,
+        &mut splitter_lookup,
+        make_store_event(3, &[1, 2, 9]),
+    );
+    let suffix_hashes: Vec<_> = compute_seq_hash_for_block(&local_hashes(&[1, 2, 3, 4]))
+        .into_iter()
+        .skip(2)
+        .map(ExternalSequenceBlockHash)
+        .collect();
+
+    // A resolve-miss remove scrubs lookup state but cannot update coverage on
+    // the node it failed to find. Model that boundary directly while keeping
+    // the resolved live node's coverage intact.
+    let scrubbed_lookup = shared_lookup.get_mut(&scrubbed_worker).unwrap();
+    for hash in &suffix_hashes {
+        scrubbed_lookup.remove(hash);
+    }
+    assert_eq!(worker_lookup_len(&shared_lookup, scrubbed_worker), Some(2));
+    assert_direct_score(&index, &[1, 2, 3, 4], scrubbed_worker, 4);
+
+    // A different worker's stale lookup successfully resolves the suffix and
+    // repairs the event thread's shared lookup map.
+    let resolved = index
+        .resolve_lookup(
+            &mut shared_lookup,
+            repairing_worker,
+            suffix_hashes[0],
+            LookupRepairDirection::TowardTail,
+        )
+        .expect("repairing worker should resolve the split suffix");
+
+    let repairing_lookup = shared_lookup.get(&repairing_worker).unwrap();
+    for hash in &suffix_hashes {
+        assert!(Arc::ptr_eq(repairing_lookup.get(hash).unwrap(), &resolved));
+    }
+
+    let scrubbed_lookup = shared_lookup.get(&scrubbed_worker).unwrap();
+    for hash in suffix_hashes {
+        assert!(
+            !scrubbed_lookup.contains_key(&hash),
+            "repair for another worker restored a scrubbed lookup entry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn head_first_eviction_after_cross_worker_split_releases_lookup_entries() {
+    use crate::test_utils::{assert_no_scores, make_remove_event};
+    let index = ThreadPoolIndexer::new(ConcurrentRadixTreeCompressed::new(), 4, 32);
+    for cycle in 1..=3 {
+        let start = cycle * 100;
+        let base: Vec<u64> = (start..start + 16).collect();
+        let mut branch = base[..8].to_vec();
+        branch.push(10_000 + cycle);
+        index.apply_event(make_store_event(0, &base)).await;
+        index.flush().await;
+        index.apply_event(make_store_event(1, &branch)).await;
+        index.flush().await;
+        assert_score(&index, &base, worker(0), 16).await;
+        index.apply_event(make_remove_event(1, &branch)).await;
+        index.flush().await;
+        index.apply_event(make_remove_event(0, &base)).await;
+        index.flush().await;
+        index.backend().run_cleanup_for_test();
+        assert_no_scores(&index, &base).await;
+        let tracked: usize = index
+            .shard_sizes()
+            .await
+            .iter()
+            .map(|s| s.block_count)
+            .sum();
+        assert_eq!(tracked, 0, "removed hashes retained after cycle {cycle}");
     }
 }

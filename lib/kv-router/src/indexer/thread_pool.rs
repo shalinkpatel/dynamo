@@ -63,6 +63,7 @@ pub struct ThreadPoolIndexer<T: SyncIndexer> {
 
     /// Handles to worker threads for joining on shutdown.
     thread_handles: Mutex<Vec<JoinHandle<()>>>,
+    cleanup_stop: Option<flume::Sender<()>>,
 
     /// Approximate-mode TTL pruning manager. None for normal event-driven mode.
     prune_manager: Option<WorkerPruneManager>,
@@ -187,6 +188,20 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             thread_handles.push(handle);
         }
 
+        let cleanup_stop = backend.background_cleanup_interval().map(|interval| {
+            let (stop, receiver) = flume::bounded::<()>(1);
+            let backend = backend.clone();
+            thread_handles.push(std::thread::spawn(move || {
+                while matches!(
+                    receiver.recv_timeout(interval),
+                    Err(flume::RecvTimeoutError::Timeout)
+                ) {
+                    backend.run_cleanup_task();
+                }
+            }));
+            stop
+        });
+
         let prune_manager = prune_config.map(WorkerPruneManager::new);
         let prune_pump_cancel = prune_manager.as_ref().map(|prune_manager| {
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -210,6 +225,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             num_workers,
             kv_block_size,
             thread_handles: Mutex::new(thread_handles),
+            cleanup_stop,
             prune_manager,
             prune_pump_cancel,
             synthetic_event_id,
@@ -445,6 +461,9 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
     }
 
     fn maybe_enqueue_cleanup(&self, thread_idx: usize) {
+        if self.cleanup_stop.is_some() {
+            return;
+        }
         if !self.backend.try_schedule_cleanup() {
             return;
         }
@@ -532,6 +551,9 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
 
 impl<T: SyncIndexer> Drop for ThreadPoolIndexer<T> {
     fn drop(&mut self) {
+        if let Some(stop) = &self.cleanup_stop {
+            let _ = stop.try_send(());
+        }
         if let Some(cancel) = &self.prune_pump_cancel {
             cancel.cancel();
         }
@@ -669,6 +691,9 @@ impl<T: SyncIndexer> KvIndexerInterface for ThreadPoolIndexer<T> {
     }
 
     fn shutdown(&self) {
+        if let Some(stop) = &self.cleanup_stop {
+            let _ = stop.try_send(());
+        }
         if let Some(cancel) = &self.prune_pump_cancel {
             cancel.cancel();
         }

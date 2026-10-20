@@ -18,6 +18,26 @@ pub(super) type SharedNode = Arc<Node>;
 /// stored here, keeping the map compact and correct across concurrent splits.
 pub(super) type WorkerLookup = FxHashMap<ExternalSequenceBlockHash, SharedNode>;
 
+#[derive(Default)]
+pub(super) struct LaneLookup {
+    workers: FxHashMap<WorkerWithDpRank, WorkerLookup>,
+    pub(super) pending_unlinks: std::collections::VecDeque<super::node::CleanupEdge>,
+}
+
+impl std::ops::Deref for LaneLookup {
+    type Target = FxHashMap<WorkerWithDpRank, WorkerLookup>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.workers
+    }
+}
+
+impl std::ops::DerefMut for LaneLookup {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.workers
+    }
+}
+
 pub(super) struct MatchWalkResult {
     pub(super) active: FxHashSet<WorkerWithDpRank>,
     pub(super) matched_depth: u32,

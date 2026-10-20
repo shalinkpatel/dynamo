@@ -11,6 +11,7 @@ pub(super) struct NodeState {
     /// Compressed edge: sequence of `(LocalBlockHash, ExternalSequenceBlockHash)` pairs.
     /// Empty for the root node; non-empty for all other nodes.
     pub(super) edge: Vec<(LocalBlockHash, ExternalSequenceBlockHash)>,
+    pub(super) parent_tail: Option<ExternalSequenceBlockHash>,
     /// Reverse index: `ExternalSequenceBlockHash` -> position in `edge`.
     pub(super) edge_index: FxHashMap<ExternalSequenceBlockHash, usize>,
     /// Workers with partial edge coverage. `worker_cutoffs[w] = k` means worker `w`

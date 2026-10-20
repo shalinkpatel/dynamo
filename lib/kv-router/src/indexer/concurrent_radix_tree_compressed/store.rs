@@ -25,7 +25,7 @@ impl ConcurrentRadixTreeCompressed {
     #[cfg_attr(feature = "profile", inline(never))]
     pub(super) fn apply_stored(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         op: KvCacheStoreData,
         id: u64,
@@ -42,7 +42,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn resolve_store_parent(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         op: &KvCacheStoreData,
         id: u64,
@@ -59,7 +59,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn resolve_explicit_store_parent(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         parent_hash: ExternalSequenceBlockHash,
         op: &KvCacheStoreData,
@@ -84,6 +84,7 @@ impl ConcurrentRadixTreeCompressed {
                 }
                 ParentEdgeAction::InsertFromParent(split_data) => {
                     if let Some(split) = split_data {
+                        self.queue_split_dead_leaf(lookup, &node, &split.suffix);
                         self.apply_split_lookup(lookup, split);
                     }
                     return Ok(StoreParentResolution::InsertFrom {
@@ -97,7 +98,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn lookup_store_parent_node(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         parent_hash: ExternalSequenceBlockHash,
         op: &KvCacheStoreData,
@@ -129,7 +130,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn reject_uncovered_store_parent(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         node: &SharedNode,
         parent_hash: ExternalSequenceBlockHash,
@@ -156,7 +157,7 @@ impl ConcurrentRadixTreeCompressed {
     #[cfg_attr(feature = "profile", inline(never))]
     fn insert_for_resolved_parent(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         parent_resolution: StoreParentResolution,
         op: &KvCacheStoreData,
@@ -190,7 +191,7 @@ impl ConcurrentRadixTreeCompressed {
     }
 
     fn finish_with_lookup_update(
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         blocks: &[KvCacheStoredBlockData],
         node: &SharedNode,
@@ -206,10 +207,11 @@ impl ConcurrentRadixTreeCompressed {
 
     fn finish_after_split_lookup(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         finish: SplitLookupFinish<'_>,
     ) -> StoreInsertOutcome {
+        self.queue_split_dead_leaf(lookup, finish.prefix_node, &finish.split.suffix);
         self.apply_split_lookup(lookup, finish.split);
 
         let wl = lookup.get_mut(&worker).unwrap();
@@ -235,7 +237,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn child_or_insert_remaining(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         cursor: StoreParentCursor<'_>,
         remaining: &[KvCacheStoredBlockData],
@@ -303,6 +305,7 @@ impl ConcurrentRadixTreeCompressed {
                         )));
                     }
                     ParentEdgeAction::InsertFromParent(Some(split)) => {
+                        self.queue_split_dead_leaf(lookup, cursor.parent, &split.suffix);
                         self.apply_split_lookup(lookup, split);
                         return Ok(StoreInsertStep::RetryParent {
                             parent: cursor.parent.clone(),
@@ -345,7 +348,11 @@ impl ConcurrentRadixTreeCompressed {
             }
         }
 
-        let new_node = Arc::new(Node::from_blocks_for_worker(remaining, worker));
+        let new_node = Arc::new(Node::from_blocks_for_worker(
+            remaining,
+            worker,
+            cursor.last_ext_hash,
+        ));
         if let Some(parent_hash) = cursor.last_ext_hash
             && !cursor.parent_is_anchor
         {
@@ -393,7 +400,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn insert_into_child(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         child: &SharedNode,
         remaining: &[KvCacheStoredBlockData],
@@ -441,7 +448,11 @@ impl ConcurrentRadixTreeCompressed {
                 let tail = &remaining[scan.match_len..];
                 debug_assert!(!tail.is_empty());
 
-                let tail_candidate = Arc::new(Node::from_blocks_for_worker(tail, worker));
+                let tail_candidate = Arc::new(Node::from_blocks_for_worker(
+                    tail,
+                    worker,
+                    Some(remaining[scan.match_len - 1].block_hash),
+                ));
                 let SplitStoreOutcome::Done { split, tail_node } = child.split_for_store_tail(
                     worker,
                     scan.match_len,
@@ -509,7 +520,7 @@ impl ConcurrentRadixTreeCompressed {
     #[cfg_attr(feature = "profile", inline(never))]
     fn insert_blocks_from(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         parent: &SharedNode,
         parent_is_anchor: bool,

@@ -58,12 +58,12 @@ impl ConcurrentRadixTreeCompressed {
 
         for (&worker, worker_lookup) in lookup.iter_mut() {
             for covered_hash in resolved.lookup_hashes_for_worker_repair(worker, hash, direction) {
-                let previous = worker_lookup.insert(covered_hash, resolved.clone());
-                let changed = match previous {
-                    Some(previous) => !Arc::ptr_eq(&previous, resolved),
-                    None => true,
-                };
-                if changed {
+                // Absence may reflect a remove that scrubbed another worker's
+                // lookup without updating the live node's coverage.
+                if let Some(entry) = worker_lookup.get_mut(&covered_hash)
+                    && !Arc::ptr_eq(entry, resolved)
+                {
+                    *entry = Arc::clone(resolved);
                     #[cfg(feature = "bench")]
                     {
                         changed_entries += 1;

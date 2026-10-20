@@ -124,6 +124,10 @@ reuse a matching existing suffix. If the new store diverges from that suffix, th
 node is split at the parent position. The suffix becomes a child node and keeps
 the original children, so existing descendants remain reachable after the split.
 
+After splitting, the prefix edge vector and its hash index shrink to fit their
+remaining entries. This releases retained suffix capacity without changing the
+split's logical contents or the suffix's original children.
+
 ## Removal
 
 Removal updates worker coverage but does not structurally split edges.
@@ -163,9 +167,51 @@ once one hash in a moved compressed edge repairs the useful head range, later
 hashes in that same edge should hit the resolved node directly instead of paying
 another subtree scan.
 
+Repair only replaces entries already present in each worker's lookup; it never
+inserts missing entries. Another worker sharing the event thread may have had
+lookup entries scrubbed by a remove while coverage on the resolved live node
+remained unchanged. Repair must preserve that absence. Store paths still insert
+lookup entries for newly stored blocks.
+
 If the scan fails in a store path, the store is rejected with
 `ParentBlockNotFound` and logged as a warning. If it fails in a remove path, the
 remove treats the block as already gone or stale and skips it.
+
+## Eager dead-leaf reclamation (pinned-architecture backport)
+
+Each event lane owns a FIFO of weak parent/key/child candidates. Evictions,
+worker removal/clear, and splits that create a holder-less suffix enqueue dead
+leaves. The queue stays below 4096 entries by draining its oldest 1024 entries
+at capacity. Idle lanes drain at most 64 candidates before checking for another
+event; `Flush` offers all currently queued candidates before acknowledging.
+Queue entries do not keep nodes alive.
+
+An unlink uses nonblocking exclusive parent and child shape gates, verifies
+that the parent still maps the key to that exact child, and rechecks that the
+child has neither workers nor children. Its strong-reference count must be
+exactly two: the parent's map and the drain's temporary upgrade. Readers,
+other lane lookups, anchors, and in-flight store plans therefore prevent
+reclamation. Removing a child bumps the parent's shape version and does not
+reset its sticky internal marker. Busy, pinned, revived, or unresolvable
+candidates are left to the full sweep rather than retried on the event lane.
+
+The child edge records its parent's last external hash. This survives a split
+that reparents children beneath a suffix because the original tail stays with
+that suffix. Parent resolution uses the root, anchor map, or removing worker's
+existing lookup, followed by pointer-identity validation; it does not perform
+lookup repair or a tree walk on the removal path.
+
+The thread pool runs CRTC's full reverse-BFS sweep on a dedicated, joinable
+maintenance thread at the existing five-minute interval, including during idle
+periods. It visits root and anchor subtrees. Shutdown wakes and joins this
+thread; explicit `run_cleanup_task()` remains available.
+
+This is a semantic backport of upstream #16313 to the c9 DashMap architecture,
+not a cherry-pick of its newer child-map/lane-lookup stack. It retains that
+revision's existing sweep traversal and uses individual nonblocking unlinks
+instead of upstream's per-parent batches. It also retains the fixed sweep
+interval rather than upstream's death-aware scheduling. It does not merge
+live split history or promise that every dead leaf is immediately reclaimable.
 
 ## Concurrency Model
 

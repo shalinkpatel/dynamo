@@ -208,8 +208,13 @@ pub trait SyncIndexer: Send + Sync + 'static {
     /// Rolls back a scheduled cleanup when enqueueing the task fails.
     fn cancel_scheduled_cleanup(&self) {}
 
-    /// Executes a maintenance task on a worker thread.
+    /// Executes maintenance on a worker or the opted-in background thread.
     fn run_cleanup_task(&self) {}
+
+    /// Opts into pool-owned background sweeps instead of event-lane cleanup.
+    fn background_cleanup_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
 
     /// Dump events directly from the shared structure, bypassing worker channels.
     /// Returns `Some(events)` for backends whose tree state is fully shared (e.g.

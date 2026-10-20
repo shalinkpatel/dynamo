@@ -52,6 +52,7 @@ impl Node {
         Self::from_state_and_children(
             NodeState {
                 edge: Vec::new(),
+                parent_tail: None,
                 edge_index: FxHashMap::default(),
                 worker_cutoffs: FxHashMap::default(),
                 full_edge_workers: FxHashSet::default(),
@@ -63,6 +64,7 @@ impl Node {
     pub(super) fn from_blocks_for_worker(
         blocks: &[KvCacheStoredBlockData],
         worker: WorkerWithDpRank,
+        parent_tail: Option<ExternalSequenceBlockHash>,
     ) -> Self {
         debug_assert!(!blocks.is_empty());
 
@@ -77,6 +79,7 @@ impl Node {
         Self::from_state_and_children(
             NodeState {
                 edge,
+                parent_tail,
                 edge_index,
                 worker_cutoffs: FxHashMap::default(),
                 full_edge_workers,
@@ -95,6 +98,7 @@ impl Node {
         Self::from_state_and_children(
             NodeState {
                 edge,
+                parent_tail: None,
                 edge_index,
                 worker_cutoffs: FxHashMap::default(),
                 full_edge_workers: FxHashSet::default(),
@@ -602,6 +606,7 @@ impl Node {
         );
 
         let suffix_edge = state.edge.split_off(pos);
+        state.edge.shrink_to_fit();
         let suffix_first_local = suffix_edge[0].0;
         let prefix_len = pos;
         let suffix_edge_index = NodeState::edge_index_for(&suffix_edge);
@@ -609,6 +614,7 @@ impl Node {
         for &(_, hash) in &suffix_edge {
             state.edge_index.remove(&hash);
         }
+        state.edge_index.shrink_to_fit();
 
         let mut suffix_full =
             FxHashSet::with_capacity_and_hasher(state.full_edge_workers.len(), FxBuildHasher);
@@ -643,6 +649,7 @@ impl Node {
         let suffix = Arc::new(Node::from_state_and_children(
             NodeState {
                 edge: suffix_edge,
+                parent_tail: state.edge.last().map(|&(_, hash)| hash),
                 edge_index: suffix_edge_index,
                 worker_cutoffs: suffix_cutoffs,
                 full_edge_workers: suffix_full,
@@ -774,8 +781,26 @@ impl Node {
         }
     }
 
+    pub(super) fn dead_leaf_key_and_tail(
+        &self,
+    ) -> Option<(LocalBlockHash, Option<ExternalSequenceBlockHash>)> {
+        let state = self.state.read();
+        if state.has_any_workers() || !self.children.is_empty() {
+            return None;
+        }
+        Some((state.edge.first()?.0, state.parent_tail))
+    }
+
+    pub(super) fn has_child(&self, key: LocalBlockHash, child: &SharedNode) -> bool {
+        self.children
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), child))
+    }
+
     pub(super) fn remove_child_if_stale_leaf(&self, key: LocalBlockHash, child: &SharedNode) {
-        let _parent_gate = self.shape_gate.write();
+        let Some(_parent_gate) = self.shape_gate.try_write() else {
+            return;
+        };
         let still_attached = self
             .children
             .get(&key)
@@ -803,4 +828,48 @@ pub(super) struct CleanupEdge {
     pub(super) parent: Weak<Node>,
     pub(super) key: LocalBlockHash,
     pub(super) child: Weak<Node>,
+}
+
+#[cfg(test)]
+mod b10_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn b10_split_releases_prefix_capacity_and_preserves_suffix_children() {
+        let edge: Vec<_> = (0..4096)
+            .map(|hash| (LocalBlockHash(hash), ExternalSequenceBlockHash(hash)))
+            .collect();
+        let edge_index = NodeState::edge_index_for(&edge);
+        let old_index_capacity = edge_index.capacity();
+        let child = Arc::new(Node::from_anchor(
+            LocalBlockHash(4096),
+            ExternalSequenceBlockHash(4096),
+        ));
+        let node = Node::from_state_and_children(
+            NodeState {
+                edge,
+                parent_tail: None,
+                edge_index,
+                worker_cutoffs: FxHashMap::default(),
+                full_edge_workers: FxHashSet::default(),
+            },
+            FxHashMap::from_iter([(LocalBlockHash(4096), child.clone())]),
+        );
+
+        let _gate = node.shape_gate.write();
+        let mut state = node.state.write();
+        let split = node.split_at_locked(&mut state, 1);
+
+        assert_eq!(
+            state.edge,
+            vec![(LocalBlockHash(0), ExternalSequenceBlockHash(0))]
+        );
+        assert_eq!(state.edge.capacity(), 1);
+        assert_eq!(state.edge_index.len(), 1);
+        assert!(state.edge_index.capacity() < old_index_capacity);
+        assert_eq!(split.suffix.state.read().edge.len(), 4095);
+        assert!(split.suffix.has_child(LocalBlockHash(4096), &child));
+        assert!(!node.has_child(LocalBlockHash(4096), &child));
+        assert!(node.internal.load(Ordering::Acquire));
+    }
 }

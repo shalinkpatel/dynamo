@@ -2270,6 +2270,18 @@ For v1.2, keep this section as audit evidence only. Do not replay these commits
 directly; use them to verify whether each functional patch has already been
 satisfied by the target SHA.
 
+### CRTC memory backports
+
+Status: `upstream-sync`
+
+Fork PR: [#1060](https://github.com/basetenlabs/dynamo/pull/1060).
+
+- Backport [#11785](https://github.com/ai-dynamo/dynamo/pull/11785) resolve-miss scrubbing and [#11891](https://github.com/ai-dynamo/dynamo/pull/11891) update-existing-only repair: eviction cannot retain or resurrect worker lookup references.
+- Semantically port [#16313](https://github.com/ai-dynamo/dynamo/pull/16313) eager dead-leaf reclamation to the fork's DashMap architecture; retain individual nonblocking unlinks, reverse-BFS sweeps, and the fixed five-minute interval rather than upstream's newer child maps, batched unlinks, and death-aware scheduling.
+- Shrink split-prefix vectors and hash indexes after suffix removal; preserve suffix children, sticky internal state, coverage, anchors, and lower-tier routing APIs. This is separate from #16313, which excludes split-capacity controls.
+
+Regressions cover failed/successful repair, bounded weak cleanup candidates, pinned/revived/replacement leaves, split-born dead suffixes, and released prefix capacity with preserved children. Drop when the fork advances to an upstream release containing equivalent fixes; retain the focused tests.
+
 Replay notes:
 
 Before replaying onto a newer upstream tag, search upstream history for these

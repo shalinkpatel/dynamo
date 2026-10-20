@@ -161,7 +161,7 @@ impl ConcurrentRadixTreeCompressed {
 
     fn resolve_anchor_lookup(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         worker: WorkerWithDpRank,
         hash: ExternalSequenceBlockHash,
     ) -> Option<SharedNode> {
@@ -185,11 +185,7 @@ impl ConcurrentRadixTreeCompressed {
     ///
     /// Updates worker lookup maps so entries for blocks that moved to the suffix now
     /// point to the suffix node. Must be called **after** the write guard is dropped.
-    fn apply_split_lookup(
-        &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
-        split: SplitLookupData,
-    ) {
+    fn apply_split_lookup(&self, lookup: &mut LaneLookup, split: SplitLookupData) {
         #[cfg(feature = "bench")]
         self.bench_metrics
             .node_splits
@@ -230,7 +226,7 @@ impl ConcurrentRadixTreeCompressed {
     #[cfg_attr(feature = "profile", inline(never))]
     fn apply_event(
         &self,
-        lookup: &mut FxHashMap<WorkerWithDpRank, WorkerLookup>,
+        lookup: &mut LaneLookup,
         event: RouterEvent,
         counters: Option<&PreBoundEventCounters>,
     ) -> Result<(), KvCacheEventError> {
