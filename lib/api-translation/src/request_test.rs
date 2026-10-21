@@ -329,6 +329,57 @@ fn tool_result_image_block_becomes_cc_image_part() {
     );
 }
 
+/// Anthropic tool search (Claude Code ToolSearch): `tool_reference` blocks reach the chat
+/// template as typed parts, so it can expand the deferred tool's schema, instead of JSON text.
+#[test]
+fn b10_tool_result_tool_reference_blocks_become_tool_reference_parts() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_channel"},
+        ]},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(
+        out,
+        vec![json!({"role": "tool", "tool_call_id": "t1", "content": [
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
+            {"type": "tool_reference", "tool_name": "mcp__slack__read_channel"},
+        ]})]
+    );
+}
+
+/// References mixed with text stay coerced text: the GLM template expands references only when
+/// they lead the content, so typed parts would drop the text or the pointer.
+#[test]
+fn b10_tool_result_tool_reference_mixed_with_text_stays_text() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": "Found:"},
+            {"type": "tool_reference", "tool_name": "lookup_stock"},
+        ]},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(out.len(), 1);
+    let content = out[0]["content"].as_str().expect("flat text content");
+    assert!(content.starts_with("Found:\n"), "content: {content}");
+    assert!(content.contains("lookup_stock"), "content: {content}");
+}
+
+/// A `tool_reference` without a string `tool_name` is not a reference: it stays coerced text.
+#[test]
+fn b10_tool_result_malformed_tool_reference_stays_text() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "tool_reference", "name": "lookup_stock"},
+        ]},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(out.len(), 1);
+    let content = out[0]["content"].as_str().expect("flat text content");
+    assert!(content.contains("lookup_stock"), "content: {content}");
+}
+
 #[test]
 fn tool_result_non_base64_image_source_is_refused() {
     let msg = anthropic_message(json!({"role": "user", "content": [

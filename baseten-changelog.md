@@ -1921,7 +1921,9 @@ require stable environment routes, with `DYNAMO_ALLOW_UNSTABLE_ENCODER_URL` as a
 
 `/v1/messages` and `/v1/responses` client tools carry `defer_loading` to the Chat Completions
 tool, so deferred tools reach the worker's `tool_reference_render` placement instead of
-rendering eagerly.
+rendering eagerly. `/v1/messages` `tool_result` blocks of type `tool_reference` become `tool_reference`
+tool-message parts instead of coerced JSON text, so the chat template expands the referenced
+tool's schema in place.
 
 `/v1/messages` client tools carry Anthropic `strict` to the Chat Completions tool, as
 Responses already did, so strict tool arguments reach the serving grammar.

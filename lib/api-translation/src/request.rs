@@ -42,7 +42,8 @@ use dynamo_protocols::types::responses::{
 };
 use dynamo_protocols::types::{
     ChatCompletionNamedToolChoice, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestMessageContentPartToolReference, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
@@ -1443,6 +1444,31 @@ fn tool_result_content(
         }
         ToolResultContent::Blocks(blocks) => blocks,
     };
+    // Anthropic tool search: a result made only of `tool_reference` blocks reaches the chat
+    // template as typed parts, so it expands each deferred tool's schema in place. The GLM
+    // template expands references only when they lead the content, so a mix with text stays
+    // coerced text below rather than losing the text or the pointer.
+    let references: Option<Vec<_>> = blocks
+        .iter()
+        .map(|block| match block {
+            ToolResultContentBlock::Other(value) => tool_reference_name(value),
+            _ => None,
+        })
+        .collect();
+    if let Some(names) = references.filter(|names| !names.is_empty()) {
+        return Ok(ChatCompletionRequestToolMessageContent::Array(
+            names
+                .into_iter()
+                .map(|tool_name| {
+                    ChatCompletionRequestToolMessageContentPart::ToolReference(
+                        ChatCompletionRequestMessageContentPartToolReference {
+                            tool_name: tool_name.to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        ));
+    }
     let mut text_parts: Vec<String> = Vec::new();
     let mut parts: Vec<ChatCompletionRequestToolMessageContentPart> = Vec::new();
     let mut has_image = false;
@@ -1510,6 +1536,14 @@ fn tool_result_content(
         // other collapse, so a flat tool result reads like the block array it came from.
         ChatCompletionRequestToolMessageContent::Text(text_parts.join("\n"))
     })
+}
+
+/// The `tool_name` of an Anthropic `{"type": "tool_reference", "tool_name": ...}` block.
+fn tool_reference_name(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) != Some("tool_reference") {
+        return None;
+    }
+    value.get("tool_name").and_then(Value::as_str)
 }
 
 /// Ceiling for passing an unknown no-text block through as raw JSON. Above this the block becomes
