@@ -182,6 +182,7 @@ Source commits:
 - `7a6c0cb81` chore(container): bump bundled NATS to v2.14.4 and etcd to v3.7.1 (CVE remediation; server pins only, client crates unchanged)
 - Current PR: build(mocker): enable KVBM offload in runtime wheel
 - Current PR: build: upgrade NIXL stack to 1.4.0
+- Current PR: refresh Go 1.26.10, uv 0.13.4, and fixed Rust CA roots for the eMudhra incident.
 
 Purpose:
 

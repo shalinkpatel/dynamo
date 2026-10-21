@@ -8,7 +8,7 @@ RUN apt-get update \
  && apt-get install -yq libucx0 python3-dev python3-pip python3-venv git protobuf-compiler curl ffmpeg libclang-dev \
  && apt-get clean
 
-COPY --from=ghcr.io/astral-sh/uv:0.10.11 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.13.4 /uv /uvx /bin/
 ENV UV_LINK_MODE=copy
 
 RUN uv venv /opt/dynamo/venv --python 3.12 \
