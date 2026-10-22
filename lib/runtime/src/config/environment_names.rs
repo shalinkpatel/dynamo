@@ -204,6 +204,16 @@ pub mod kvbm {
 
     /// Stable identity shared by all tensor-parallel ranks in one G2 replica.
     pub const DYN_KVBM_G2PB_REPLICA_ID: &str = "DYN_KVBM_G2PB_REPLICA_ID";
+
+    /// How long the replica publisher collects changes before it flushes a
+    /// batch, in milliseconds (default 50). Longer means fewer, larger messages
+    /// and a staler peer index.
+    pub const DYN_KVBM_G2PB_REPLICA_BATCH_MS: &str = "DYN_KVBM_G2PB_REPLICA_BATCH_MS";
+
+    /// Maximum distinct keys per replica-index batch and per message (default 4096).
+    pub const DYN_KVBM_G2PB_REPLICA_BATCH_MAX_BLOCKS: &str =
+        "DYN_KVBM_G2PB_REPLICA_BATCH_MAX_BLOCKS";
+
     /// Enable KVBM metrics endpoint
     pub const DYN_KVBM_METRICS: &str = "DYN_KVBM_METRICS";
 

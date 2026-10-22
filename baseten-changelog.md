@@ -2773,6 +2773,7 @@ Source commits:
 - fix(g2direct): drop index entries for host slots refilled by a fetch
 - feat(g2direct): publish pages a replica pulls from peers
 - feat(g2direct): opt-in node-scoped replica index (`DYN_HICACHE_G2_INDEX_MODE=node`)
+- feat(g2direct): compact replica-index wire format (replaces the named encoding; topic `kvbm.serving_g2.replicas.v2`) and env-tunable publish batching
 
 Purpose:
 

@@ -30,7 +30,10 @@ use dynamo_runtime::pipeline::{
 use dynamo_runtime::stream::{self, StreamExt};
 use dynamo_runtime::transports::event_plane::{EventPublisher, EventSubscriber};
 
-pub const SERVING_G2_REPLICA_TOPIC: &str = "kvbm.serving_g2.replicas.v1";
+/// Replica events in the compact positional encoding (see
+/// `encode_compact_replica_event`). The suffix names the encoding; deployments
+/// never mix builds, so there is no other topic to stay compatible with.
+pub const SERVING_G2_REPLICA_TOPIC: &str = "kvbm.serving_g2.replicas.v2";
 pub const SERVING_G2_INDEX_NAMESPACE: &str = "kvbm-serving-g2";
 pub const SERVING_G2_MODEL_NAMESPACE_ENV: &str = "DYNAMO_MODEL_NAMESPACE";
 pub const SERVING_G2_DEFAULT_MODEL_NAMESPACE: &str = "dynamo";
@@ -39,9 +42,56 @@ pub const SERVING_G2_INDEX_QUERY_ENDPOINT: &str = "query";
 pub const SERVING_G2_PEER_COMPONENT: &str = "replica-peer";
 pub const SERVING_G2_PEER_ENDPOINT: &str = "fetch";
 const REPLICA_EVENT_WORKERS: usize = 8;
-const REPLICA_BATCH_DEADLINE: Duration = Duration::from_millis(50);
+const REPLICA_BATCH_DEADLINE_MS: u64 = 50;
 const REPLICA_BATCH_MAX_BLOCKS: usize = 4_096;
 const REPLICA_PUBLISH_QUEUE_CAPACITY: usize = 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplicaPublishConfig {
+    batch_deadline: Duration,
+    batch_max_blocks: usize,
+}
+
+impl ReplicaPublishConfig {
+    fn parse(batch_ms: Option<&str>, max_blocks: Option<&str>) -> Result<Self> {
+        use dynamo_runtime::config::environment_names::kvbm;
+        let parse_number = |name: &str, value: Option<&str>, default: u64| -> Result<u64> {
+            match value.map(str::trim).filter(|value| !value.is_empty()) {
+                None => Ok(default),
+                Some(value) => value
+                    .parse()
+                    .with_context(|| format!("{name} must be a non-negative integer; got {value}")),
+            }
+        };
+        let batch_ms = parse_number(
+            kvbm::DYN_KVBM_G2PB_REPLICA_BATCH_MS,
+            batch_ms,
+            REPLICA_BATCH_DEADLINE_MS,
+        )?;
+        let batch_max_blocks = parse_number(
+            kvbm::DYN_KVBM_G2PB_REPLICA_BATCH_MAX_BLOCKS,
+            max_blocks,
+            REPLICA_BATCH_MAX_BLOCKS as u64,
+        )?;
+        anyhow::ensure!(
+            batch_max_blocks > 0,
+            "{} must be at least 1",
+            kvbm::DYN_KVBM_G2PB_REPLICA_BATCH_MAX_BLOCKS
+        );
+        Ok(Self {
+            batch_deadline: Duration::from_millis(batch_ms),
+            batch_max_blocks: usize::try_from(batch_max_blocks)?,
+        })
+    }
+
+    fn from_env() -> Result<Self> {
+        use dynamo_runtime::config::environment_names::kvbm;
+        Self::parse(
+            optional_utf8_env(kvbm::DYN_KVBM_G2PB_REPLICA_BATCH_MS)?.as_deref(),
+            optional_utf8_env(kvbm::DYN_KVBM_G2PB_REPLICA_BATCH_MAX_BLOCKS)?.as_deref(),
+        )
+    }
+}
 
 /// Scope direct G2G discovery beneath the model deployment's namespace.
 pub fn serving_g2_namespace(
@@ -219,6 +269,155 @@ pub struct ReplicaEvent {
     pub source: ReplicaSource,
     pub revision: u64,
     pub kind: ReplicaEventKind,
+}
+
+/// Source header of a v2 message, positional so absent options keep their slot:
+/// (instance_id, tp_rank, replica_id, tp_world_size, incarnation, block_size, row).
+type CompactReplicaSource = (u64, u32, Option<u64>, u32, Uuid, u32, Option<String>);
+
+#[derive(Serialize, Deserialize)]
+enum CompactReplicaKind {
+    /// Every block has `size_bytes`. `keys` and `checksums` are packed
+    /// little-endian u64s; `checksums` is empty when no block has one.
+    Upsert {
+        size_bytes: u64,
+        #[serde(with = "serde_bytes")]
+        keys: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        checksums: Vec<u8>,
+    },
+    /// Fallback when sizes or checksum presence differ within one batch.
+    UpsertMixed(Vec<(SequenceHash, u64, Option<u64>)>),
+    Remove(#[serde(with = "serde_bytes")] Vec<u8>),
+    RemoveSource,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CompactReplicaEvent(CompactReplicaSource, u64, CompactReplicaKind);
+
+fn pack_u64s(values: impl IntoIterator<Item = u64>) -> Vec<u8> {
+    values.into_iter().flat_map(u64::to_le_bytes).collect()
+}
+
+fn unpack_u64s(packed: &[u8]) -> Result<Vec<u64>> {
+    anyhow::ensure!(
+        packed.len().is_multiple_of(8),
+        "packed u64 array has {} bytes",
+        packed.len()
+    );
+    Ok(packed
+        .chunks_exact(8)
+        .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+        .collect())
+}
+
+/// Encode an event for `SERVING_G2_REPLICA_TOPIC`: msgpack arrays instead of
+/// named maps, one source header per message, and a uniform upsert batch as one
+/// `size_bytes` plus packed keys and checksums (16 bytes per block).
+pub fn encode_compact_replica_event(event: &ReplicaEvent) -> Result<Vec<u8>> {
+    let source = &event.source;
+    let header = (
+        source.key.instance_id,
+        source.key.tp_rank,
+        source.replica_id,
+        source.tp_world_size,
+        source.incarnation,
+        source.block_size,
+        source.row.clone(),
+    );
+    let kind = match &event.kind {
+        ReplicaEventKind::Upsert(blocks) => {
+            let size_bytes = blocks.first().map_or(0, |block| block.size_bytes);
+            let all_checksums = blocks.iter().all(|block| block.checksum.is_some());
+            let no_checksums = blocks.iter().all(|block| block.checksum.is_none());
+            if blocks.iter().all(|block| block.size_bytes == size_bytes)
+                && (all_checksums || no_checksums)
+            {
+                CompactReplicaKind::Upsert {
+                    size_bytes,
+                    keys: pack_u64s(blocks.iter().map(|block| block.key)),
+                    checksums: pack_u64s(blocks.iter().filter_map(|block| block.checksum)),
+                }
+            } else {
+                CompactReplicaKind::UpsertMixed(
+                    blocks
+                        .iter()
+                        .map(|block| (block.key, block.size_bytes, block.checksum))
+                        .collect(),
+                )
+            }
+        }
+        ReplicaEventKind::Remove(keys) => {
+            CompactReplicaKind::Remove(pack_u64s(keys.iter().copied()))
+        }
+        ReplicaEventKind::RemoveSource => CompactReplicaKind::RemoveSource,
+    };
+    Ok(rmp_serde::to_vec(&CompactReplicaEvent(
+        header,
+        event.revision,
+        kind,
+    ))?)
+}
+
+pub fn decode_compact_replica_event(bytes: &[u8]) -> Result<ReplicaEvent> {
+    let CompactReplicaEvent(
+        (instance_id, tp_rank, replica_id, tp_world_size, incarnation, block_size, row),
+        revision,
+        kind,
+    ) = rmp_serde::from_slice(bytes)?;
+    let kind = match kind {
+        CompactReplicaKind::Upsert {
+            size_bytes,
+            keys,
+            checksums,
+        } => {
+            let keys = unpack_u64s(&keys)?;
+            let checksums = unpack_u64s(&checksums)?;
+            anyhow::ensure!(
+                checksums.is_empty() || checksums.len() == keys.len(),
+                "compact upsert has {} keys and {} checksums",
+                keys.len(),
+                checksums.len()
+            );
+            ReplicaEventKind::Upsert(
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(index, key)| ReplicaBlock {
+                        key,
+                        size_bytes,
+                        checksum: checksums.get(index).copied(),
+                    })
+                    .collect(),
+            )
+        }
+        CompactReplicaKind::UpsertMixed(blocks) => ReplicaEventKind::Upsert(
+            blocks
+                .into_iter()
+                .map(|(key, size_bytes, checksum)| ReplicaBlock {
+                    key,
+                    size_bytes,
+                    checksum,
+                })
+                .collect(),
+        ),
+        CompactReplicaKind::Remove(keys) => ReplicaEventKind::Remove(unpack_u64s(&keys)?),
+        CompactReplicaKind::RemoveSource => ReplicaEventKind::RemoveSource,
+    };
+    Ok(ReplicaEvent {
+        source: ReplicaSource {
+            key: ReplicaSourceKey {
+                instance_id,
+                tp_rank,
+            },
+            replica_id,
+            tp_world_size,
+            incarnation,
+            block_size,
+            row,
+        },
+        revision,
+        kind,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,9 +654,8 @@ impl ReplicaIndex {
 
     pub async fn subscribe(component: &Component) -> Result<Arc<Self>> {
         let index = Arc::new(Self::new());
-        let subscriber = EventSubscriber::for_component(component, SERVING_G2_REPLICA_TOPIC)
-            .await?
-            .typed::<ReplicaEvent>();
+        let subscriber =
+            EventSubscriber::for_component(component, SERVING_G2_REPLICA_TOPIC).await?;
         spawn_replica_subscriber(subscriber, Arc::downgrade(&index));
         Ok(index)
     }
@@ -664,13 +862,15 @@ pub struct ReplicaPublisher {
 
 impl ReplicaPublisher {
     pub async fn new(component: &Component, source: ReplicaSource) -> Result<Arc<Self>> {
+        let config = ReplicaPublishConfig::from_env()?;
+        tracing::info!(?config, "serving-G2 replica publisher");
         let publisher = Arc::new(
             EventPublisher::for_component(component, SERVING_G2_REPLICA_TOPIC)
                 .await
                 .context("failed to create replica event publisher")?,
         );
         let (tx, rx) = mpsc::channel(REPLICA_PUBLISH_QUEUE_CAPACITY);
-        tokio::spawn(run_replica_publisher(source, publisher, rx));
+        tokio::spawn(run_replica_publisher(source, publisher, config, rx));
         Ok(Arc::new(Self { tx }))
     }
 
@@ -738,14 +938,16 @@ async fn publish_replica_event(
     kind: ReplicaEventKind,
 ) {
     *revision += 1;
-    if let Err(error) = publisher
-        .publish(&ReplicaEvent {
-            source: source.clone(),
-            revision: *revision,
-            kind,
-        })
-        .await
-    {
+    let event = ReplicaEvent {
+        source: source.clone(),
+        revision: *revision,
+        kind,
+    };
+    let published = match encode_compact_replica_event(&event) {
+        Ok(bytes) => publisher.publish_bytes(bytes).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = published {
         tracing::warn!(error = %error, "failed to publish replica event batch");
     }
 }
@@ -753,6 +955,7 @@ async fn publish_replica_event(
 async fn run_replica_publisher(
     source: ReplicaSource,
     publisher: Arc<EventPublisher>,
+    config: ReplicaPublishConfig,
     mut rx: mpsc::Receiver<ReplicaEventKind>,
 ) {
     let mut revision = 0;
@@ -760,9 +963,9 @@ async fn run_replica_publisher(
         let mut pending = PendingReplicaDelta::default();
         pending.absorb(first);
 
-        let deadline = tokio::time::sleep(REPLICA_BATCH_DEADLINE);
+        let deadline = tokio::time::sleep(config.batch_deadline);
         tokio::pin!(deadline);
-        while pending.changes.len() < REPLICA_BATCH_MAX_BLOCKS {
+        while pending.changes.len() < config.batch_max_blocks {
             tokio::select! {
                 _ = &mut deadline => break,
                 next = rx.recv() => match next {
@@ -772,23 +975,20 @@ async fn run_replica_publisher(
             }
         }
 
-        for kind in pending.into_kinds(REPLICA_BATCH_MAX_BLOCKS) {
-            publish_replica_event(&publisher, &source.clone(), &mut revision, kind).await;
+        for kind in pending.into_kinds(config.batch_max_blocks) {
+            publish_replica_event(&publisher, &source, &mut revision, kind).await;
         }
     }
     publish_replica_event(
         &publisher,
-        &source.clone(),
+        &source,
         &mut revision,
         ReplicaEventKind::RemoveSource,
     )
     .await;
 }
 
-fn spawn_replica_subscriber(
-    mut subscriber: dynamo_runtime::transports::event_plane::TypedEventSubscriber<ReplicaEvent>,
-    index: std::sync::Weak<ReplicaIndex>,
-) {
+fn spawn_replica_subscriber(mut subscriber: EventSubscriber, index: std::sync::Weak<ReplicaIndex>) {
     let mut workers = Vec::with_capacity(REPLICA_EVENT_WORKERS);
     for _ in 0..REPLICA_EVENT_WORKERS {
         let (tx, mut rx) = mpsc::unbounded_channel::<ReplicaEvent>();
@@ -804,13 +1004,15 @@ fn spawn_replica_subscriber(
         });
     }
 
+    let route = move |event: ReplicaEvent| {
+        let sticky = event.source.key.instance_id as usize ^ event.source.key.tp_rank as usize;
+        workers[sticky % workers.len()].send(event).is_ok()
+    };
     tokio::spawn(async move {
-        while let Some(event) = subscriber.next().await {
-            match event {
-                Ok((_envelope, event)) => {
-                    let sticky =
-                        event.source.key.instance_id as usize ^ event.source.key.tp_rank as usize;
-                    if workers[sticky % workers.len()].send(event).is_err() {
+        while let Some(envelope) = subscriber.next().await {
+            match envelope.and_then(|envelope| decode_compact_replica_event(&envelope.payload)) {
+                Ok(event) => {
+                    if !route(event) {
                         break;
                     }
                 }
@@ -1092,6 +1294,154 @@ mod tests {
         assert_eq!(kinds.len(), 2);
         assert!(matches!(&kinds[0], ReplicaEventKind::Remove(keys) if keys == &[12]));
         assert!(matches!(&kinds[1], ReplicaEventKind::Upsert(blocks) if blocks[0].key == 11));
+    }
+
+    fn compact_round_trip(event: ReplicaEvent) -> usize {
+        let bytes = encode_compact_replica_event(&event).expect("encode compact");
+        assert_eq!(decode_compact_replica_event(&bytes).expect("decode"), event);
+        bytes.len()
+    }
+
+    #[test]
+    fn compact_wire_round_trips_every_event_shape() {
+        let mut with_row = source(7, 1, 3);
+        with_row.row = Some("row04".to_string());
+        let mut legacy = source(9, 0, 4);
+        legacy.replica_id = None;
+        for source in [with_row, legacy] {
+            let mut no_checksum = block(13);
+            no_checksum.checksum = None;
+            let mut bigger = block(14);
+            bigger.size_bytes += 1;
+            for kind in [
+                ReplicaEventKind::Upsert(vec![block(11), block(12)]),
+                ReplicaEventKind::Upsert(vec![no_checksum.clone()]),
+                ReplicaEventKind::Upsert(vec![block(11), no_checksum]),
+                ReplicaEventKind::Upsert(vec![block(11), bigger]),
+                ReplicaEventKind::Upsert(Vec::new()),
+                ReplicaEventKind::Remove(vec![11, u64::MAX]),
+                ReplicaEventKind::RemoveSource,
+            ] {
+                compact_round_trip(ReplicaEvent {
+                    source: source.clone(),
+                    revision: 42,
+                    kind,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn compact_wire_rejects_truncated_packed_arrays() {
+        let bytes = rmp_serde::to_vec(&CompactReplicaEvent(
+            (7, 0, None, 1, Uuid::nil(), 64, None),
+            1,
+            CompactReplicaKind::Remove(vec![0; 7]),
+        ))
+        .unwrap();
+        assert!(decode_compact_replica_event(&bytes).is_err());
+        let bytes = rmp_serde::to_vec(&CompactReplicaEvent(
+            (7, 0, None, 1, Uuid::nil(), 64, None),
+            1,
+            CompactReplicaKind::Upsert {
+                size_bytes: 1,
+                keys: vec![0; 16],
+                checksums: vec![0; 8],
+            },
+        ))
+        .unwrap();
+        assert!(decode_compact_replica_event(&bytes).is_err());
+    }
+
+    /// Payload bytes of the old named encoding (`to_vec_named`, what the event
+    /// plane codec emits) against v2, for realistic hash-valued keys. Run with
+    /// `--nocapture` for the table quoted in the PR.
+    #[test]
+    fn compact_wire_is_at_least_2x_smaller_for_upserts() {
+        let mut source = source(0x9e37_79b9_7f4a_7c15, 3, 5);
+        source.tp_world_size = 8;
+        source.replica_id = Some(0xc2b2_ae3d_27d4_eb4f);
+        source.row = Some("row04".to_string());
+        // Sequence hashes and checksums are uniformly distributed u64s.
+        let hash = |seed: u64| compute_hash_v2(&seed.to_le_bytes(), 0);
+        // Fixed per-message cost of the event-plane envelope around either payload.
+        let envelope = dynamo_runtime::transports::event_plane::EventEnvelope {
+            publisher_id: hash(1),
+            sequence: 1 << 40,
+            published_at: 1_792_686_000_000,
+            topic: SERVING_G2_REPLICA_TOPIC.to_string(),
+            payload: Default::default(),
+        };
+        println!(
+            "envelope overhead: {} B/message",
+            rmp_serde::to_vec_named(&envelope).unwrap().len()
+        );
+        for count in [1u64, 64, 512, 4096] {
+            let upsert = ReplicaEvent {
+                source: source.clone(),
+                revision: 1_000_000,
+                kind: ReplicaEventKind::Upsert(
+                    (0..count)
+                        .map(|seed| ReplicaBlock {
+                            key: hash(seed),
+                            size_bytes: 2_359_296,
+                            checksum: Some(hash(seed + 1_000_000)),
+                        })
+                        .collect(),
+                ),
+            };
+            let remove = ReplicaEvent {
+                source: source.clone(),
+                revision: 1_000_001,
+                kind: ReplicaEventKind::Remove((0..count).map(hash).collect()),
+            };
+            for (name, event, max_ratio) in [("upsert", upsert, 0.5), ("remove", remove, 1.0)] {
+                let v1 = rmp_serde::to_vec_named(&event).unwrap().len();
+                let v2 = compact_round_trip(event);
+                println!(
+                    "{name:6} {count:4} blocks: v1 {v1:6} B ({:.1} B/block)  v2 {v2:6} B ({:.1} B/block)  {:.2}x",
+                    v1 as f64 / count as f64,
+                    v2 as f64 / count as f64,
+                    v1 as f64 / v2 as f64
+                );
+                assert!(
+                    (v2 as f64) < v1 as f64 * max_ratio,
+                    "{name} {count}: {v2} vs {v1}"
+                );
+                // v2 per-block cost is the packed payload plus a fixed header.
+                let per_block = if name == "upsert" { 16 } else { 8 };
+                assert!(
+                    v2 <= per_block * count as usize + 96,
+                    "{name} {count}: {v2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn publish_config_defaults_and_env_overrides() {
+        let defaults = ReplicaPublishConfig::parse(None, None).unwrap();
+        assert_eq!(
+            defaults,
+            ReplicaPublishConfig {
+                batch_deadline: Duration::from_millis(50),
+                batch_max_blocks: 4_096,
+            }
+        );
+        assert_eq!(
+            ReplicaPublishConfig::parse(Some(""), Some("")).unwrap(),
+            defaults
+        );
+        assert_eq!(
+            ReplicaPublishConfig::parse(Some("250"), Some("16384")).unwrap(),
+            ReplicaPublishConfig {
+                batch_deadline: Duration::from_millis(250),
+                batch_max_blocks: 16_384,
+            }
+        );
+        assert!(ReplicaPublishConfig::parse(Some("-1"), None).is_err());
+        assert!(ReplicaPublishConfig::parse(None, Some("0")).is_err());
+        assert!(ReplicaPublishConfig::parse(None, Some("lots")).is_err());
     }
 
     #[test]
