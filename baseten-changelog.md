@@ -2808,6 +2808,16 @@ never a hang. Under attention DP the adapter passes `dp_rank`/`cp_rank` with the
 attention-TP rank, so the owner is DP 0, CP 0, attention-TP 0 rather than one
 per DP group. A process without a replica id shared with its siblings keeps
 its own directory.
+`DYN_HICACHE_G2_NODE_PUBLISH=1` (node mode only, default off) does the same for
+publishing: every process still numbers its own deltas, but hands each finished
+event to the index owner over a second abstract socket, and the owner publishes
+everything that arrived in a window (`DYN_HICACHE_G2_NODE_PUBLISH_BATCH_MS`,
+default 50) as one compact `kvbm.serving_g2.replicas.batch.v2` message. Readers
+subscribe to it alongside `replicas.v2` and apply its events in order, so NATS
+carries one message per replica per window instead of one per process. Events
+the relay cannot deliver are dropped and counted (`relay_dropped_events`), like
+a failed publish; `relayed_events`, `relay_published_batches` and
+`relay_published_events` count the rest.
 A page a fetch pulls from a peer is published from the puller too, before the
 fetch returns, with the checksum it verified (counted in
 `published_pulled_pages`). Pages under an unsettled ticket are misses and are

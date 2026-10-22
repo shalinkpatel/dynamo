@@ -22,6 +22,10 @@ use super::nixl::new_hicache_g2_nixl_agent;
 use super::node_index::{
     HiCacheIndexMode, NodeIndexClient, index_mode_from_env, owner_socket_name, serve_node_index,
 };
+use super::node_relay::{
+    NodeRelayStats, connect_node_relay, node_publish_from_env, relay_socket_name,
+    start_node_relay_owner,
+};
 use super::peer_index::{
     ReplicaBlock, ReplicaIndex, ReplicaLocation, ReplicaPublisher, ReplicaSource, ReplicaSourceKey,
     SERVING_G2_INDEX_COMPONENT, SERVING_G2_PEER_COMPONENT, baseten_row_from_env,
@@ -786,6 +790,9 @@ pub struct HiCacheG2Metrics {
     /// Node index mode, non-owner ranks: lookups answered as a miss because
     /// the owner rank could not be reached (dead, wedged, or backing off).
     pub index_owner_failures: AtomicU64,
+    /// Node publishing (`DYN_HICACHE_G2_NODE_PUBLISH`): events handed to the
+    /// owner's relay, dropped, and (owner only) published in batches.
+    pub relay: Arc<NodeRelayStats>,
     /// Where a fetch's wall clock goes, summed over every fetch.
     pub index_query_ns: AtomicU64,
     pub lease_rpc_ns: AtomicU64,
@@ -902,6 +909,22 @@ impl HiCacheG2Metrics {
             (
                 "index_owner_failures",
                 self.index_owner_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "relayed_events",
+                self.relay.relayed_events.load(Ordering::Relaxed),
+            ),
+            (
+                "relay_dropped_events",
+                self.relay.relay_dropped_events.load(Ordering::Relaxed),
+            ),
+            (
+                "relay_published_batches",
+                self.relay.relay_published_batches.load(Ordering::Relaxed),
+            ),
+            (
+                "relay_published_events",
+                self.relay.relay_published_events.load(Ordering::Relaxed),
             ),
             (
                 "index_query_ms",
@@ -2180,7 +2203,49 @@ impl HiCacheG2Direct {
         // Same UCX profile as a KVBM worker's G2G path.
         create_worker_ucx_backend(&agent, true, ucx_devices.as_deref())?;
 
-        let publisher = ReplicaPublisher::new(&index_component, source.clone()).await?;
+        // The node index socket is named after the replica id, so node mode
+        // needs one the processes share; a TP1 process without one falls back
+        // to its own instance id and keeps a per-rank directory.
+        let shared_replica_id = source
+            .replica_id
+            .filter(|replica_id| *replica_id != instance_id);
+        let node_mode = index_mode_from_env()? == HiCacheIndexMode::PerNode;
+        if node_mode && shared_replica_id.is_none() {
+            tracing::warn!(
+                "{} is `node` but this process has no replica id shared with its \
+                 siblings; keeping a directory for this rank only",
+                super::node_index::HICACHE_G2_INDEX_MODE_ENV
+            );
+        }
+
+        // With node publishing on, every process of the replica hands its
+        // finished deltas to the index owner, which publishes one batch per
+        // window for the whole replica.
+        let metrics = HiCacheG2Metrics::default();
+        let node_publish = node_mode && node_publish_from_env()?;
+        let publisher = match (node_publish, shared_replica_id) {
+            (true, Some(replica_id)) if config.is_index_owner() => {
+                let name = relay_socket_name(replica_id);
+                match start_node_relay_owner(&index_component, &name, Arc::clone(&metrics.relay))
+                    .await?
+                {
+                    Some(relay) => ReplicaPublisher::through_relay(source.clone(), relay)?,
+                    None => {
+                        tracing::warn!(
+                            socket = %name,
+                            "another process already owns this replica's publish relay; \
+                             publishing this rank directly"
+                        );
+                        ReplicaPublisher::new(&index_component, source.clone()).await?
+                    }
+                }
+            }
+            (true, Some(replica_id)) => ReplicaPublisher::through_relay(
+                source.clone(),
+                connect_node_relay(relay_socket_name(replica_id), Arc::clone(&metrics.relay)),
+            )?,
+            _ => ReplicaPublisher::new(&index_component, source.clone()).await?,
+        };
         let hash_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(config.hash_threads)
             .thread_name(|index| format!("hicache-g2-hash-{index}"))
@@ -2201,7 +2266,7 @@ impl HiCacheG2Direct {
             map_generation: AtomicU64::new(0),
             peer_health: PeerHealthTracker::default(),
             hash_pool,
-            metrics: HiCacheG2Metrics::default(),
+            metrics,
             reaper: UnsettledReadReaper::default(),
         });
         let reaper_state = Arc::downgrade(&state);
@@ -2217,22 +2282,6 @@ impl HiCacheG2Direct {
         // and every other process of its replica (other TP ranks and, under
         // attention DP, other DP groups) reads it over a local socket, which
         // divides the event fan-out by the number of processes per replica.
-        //
-        // The socket is named after the replica id, so node mode needs one the
-        // processes share; a TP1 process without one falls back to its own
-        // instance id and keeps a per-rank directory.
-        let shared_replica_id = state
-            .source
-            .replica_id
-            .filter(|replica_id| *replica_id != instance_id);
-        let node_mode = index_mode_from_env()? == HiCacheIndexMode::PerNode;
-        if node_mode && shared_replica_id.is_none() {
-            tracing::warn!(
-                "{} is `node` but this process has no replica id shared with its \
-                 siblings; keeping a directory for this rank only",
-                super::node_index::HICACHE_G2_INDEX_MODE_ENV
-            );
-        }
         let directory = match (node_mode, shared_replica_id) {
             (true, Some(replica_id)) if !state.config.is_index_owner() => {
                 Directory::Node(NodeIndexClient::new(owner_socket_name(replica_id)))

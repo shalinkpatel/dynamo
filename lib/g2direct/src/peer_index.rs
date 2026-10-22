@@ -30,10 +30,15 @@ use dynamo_runtime::pipeline::{
 use dynamo_runtime::stream::{self, StreamExt};
 use dynamo_runtime::transports::event_plane::{EventPublisher, EventSubscriber};
 
+use crate::node_relay::RelaySender;
+
 /// Replica events in the compact positional encoding (see
 /// `encode_compact_replica_event`). The suffix names the encoding; deployments
 /// never mix builds, so there is no other topic to stay compatible with.
 pub const SERVING_G2_REPLICA_TOPIC: &str = "kvbm.serving_g2.replicas.v2";
+/// A replica's node-index owner publishes every process's events as one
+/// compact-encoded batch per window (see `node_relay`).
+pub const SERVING_G2_REPLICA_BATCH_TOPIC: &str = "kvbm.serving_g2.replicas.batch.v2";
 pub const SERVING_G2_INDEX_NAMESPACE: &str = "kvbm-serving-g2";
 pub const SERVING_G2_MODEL_NAMESPACE_ENV: &str = "DYNAMO_MODEL_NAMESPACE";
 pub const SERVING_G2_DEFAULT_MODEL_NAMESPACE: &str = "dynamo";
@@ -359,6 +364,32 @@ pub fn encode_compact_replica_event(event: &ReplicaEvent) -> Result<Vec<u8>> {
     ))?)
 }
 
+/// Several sources' events in one message, applied in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaEventBatch {
+    pub events: Vec<ReplicaEvent>,
+}
+
+/// `SERVING_G2_REPLICA_BATCH_TOPIC`: each event in the compact encoding.
+#[derive(Serialize, Deserialize)]
+struct CompactReplicaBatch(Vec<serde_bytes::ByteBuf>);
+
+pub fn encode_compact_replica_batch(events: &[ReplicaEvent]) -> Result<Vec<u8>> {
+    let events = events
+        .iter()
+        .map(|event| encode_compact_replica_event(event).map(serde_bytes::ByteBuf::from))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rmp_serde::to_vec(&CompactReplicaBatch(events))?)
+}
+
+pub fn decode_compact_replica_batch(bytes: &[u8]) -> Result<Vec<ReplicaEvent>> {
+    let CompactReplicaBatch(events) = rmp_serde::from_slice(bytes)?;
+    events
+        .iter()
+        .map(|event| decode_compact_replica_event(event))
+        .collect()
+}
+
 pub fn decode_compact_replica_event(bytes: &[u8]) -> Result<ReplicaEvent> {
     let CompactReplicaEvent(
         (instance_id, tp_rank, replica_id, tp_world_size, incarnation, block_size, row),
@@ -656,7 +687,9 @@ impl ReplicaIndex {
         let index = Arc::new(Self::new());
         let subscriber =
             EventSubscriber::for_component(component, SERVING_G2_REPLICA_TOPIC).await?;
-        spawn_replica_subscriber(subscriber, Arc::downgrade(&index));
+        let batch_subscriber =
+            EventSubscriber::for_component(component, SERVING_G2_REPLICA_BATCH_TOPIC).await?;
+        spawn_replica_subscriber(subscriber, batch_subscriber, Arc::downgrade(&index));
         Ok(index)
     }
 
@@ -860,18 +893,59 @@ pub struct ReplicaPublisher {
     tx: mpsc::Sender<ReplicaEventKind>,
 }
 
+/// Where a publisher's finished events go: straight to NATS, or to the
+/// replica's node-index owner, which publishes them in a batch.
+enum ReplicaSink {
+    Nats(Box<EventPublisher>),
+    Relay(RelaySender),
+}
+
+impl ReplicaSink {
+    async fn send(&self, event: ReplicaEvent) {
+        match self {
+            ReplicaSink::Nats(publisher) => {
+                let published = match encode_compact_replica_event(&event) {
+                    Ok(bytes) => publisher.publish_bytes(bytes).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = published {
+                    tracing::warn!(error = %error, "failed to publish replica event batch");
+                }
+            }
+            ReplicaSink::Relay(relay) => relay.send(event),
+        }
+    }
+}
+
 impl ReplicaPublisher {
     pub async fn new(component: &Component, source: ReplicaSource) -> Result<Arc<Self>> {
         let config = ReplicaPublishConfig::from_env()?;
         tracing::info!(?config, "serving-G2 replica publisher");
-        let publisher = Arc::new(
-            EventPublisher::for_component(component, SERVING_G2_REPLICA_TOPIC)
-                .await
-                .context("failed to create replica event publisher")?,
+        let publisher = EventPublisher::for_component(component, SERVING_G2_REPLICA_TOPIC)
+            .await
+            .context("failed to create replica event publisher")?;
+        Ok(Self::spawn(
+            source,
+            ReplicaSink::Nats(Box::new(publisher)),
+            config,
+        ))
+    }
+
+    /// Number this source's deltas as usual, but hand each finished event to
+    /// the node-index owner instead of publishing it.
+    pub fn through_relay(source: ReplicaSource, relay: RelaySender) -> Result<Arc<Self>> {
+        let config = ReplicaPublishConfig::from_env()?;
+        tracing::info!(
+            ?config,
+            "serving-G2 replica publisher (through the node relay)"
         );
+        Ok(Self::spawn(source, ReplicaSink::Relay(relay), config))
+    }
+
+    fn spawn(source: ReplicaSource, sink: ReplicaSink, config: ReplicaPublishConfig) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(REPLICA_PUBLISH_QUEUE_CAPACITY);
-        tokio::spawn(run_replica_publisher(source, publisher, config, rx));
-        Ok(Arc::new(Self { tx }))
+        tokio::spawn(run_replica_publisher(source, sink, config, rx));
+        Arc::new(Self { tx })
     }
 
     pub fn upsert(&self, blocks: Vec<ReplicaBlock>) -> Result<()> {
@@ -932,29 +1006,24 @@ impl PendingReplicaDelta {
 }
 
 async fn publish_replica_event(
-    publisher: &EventPublisher,
+    publisher: &ReplicaSink,
     source: &ReplicaSource,
     revision: &mut u64,
     kind: ReplicaEventKind,
 ) {
     *revision += 1;
-    let event = ReplicaEvent {
-        source: source.clone(),
-        revision: *revision,
-        kind,
-    };
-    let published = match encode_compact_replica_event(&event) {
-        Ok(bytes) => publisher.publish_bytes(bytes).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = published {
-        tracing::warn!(error = %error, "failed to publish replica event batch");
-    }
+    publisher
+        .send(ReplicaEvent {
+            source: source.clone(),
+            revision: *revision,
+            kind,
+        })
+        .await;
 }
 
 async fn run_replica_publisher(
     source: ReplicaSource,
-    publisher: Arc<EventPublisher>,
+    publisher: ReplicaSink,
     config: ReplicaPublishConfig,
     mut rx: mpsc::Receiver<ReplicaEventKind>,
 ) {
@@ -988,7 +1057,11 @@ async fn run_replica_publisher(
     .await;
 }
 
-fn spawn_replica_subscriber(mut subscriber: EventSubscriber, index: std::sync::Weak<ReplicaIndex>) {
+fn spawn_replica_subscriber(
+    mut subscriber: EventSubscriber,
+    mut batch_subscriber: EventSubscriber,
+    index: std::sync::Weak<ReplicaIndex>,
+) {
     let mut workers = Vec::with_capacity(REPLICA_EVENT_WORKERS);
     for _ in 0..REPLICA_EVENT_WORKERS {
         let (tx, mut rx) = mpsc::unbounded_channel::<ReplicaEvent>();
@@ -1004,15 +1077,25 @@ fn spawn_replica_subscriber(mut subscriber: EventSubscriber, index: std::sync::W
         });
     }
 
+    // Events of one source always go to the same worker, so a source's
+    // revisions apply in order whichever topic (single or batch) carried them.
     let route = move |event: ReplicaEvent| {
         let sticky = event.source.key.instance_id as usize ^ event.source.key.tp_rank as usize;
         workers[sticky % workers.len()].send(event).is_ok()
     };
     tokio::spawn(async move {
-        while let Some(envelope) = subscriber.next().await {
-            match envelope.and_then(|envelope| decode_compact_replica_event(&envelope.payload)) {
-                Ok(event) => {
-                    if !route(event) {
+        loop {
+            let decoded = tokio::select! {
+                Some(envelope) = subscriber.next() => envelope
+                    .and_then(|envelope| decode_compact_replica_event(&envelope.payload))
+                    .map(|event| vec![event]),
+                Some(envelope) = batch_subscriber.next() => envelope
+                    .and_then(|envelope| decode_compact_replica_batch(&envelope.payload)),
+                else => break,
+            };
+            match decoded {
+                Ok(events) => {
+                    if !events.into_iter().all(&route) {
                         break;
                     }
                 }
@@ -1300,6 +1383,25 @@ mod tests {
         let bytes = encode_compact_replica_event(&event).expect("encode compact");
         assert_eq!(decode_compact_replica_event(&bytes).expect("decode"), event);
         bytes.len()
+    }
+
+    #[test]
+    fn compact_batch_round_trips_every_source_in_order() {
+        let events = (0..3u32)
+            .flat_map(|rank| {
+                (1..=2u64).map(move |revision| ReplicaEvent {
+                    source: source(100 + u64::from(rank), rank, 1),
+                    revision,
+                    kind: ReplicaEventKind::Upsert(vec![ReplicaBlock {
+                        key: u64::from(rank) * 10 + revision,
+                        size_bytes: 4096,
+                        checksum: Some(revision),
+                    }]),
+                })
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_compact_replica_batch(&events).unwrap();
+        assert_eq!(decode_compact_replica_batch(&encoded).unwrap(), events);
     }
 
     #[test]

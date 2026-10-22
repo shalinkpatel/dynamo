@@ -9,4 +9,6 @@ pub mod nixl;
 #[cfg(feature = "transport")]
 pub mod node_index;
 #[cfg(feature = "transport")]
+pub mod node_relay;
+#[cfg(feature = "transport")]
 pub mod peer_index;
