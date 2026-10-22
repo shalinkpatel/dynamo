@@ -19,6 +19,9 @@
 use super::lease::{G2pbFetchLeaseId, release_fetch_lease_bounded, unix_time_ms};
 use super::nixl::create_worker_ucx_backend;
 use super::nixl::new_hicache_g2_nixl_agent;
+use super::node_index::{
+    HiCacheIndexMode, NodeIndexClient, index_mode_from_env, owner_socket_name, serve_node_index,
+};
 use super::peer_index::{
     ReplicaBlock, ReplicaIndex, ReplicaLocation, ReplicaPublisher, ReplicaSource, ReplicaSourceKey,
     SERVING_G2_INDEX_COMPONENT, SERVING_G2_PEER_COMPONENT, baseten_row_from_env,
@@ -780,6 +783,9 @@ pub struct HiCacheG2Metrics {
     /// Times a peer pool was suspended, and index candidates skipped for it.
     pub peer_suspensions: AtomicU64,
     pub suspended_peer_candidates: AtomicU64,
+    /// Node index mode, non-owner ranks: lookups answered as a miss because
+    /// the owner rank could not be reached (dead, wedged, or backing off).
+    pub index_owner_failures: AtomicU64,
     /// Where a fetch's wall clock goes, summed over every fetch.
     pub index_query_ns: AtomicU64,
     pub lease_rpc_ns: AtomicU64,
@@ -894,6 +900,10 @@ impl HiCacheG2Metrics {
                 self.suspended_peer_candidates.load(Ordering::Relaxed),
             ),
             (
+                "index_owner_failures",
+                self.index_owner_failures.load(Ordering::Relaxed),
+            ),
+            (
                 "index_query_ms",
                 self.index_query_ns.load(Ordering::Relaxed) / 1_000_000,
             ),
@@ -912,8 +922,15 @@ impl HiCacheG2Metrics {
 
 #[derive(Debug, Clone)]
 pub struct HiCacheG2Config {
+    /// Under attention DP these are the attention-TP rank and size, which is
+    /// what SGLang hands its storage backend.
     pub tp_rank: u32,
     pub tp_world_size: u32,
+    /// Attention-DP and attention-CP ranks (0 without them). With `tp_rank`
+    /// they place this process in the replica, so exactly one process, global
+    /// TP rank 0, owns the node index.
+    pub dp_rank: u32,
+    pub cp_rank: u32,
     pub page_size: u32,
     pub lease_ttl: Duration,
     /// Cap on the bytes of a single NIXL transfer request, so one prefetch of a
@@ -942,6 +959,14 @@ impl std::fmt::Display for UnsettledReads {
 }
 
 impl std::error::Error for UnsettledReads {}
+
+impl HiCacheG2Config {
+    /// Global TP rank 0 of the replica. Under attention DP every DP group has
+    /// an attention-TP rank 0, so the DP and CP ranks must be 0 too.
+    pub fn is_index_owner(&self) -> bool {
+        self.tp_rank == 0 && self.dp_rank == 0 && self.cp_rank == 0
+    }
+}
 
 /// What a fetch did: pages completed from the front, and the ticket of reads it
 /// left in flight, if any.
@@ -2003,7 +2028,7 @@ const DEPARTED_PEER_GRACE: Duration = Duration::from_secs(30);
 /// good. Event-driven: nothing runs while membership is stable, and each
 /// departure gets one delayed re-check. Stops when the transport is dropped.
 fn spawn_departed_peer_purger(
-    index: Weak<ReplicaIndex>,
+    index: Option<Weak<ReplicaIndex>>,
     peers: HiCachePeerClient,
     state: Weak<HiCacheG2State>,
 ) {
@@ -2027,13 +2052,17 @@ fn spawn_departed_peer_purger(
                     if peers.is_live(departed) {
                         return;
                     }
-                    let (Some(index), Some(state)) = (index.upgrade(), state.upgrade()) else {
+                    let Some(state) = state.upgrade() else {
                         return;
                     };
                     if departed == state.source.key.instance_id {
                         return;
                     }
                     state.peer_health.forget_instance(departed);
+                    // A node-mode non-owner has no directory; its owner purges.
+                    let Some(index) = index.and_then(|index| index.upgrade()) else {
+                        return;
+                    };
                     // A departed peer can own hundreds of thousands of entries;
                     // keep the purge off the async workers.
                     let Ok((sources, entries)) =
@@ -2058,7 +2087,7 @@ fn spawn_departed_peer_purger(
                 });
             }
             known = current;
-            if index.strong_count() == 0 {
+            if state.strong_count() == 0 {
                 break;
             }
         }
@@ -2099,12 +2128,19 @@ impl
     }
 }
 
+/// Where this process's lookups are answered.
+enum Directory {
+    /// This process's own copy of the directory (fed the same NATS deltas as
+    /// every other copy), so a lookup needs no peer to be reachable.
+    Local(Arc<ReplicaIndex>),
+    /// Node index mode on a TP rank other than 0: the copy rank 0 keeps.
+    Node(NodeIndexClient),
+}
+
 /// The engine-facing handle: publish my pages, look up a peer's, read them.
 pub struct HiCacheG2Direct {
     state: Arc<HiCacheG2State>,
-    /// This process's own copy of the directory (fed the same NATS deltas as
-    /// every other replica's), so a lookup needs no peer to be reachable.
-    index: Arc<ReplicaIndex>,
+    directory: Directory,
     peers: HiCachePeerClient,
     runtime: tokio::runtime::Handle,
     _distributed_runtime: Arc<DistributedRuntime>,
@@ -2177,8 +2213,44 @@ impl HiCacheG2Direct {
         // Every replica runs its own copy of the directory: both are fed the
         // same NATS deltas, so no separate indexer process is needed, and
         // lookups read the local copy rather than round-robin over replicas
-        // that may be gone.
-        let index = start_replica_index_service(&index_component).await?;
+        // that may be gone. In node mode only global TP rank 0 keeps that copy
+        // and every other process of its replica (other TP ranks and, under
+        // attention DP, other DP groups) reads it over a local socket, which
+        // divides the event fan-out by the number of processes per replica.
+        //
+        // The socket is named after the replica id, so node mode needs one the
+        // processes share; a TP1 process without one falls back to its own
+        // instance id and keeps a per-rank directory.
+        let shared_replica_id = state
+            .source
+            .replica_id
+            .filter(|replica_id| *replica_id != instance_id);
+        let node_mode = index_mode_from_env()? == HiCacheIndexMode::PerNode;
+        if node_mode && shared_replica_id.is_none() {
+            tracing::warn!(
+                "{} is `node` but this process has no replica id shared with its \
+                 siblings; keeping a directory for this rank only",
+                super::node_index::HICACHE_G2_INDEX_MODE_ENV
+            );
+        }
+        let directory = match (node_mode, shared_replica_id) {
+            (true, Some(replica_id)) if !state.config.is_index_owner() => {
+                Directory::Node(NodeIndexClient::new(owner_socket_name(replica_id)))
+            }
+            (true, Some(replica_id)) => {
+                let index = start_replica_index_service(&index_component).await?;
+                let name = owner_socket_name(replica_id);
+                if !serve_node_index(Arc::clone(&index), &name)? {
+                    tracing::warn!(
+                        socket = %name,
+                        "another process already serves this replica's node index; \
+                         keeping a directory for this rank only"
+                    );
+                }
+                Directory::Local(index)
+            }
+            _ => Directory::Local(start_replica_index_service(&index_component).await?),
+        };
         start_peer_service(&peer_component, Arc::clone(&state))?;
 
         let peers = HiCachePeerClient::new(peer_component).await?;
@@ -2189,19 +2261,21 @@ impl HiCacheG2Direct {
             agent_name = %agent_name,
             tp_rank = state.config.tp_rank,
             tp_world_size = state.config.tp_world_size,
+            dp_rank = state.config.dp_rank,
+            cp_rank = state.config.cp_rank,
             replica_id = state.source.replica_id(),
             host = std::env::var("HOSTNAME").ok(),
             "HiCache G2 started"
         );
-        spawn_departed_peer_purger(
-            Arc::downgrade(&index),
-            peers.clone(),
-            Arc::downgrade(&state),
-        );
+        let purge_index = match &directory {
+            Directory::Local(index) => Some(Arc::downgrade(index)),
+            Directory::Node(_) => None,
+        };
+        spawn_departed_peer_purger(purge_index, peers.clone(), Arc::downgrade(&state));
 
         Ok(Self {
             state,
-            index,
+            directory,
             peers,
             runtime: tokio::runtime::Handle::current(),
             _distributed_runtime: distributed_runtime,
@@ -2662,9 +2736,20 @@ impl HiCacheG2Direct {
         page_bytes: Option<u64>,
     ) -> Vec<Vec<ReplicaLocation>> {
         let query_started = Instant::now();
-        let locations = self
-            .index
-            .batch_locations(keys, Some(self.state.config.page_size));
+        let page_size = self.state.config.page_size;
+        let locations = match &self.directory {
+            Directory::Local(index) => index.batch_locations(keys, Some(page_size)),
+            Directory::Node(client) => {
+                client.batch_locations(keys, page_size).unwrap_or_else(|error| {
+                    self.state
+                        .metrics
+                        .index_owner_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(%error, "HiCache G2 node index lookup failed; treating as a miss");
+                    vec![Vec::new(); keys.len()]
+                })
+            }
+        };
         self.state
             .metrics
             .index_query_ns
@@ -2958,6 +3043,37 @@ mod tests {
         }
         // The previous `instance_id ^ tp_rank` scheme collided on exactly these ids.
         assert!(old_names.len() < ids.len() * 4);
+    }
+
+    #[test]
+    fn exactly_global_tp_rank_zero_owns_the_node_index() {
+        let config = |tp_rank, tp_world_size, dp_rank, cp_rank| HiCacheG2Config {
+            tp_rank,
+            tp_world_size,
+            dp_rank,
+            cp_rank,
+            page_size: 64,
+            lease_ttl: Duration::from_secs(10),
+            max_transfer_bytes: 1 << 20,
+            verify: HiCacheVerify::Destination,
+            hash_threads: 1,
+        };
+        // TP8 without attention DP, attention TP2 x DP4, and pure attention DP8
+        // (where every process reports attention-TP rank 0 of 1).
+        for (tp_world_size, dp_size) in [(8, 1), (2, 4), (1, 8)] {
+            let owners = (0..dp_size)
+                .flat_map(|dp_rank| (0..tp_world_size).map(move |tp_rank| (tp_rank, dp_rank)))
+                .filter(|&(tp_rank, dp_rank)| {
+                    config(tp_rank, tp_world_size, dp_rank, 0).is_index_owner()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                owners,
+                vec![(0, 0)],
+                "attention TP{tp_world_size} x DP{dp_size}"
+            );
+        }
+        assert!(!config(0, 8, 0, 1).is_index_owner());
     }
 
     #[test]

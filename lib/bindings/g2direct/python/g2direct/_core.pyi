@@ -7,6 +7,8 @@ class HiCacheG2Direct:
         lease_ttl_sec: int = 30,
         max_transfer_mib: int = 512,
         ucx_devices: str | None = None,
+        dp_rank: int = 0,
+        cp_rank: int = 0,
     ) -> None: ...
     def register_host_region(self, addr: int, size: int, page_bytes: int) -> None: ...
     def publish(

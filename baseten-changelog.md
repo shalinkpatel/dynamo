@@ -2772,6 +2772,7 @@ Source commits:
 - fix(g2direct): unique NIXL agent names; suspend peer pools readers cannot address
 - fix(g2direct): drop index entries for host slots refilled by a fetch
 - feat(g2direct): publish pages a replica pulls from peers
+- feat(g2direct): opt-in node-scoped replica index (`DYN_HICACHE_G2_INDEX_MODE=node`)
 
 Purpose:
 
@@ -2798,6 +2799,14 @@ index) before posting reads into the slot. `invalidate_slots(ptrs, sizes,
 ptrs_per_page)` does the same for slots the adapter refills from L3; without it
 peers leased slots that had been refilled and failed verification
 (`invalidated_by_fetch` / `invalidated_by_caller` count the withdrawals).
+`DYN_HICACHE_G2_INDEX_MODE=node` (default `rank`) keeps one directory per
+replica: only global TP rank 0 subscribes to replica events and every other
+process of the replica queries it over an abstract Unix socket named after the
+replica id; an unreachable owner is a lookup miss (`index_owner_failures`),
+never a hang. Under attention DP the adapter passes `dp_rank`/`cp_rank` with the
+attention-TP rank, so the owner is DP 0, CP 0, attention-TP 0 rather than one
+per DP group. A process without a replica id shared with its siblings keeps
+its own directory.
 A page a fetch pulls from a peer is published from the puller too, before the
 fetch returns, with the checksum it verified (counted in
 `published_pulled_pages`). Pages under an unsettled ticket are misses and are

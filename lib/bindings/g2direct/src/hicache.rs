@@ -58,6 +58,10 @@ impl PyHiCacheG2Direct {
 impl PyHiCacheG2Direct {
     /// Join the serving-G2 namespace. ETCD and NATS come from the Dynamo runtime
     /// settings (`ETCD_ENDPOINTS`, `NATS_SERVER`) like every other Dynamo process.
+    ///
+    /// Under attention DP, `tp_rank`/`tp_world_size` are the attention-TP rank
+    /// and size and `dp_rank`/`cp_rank` the attention-DP and attention-CP ranks;
+    /// together they pick the one process that owns the node index.
     #[new]
     #[pyo3(signature = (
         tp_rank,
@@ -66,6 +70,8 @@ impl PyHiCacheG2Direct {
         lease_ttl_sec = 30,
         max_transfer_mib = 512,
         ucx_devices = None,
+        dp_rank = 0,
+        cp_rank = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -75,6 +81,8 @@ impl PyHiCacheG2Direct {
         lease_ttl_sec: u64,
         max_transfer_mib: u64,
         ucx_devices: Option<String>,
+        dp_rank: u32,
+        cp_rank: u32,
     ) -> PyResult<Self> {
         if tp_world_size == 0 || tp_rank >= tp_world_size {
             return Err(PyValueError::new_err(format!(
@@ -90,6 +98,8 @@ impl PyHiCacheG2Direct {
         let config = HiCacheG2Config {
             tp_rank,
             tp_world_size,
+            dp_rank,
+            cp_rank,
             page_size,
             lease_ttl: Duration::from_secs(lease_ttl_sec),
             max_transfer_bytes: max_transfer_mib * 1024 * 1024,
