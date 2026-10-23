@@ -475,6 +475,15 @@ impl DistributedRuntime {
         self.routing_occupancy_states.clone()
     }
 
+    /// Whether the NATS client is connected right now; `None` when this runtime
+    /// has no NATS client. A client built with
+    /// `ClientOptions::with_retry_on_initial_connect` starts disconnected.
+    pub fn nats_connected(&self) -> Option<bool> {
+        self.nats_client.as_ref().map(|client| {
+            client.client().connection_state() == async_nats::connection::State::Connected
+        })
+    }
+
     /// TODO: This is a temporary KV router measure for component/component.rs EventPublisher impl for
     /// Component, to allow it to publish to NATS. KV Router is the only user.
     ///

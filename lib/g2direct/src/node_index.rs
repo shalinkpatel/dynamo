@@ -25,7 +25,21 @@ use anyhow::{Context, Result};
 use dynamo_tokens::SequenceHash;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::peer_index::{ReplicaIndex, ReplicaLocation, ReplicaQueryRequest, ReplicaQueryResponse};
+use serde::{Deserialize, Serialize};
+
+use crate::peer_index::{
+    ReplicaIndex, ReplicaLocation, ReplicaQueryRequest, ReplicaQueryResponse, ReplicaSourceKey,
+};
+
+/// One frame from a non-owner rank. Both ends are processes of one replica,
+/// so they always run the same build.
+#[derive(Serialize, Deserialize)]
+enum NodeIndexRequest {
+    Lookup(ReplicaQueryRequest),
+    /// Entries whose source refused a single-page lease (see
+    /// `ReplicaIndex::forget`); acknowledged with an empty `Locations`.
+    Forget(Vec<(SequenceHash, ReplicaSourceKey)>),
+}
 
 /// `rank` (default): every TP rank subscribes to the replica events and keeps
 /// its own directory. `node`: only global TP rank 0 does, and serves every
@@ -112,10 +126,16 @@ async fn serve_connection(mut stream: tokio::net::UnixStream, index: Arc<Replica
         if stream.read_exact(&mut frame).await.is_err() {
             return;
         }
-        let response = match rmp_serde::from_slice::<ReplicaQueryRequest>(&frame) {
-            Ok(request) => ReplicaQueryResponse::Locations(
+        let response = match rmp_serde::from_slice::<NodeIndexRequest>(&frame) {
+            Ok(NodeIndexRequest::Lookup(request)) => ReplicaQueryResponse::Locations(
                 index.batch_locations(&request.keys, Some(request.block_size)),
             ),
+            Ok(NodeIndexRequest::Forget(entries)) => {
+                for (key, source) in entries {
+                    index.forget(key, source);
+                }
+                ReplicaQueryResponse::Locations(Vec::new())
+            }
             Err(error) => ReplicaQueryResponse::Error(error.to_string()),
         };
         let Ok(body) = rmp_serde::to_vec_named(&response) else {
@@ -158,6 +178,28 @@ impl NodeIndexClient {
         keys: &[SequenceHash],
         block_size: u32,
     ) -> Result<Vec<Vec<ReplicaLocation>>> {
+        let locations = self.request(&NodeIndexRequest::Lookup(ReplicaQueryRequest {
+            keys: keys.to_vec(),
+            block_size,
+        }))?;
+        anyhow::ensure!(
+            locations.len() == keys.len(),
+            "node index answered {} keys for {}",
+            locations.len(),
+            keys.len()
+        );
+        Ok(locations)
+    }
+
+    /// Have the owner drop entries whose source refused to lease them, as a
+    /// rank with its own directory does. Best effort, with the same backoff
+    /// as lookups.
+    pub fn forget(&self, entries: &[(SequenceHash, ReplicaSourceKey)]) -> Result<()> {
+        self.request(&NodeIndexRequest::Forget(entries.to_vec()))
+            .map(|_| ())
+    }
+
+    fn request(&self, request: &NodeIndexRequest) -> Result<Vec<Vec<ReplicaLocation>>> {
         let mut state = self
             .state
             .lock()
@@ -168,7 +210,7 @@ impl NodeIndexClient {
         {
             anyhow::bail!("HiCache G2 node index owner is backing off");
         }
-        let result = self.round_trip(&mut state.stream, keys, block_size);
+        let result = self.round_trip(&mut state.stream, request);
         match &result {
             Ok(_) => state.retry_after = None,
             Err(_) => {
@@ -182,8 +224,7 @@ impl NodeIndexClient {
     fn round_trip(
         &self,
         stream: &mut Option<UnixStream>,
-        keys: &[SequenceHash],
-        block_size: u32,
+        request: &NodeIndexRequest,
     ) -> Result<Vec<Vec<ReplicaLocation>>> {
         if stream.is_none() {
             let connected =
@@ -195,10 +236,7 @@ impl NodeIndexClient {
             *stream = Some(connected);
         }
         let stream = stream.as_mut().expect("connected above");
-        let body = rmp_serde::to_vec_named(&ReplicaQueryRequest {
-            keys: keys.to_vec(),
-            block_size,
-        })?;
+        let body = rmp_serde::to_vec_named(request)?;
         stream.write_all(&(body.len() as u32).to_le_bytes())?;
         stream.write_all(&body)?;
         let mut len = [0; 4];
@@ -208,15 +246,7 @@ impl NodeIndexClient {
         let mut frame = vec![0; len];
         stream.read_exact(&mut frame)?;
         match rmp_serde::from_slice(&frame)? {
-            ReplicaQueryResponse::Locations(locations) => {
-                anyhow::ensure!(
-                    locations.len() == keys.len(),
-                    "node index answered {} keys for {}",
-                    locations.len(),
-                    keys.len()
-                );
-                Ok(locations)
-            }
+            ReplicaQueryResponse::Locations(locations) => Ok(locations),
             ReplicaQueryResponse::Error(message) => anyhow::bail!(message),
         }
     }
@@ -292,6 +322,27 @@ mod tests {
         assert_eq!(locations.0, index.batch_locations(&[12, 11], Some(64)));
         assert_eq!(locations.0[1][0].source.key.tp_rank, 3);
         assert!(locations.1[0].is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_owner_refusal_removes_the_entry_from_the_owners_directory() {
+        let name = unique_name("forget");
+        let index = index_with(11);
+        assert!(serve_node_index(Arc::clone(&index), &name).unwrap());
+        let client = NodeIndexClient::new(name);
+        let source = ReplicaSourceKey {
+            instance_id: 7,
+            tp_rank: 3,
+        };
+        let after = tokio::task::spawn_blocking(move || {
+            client.forget(&[(11, source)]).unwrap();
+            client.batch_locations(&[11], 64).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(after[0].is_empty());
+        assert!(index.batch_locations(&[11], Some(64))[0].is_empty());
+        assert!(index.counters().contains(&("index_refused_entries", 1)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -2719,6 +2719,7 @@ dependencies = [
  "dynamo-runtime",
  "dynamo-tokens",
  "nixl-sys",
+ "rand 0.9.4",
  "rayon",
  "rmp-serde",
  "serde",

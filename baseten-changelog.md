@@ -2774,6 +2774,7 @@ Source commits:
 - feat(g2direct): publish pages a replica pulls from peers
 - feat(g2direct): opt-in node-scoped replica index (`DYN_HICACHE_G2_INDEX_MODE=node`)
 - feat(g2direct): compact replica-index wire format (replaces the named encoding; topic `kvbm.serving_g2.replicas.v2`) and env-tunable publish batching
+- feat(g2direct): start without NATS, never block publishing, resync the index on revision gaps
 
 Purpose:
 
@@ -2821,13 +2822,21 @@ a failed publish; `relayed_events`, `relay_published_batches` and
 A page a fetch pulls from a peer is published from the puller too, before the
 fetch returns, with the checksum it verified (counted in
 `published_pulled_pages`). Pages under an unsettled ticket are misses and are
-never published. The SGLang adapter, the deferred host release
+never published. The binding connects NATS in the background
+(`ClientOptions::with_retry_on_initial_connect`, jittered backoff), so a worker
+starts while NATS is down; lookups miss while disconnected. The publisher skips
+or times out undeliverable batches and burns their revision; readers treat a
+revision jump (or a first contact past revision 1) as lost deltas and pull a
+snapshot from the source over the peer endpoint (`HiCachePeerRequest::Snapshot`).
+A single-page "no longer holds" refusal drops that entry from the reader's
+index. The SGLang adapter, the deferred host release
 patch, and MLA host dedup live in the monorepo.
 
 Shared pieces outside the crates: `dynamo-memory` registration chunking
 (`registration_chunk_bytes` / `registration_chunks`), the
 `DYN_KVBM_G2PB_REPLICA_ID` / `DYN_KVBM_G2PB_ALLOW_CROSS_ROW` names in
-`dynamo-runtime`, endpoint discovery in nested namespaces, and a wheel-builder
+`dynamo-runtime`, the opt-in NATS `retry_on_initial_connect` option
+(`transports/nats/b10_backoff.rs`) and `DistributedRuntime::nats_connected`, endpoint discovery in nested namespaces, and a wheel-builder
 loop that always builds `g2direct` and builds `kvbm` only with `ENABLE_KVBM`.
 
 Replay notes:

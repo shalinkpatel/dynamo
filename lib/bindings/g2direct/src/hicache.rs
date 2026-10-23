@@ -15,6 +15,7 @@ use dynamo_g2direct::hicache_g2::{
     HiCacheG2Config, HiCacheG2Direct, HiCachePageSegments, HiCacheVerify, hicache_g2_cache_key,
     hicache_g2_hash_threads,
 };
+use dynamo_runtime::distributed::DistributedConfig;
 use dynamo_runtime::{DistributedRuntime, Runtime};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -109,8 +110,14 @@ impl PyHiCacheG2Direct {
         let runtime = get_current_tokio_handle();
         let inner = runtime
             .block_on(async move {
+                // A worker must start while NATS is down: the index then runs
+                // local-only (lookups miss) until the background connect lands.
+                let mut runtime_config = DistributedConfig::from_settings();
+                runtime_config.nats_config = runtime_config
+                    .nats_config
+                    .map(|nats| nats.with_retry_on_initial_connect());
                 let distributed_runtime =
-                    DistributedRuntime::from_settings(Runtime::from_current()?).await?;
+                    DistributedRuntime::new(Runtime::from_current()?, runtime_config).await?;
                 HiCacheG2Direct::new(Arc::new(distributed_runtime), config, ucx_devices).await
             })
             .map_err(to_pyerr)?;
@@ -229,7 +236,7 @@ impl PyHiCacheG2Direct {
 
     /// Transport counters. Cheap enough for the engine's scheduler thread.
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let snapshot = self.inner.metrics().snapshot();
+        let snapshot = self.inner.metrics_snapshot();
         let stats = PyDict::new(py);
         for (name, value) in snapshot {
             stats.set_item(name, value)?;

@@ -18,7 +18,7 @@
 //! would be.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -112,17 +112,40 @@ fn socket_addr(name: &str) -> Result<std::os::unix::net::SocketAddr> {
 pub struct RelaySender {
     tx: mpsc::Sender<ReplicaEvent>,
     stats: Arc<NodeRelayStats>,
+    /// Set on every drop this side of the owner (full queue, owner
+    /// unreachable, socket error). The publisher shares it as its `lost` flag,
+    /// so it burns a revision and announces the gap, as for a failed publish.
+    lost: Arc<AtomicBool>,
 }
 
 impl RelaySender {
+    fn new(tx: mpsc::Sender<ReplicaEvent>, stats: Arc<NodeRelayStats>) -> Self {
+        Self {
+            tx,
+            stats,
+            lost: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Never waits: the publisher's batching loop must not stall on the relay.
-    pub fn send(&self, event: ReplicaEvent) {
+    /// Returns whether the event was queued.
+    pub fn send(&self, event: ReplicaEvent) -> bool {
         match self.tx.try_send(event) {
             Ok(()) => {
                 self.stats.relayed_events.fetch_add(1, Ordering::Relaxed);
+                true
             }
-            Err(_) => self.stats.drop_events(1),
+            Err(_) => {
+                self.stats.drop_events(1);
+                self.lost.store(true, Ordering::Release);
+                false
+            }
         }
+    }
+
+    /// The flag this sender sets when it drops an event.
+    pub fn lost_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.lost)
     }
 }
 
@@ -173,7 +196,7 @@ pub async fn start_node_relay_owner(
         window,
         Arc::clone(&stats),
     ));
-    Ok(Some(RelaySender { tx, stats }))
+    Ok(Some(RelaySender::new(tx, stats)))
 }
 
 async fn read_relayed_events(
@@ -288,14 +311,20 @@ async fn publish_batches(
 /// owner's relay socket, reconnecting after [`RECONNECT_BACKOFF`].
 pub fn connect_node_relay(name: String, stats: Arc<NodeRelayStats>) -> RelaySender {
     let (tx, mut rx) = mpsc::channel::<ReplicaEvent>(RELAY_QUEUE_CAPACITY);
-    let task_stats = Arc::clone(&stats);
+    let sender = RelaySender::new(tx, stats);
+    let task_stats = Arc::clone(&sender.stats);
+    let lost = sender.lost_flag();
+    let drop_event = move || {
+        task_stats.drop_events(1);
+        lost.store(true, Ordering::Release);
+    };
     tokio::spawn(async move {
         let mut stream: Option<tokio::net::UnixStream> = None;
         let mut retry_at = tokio::time::Instant::now();
         while let Some(event) = rx.recv().await {
             if stream.is_none() {
                 if tokio::time::Instant::now() < retry_at {
-                    task_stats.drop_events(1);
+                    drop_event();
                     continue;
                 }
                 match connect(&name).await {
@@ -303,13 +332,13 @@ pub fn connect_node_relay(name: String, stats: Arc<NodeRelayStats>) -> RelaySend
                     Err(error) => {
                         tracing::debug!(%error, socket = %name, "HiCache G2 node relay owner unreachable");
                         retry_at = tokio::time::Instant::now() + RECONNECT_BACKOFF;
-                        task_stats.drop_events(1);
+                        drop_event();
                         continue;
                     }
                 }
             }
             let Ok(body) = rmp_serde::to_vec(&event) else {
-                task_stats.drop_events(1);
+                drop_event();
                 continue;
             };
             let connected = stream.as_mut().expect("connected above");
@@ -321,11 +350,11 @@ pub fn connect_node_relay(name: String, stats: Arc<NodeRelayStats>) -> RelaySend
                 tracing::debug!(%error, socket = %name, "HiCache G2 node relay write failed");
                 stream = None;
                 retry_at = tokio::time::Instant::now() + RECONNECT_BACKOFF;
-                task_stats.drop_events(1);
+                drop_event();
             }
         }
     });
-    RelaySender { tx, stats }
+    sender
 }
 
 async fn connect(name: &str) -> Result<tokio::net::UnixStream> {
@@ -396,7 +425,7 @@ mod tests {
             window,
             Arc::clone(&stats),
         ));
-        (RelaySender { tx, stats }, batch_rx)
+        (RelaySender::new(tx, stats), batch_rx)
     }
 
     #[tokio::test]
@@ -444,6 +473,8 @@ mod tests {
         client.send(event(1, 1, 1));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(stats.relay_dropped_events.load(Ordering::Relaxed), 1);
+        // The drop is flagged so the rank's publisher announces a gap.
+        assert!(client.lost_flag().load(Ordering::Acquire));
 
         let (_owner, mut batches) = start_test_owner(&name, Duration::from_millis(20));
         tokio::time::sleep(RECONNECT_BACKOFF + Duration::from_millis(100)).await;

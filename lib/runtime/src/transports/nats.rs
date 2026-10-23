@@ -280,7 +280,15 @@ pub struct ClientOptions {
 
     #[builder(default)]
     auth: NatsAuth,
+
+    /// Connect in the background, with jittered exponential reconnect backoff,
+    /// instead of failing when the server is unreachable. Off by default; see
+    /// [`ClientOptions::with_retry_on_initial_connect`].
+    #[builder(default)]
+    retry_on_initial_connect: bool,
 }
+
+mod b10_backoff;
 
 fn default_server() -> String {
     if let Ok(server) = std::env::var(env_nats::NATS_SERVER) {
@@ -307,11 +315,20 @@ impl ClientOptions {
         ClientOptionsBuilder::default()
     }
 
+    /// Return immediately from [`connect`](Self::connect) even when the server
+    /// is unreachable, and keep connecting in the background with jittered
+    /// exponential backoff. For components that can run degraded without
+    /// NATS; publishes and requests fail or wait until the connection is up.
+    pub fn with_retry_on_initial_connect(mut self) -> Self {
+        self.retry_on_initial_connect = true;
+        self
+    }
+
     /// Validate the config and attempt to connection to the NATS server
     pub async fn connect(self) -> Result<Client> {
         self.validate()?;
 
-        let client = match self.auth {
+        let mut client = match self.auth {
             NatsAuth::UserPass(username, password) => {
                 async_nats::ConnectOptions::with_user_and_password(username, password)
             }
@@ -321,6 +338,11 @@ impl ClientOptions {
                 async_nats::ConnectOptions::with_credentials_file(path).await?
             }
         };
+        if self.retry_on_initial_connect {
+            client = client
+                .retry_on_initial_connect()
+                .reconnect_delay_callback(b10_backoff::reconnect_delay);
+        }
 
         let (client, _) = build_in_runtime(
             async move {
@@ -344,6 +366,7 @@ impl Default for ClientOptions {
         ClientOptions {
             server: default_server(),
             auth: NatsAuth::default(),
+            retry_on_initial_connect: false,
         }
     }
 }
@@ -931,6 +954,37 @@ mod tests {
 
             Ok(())
         });
+    }
+
+    /// A port nothing listens on: bind an ephemeral port and release it.
+    fn b10_refused_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("nats://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn b10_retry_on_initial_connect_starts_disconnected_instead_of_failing() {
+        let server = b10_refused_server();
+        let strict = ClientOptions::builder()
+            .server(server.clone())
+            .build()
+            .unwrap();
+        assert!(strict.connect().await.is_err());
+
+        let client = ClientOptions::builder()
+            .server(server)
+            .build()
+            .unwrap()
+            .with_retry_on_initial_connect()
+            .connect()
+            .await
+            .expect("connects in the background");
+        assert_ne!(
+            client.client().connection_state(),
+            async_nats::connection::State::Connected
+        );
     }
 
     // Integration test for object store data operations using bincode

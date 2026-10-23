@@ -223,17 +223,36 @@ pub struct HiCacheReleaseRequest {
     pub lease_id: G2pbFetchLeaseId,
 }
 
+/// Everything a source advertises, as of `revision`; see
+/// [`ReplicaIndex::install_snapshot`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HiCacheSnapshotResponse {
+    pub source: ReplicaSource,
+    pub revision: u64,
+    pub blocks: Vec<ReplicaBlock>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HiCachePeerRequest {
     Fetch(HiCacheFetchRequest),
     Release(HiCacheReleaseRequest),
+    /// A reader lost deltas from this source and resyncs point to point, so a
+    /// resync costs no NATS traffic.
+    Snapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HiCachePeerResponse {
     Ack,
     Fetch(HiCacheFetchResponse),
+    Snapshot(HiCacheSnapshotResponse),
 }
+
+/// `serve_fetch`'s refusal when a requested key is no longer published. A
+/// reader that gets it for one page drops that entry from its index.
+const HICACHE_G2_NOT_HELD: &str = "HiCache G2 source no longer holds every requested page";
+/// Bound on one snapshot RPC.
+const HICACHE_G2_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Derive the physical index key for one engine page.
 ///
@@ -1407,7 +1426,7 @@ impl HiCacheG2State {
         let leased = match leased {
             Ok(leased) => leased,
             Err(PeerFetchLeaseError::NotFound) => {
-                anyhow::bail!("HiCache G2 source no longer holds every requested page")
+                anyhow::bail!(HICACHE_G2_NOT_HELD)
             }
             Err(error) => return Err(error.into()),
         };
@@ -1429,6 +1448,30 @@ impl HiCacheG2State {
             metadata_generation: self.map_generation.load(Ordering::Acquire),
             pages: leased.iter().map(|page| page.segments.clone()).collect(),
             checksums: leased.iter().map(|page| page.checksum).collect(),
+        })
+    }
+
+    /// Answer a reader's resync. The revision is read before the map, so every
+    /// change missing from the snapshot reaches the reader at a later revision.
+    fn serve_snapshot(&self) -> Result<HiCacheSnapshotResponse> {
+        let revision = self.publisher.revision();
+        let published = self
+            .published
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HiCache G2 published map poisoned"))?;
+        let blocks = published
+            .by_key
+            .iter()
+            .map(|(key, page)| ReplicaBlock {
+                key: *key,
+                size_bytes: page.segments.total_bytes(),
+                checksum: Some(page.checksum),
+            })
+            .collect();
+        Ok(HiCacheSnapshotResponse {
+            source: self.source.clone(),
+            revision,
+            blocks,
         })
     }
 
@@ -2026,6 +2069,23 @@ impl HiCachePeerClient {
         }
     }
 
+    async fn snapshot(&self, instance_id: u64) -> Result<HiCacheSnapshotResponse> {
+        match self
+            .request(instance_id, HiCachePeerRequest::Snapshot)
+            .await?
+        {
+            HiCachePeerResponse::Snapshot(snapshot) => {
+                anyhow::ensure!(
+                    snapshot.source.key.instance_id == instance_id,
+                    "HiCache G2 snapshot from instance {instance_id} names instance {}",
+                    snapshot.source.key.instance_id
+                );
+                Ok(snapshot)
+            }
+            other => anyhow::bail!("unexpected HiCache G2 snapshot response: {other:?}"),
+        }
+    }
+
     async fn release(&self, instance_id: u64, lease_id: G2pbFetchLeaseId) -> Result<()> {
         match self
             .request(
@@ -2117,6 +2177,71 @@ fn spawn_departed_peer_purger(
     });
 }
 
+/// Resync sources whose deltas this process lost (see
+/// `ReplicaIndex::request_resync`) from a snapshot fetched over the peer
+/// endpoint, one at a time. Stops when the transport is dropped.
+///
+/// ponytail: one snapshot in flight per reader; after a fleet-wide loss each
+/// reader walks every source in turn. Add bounded concurrency if that
+/// convergence time matters.
+fn spawn_index_resync(index: Weak<ReplicaIndex>, peers: HiCachePeerClient, own_instance: u64) {
+    tokio::spawn(async move {
+        loop {
+            let Some(strong) = index.upgrade() else {
+                return;
+            };
+            // Bounded wait, so a dropped transport is noticed.
+            let Ok(source) =
+                tokio::time::timeout(Duration::from_secs(1), strong.next_resync()).await
+            else {
+                continue;
+            };
+            let instance_id = source.key.instance_id;
+            if instance_id == own_instance {
+                // Own entries are never read.
+                continue;
+            }
+            // A late joiner sees a source's deltas before discovery lists it;
+            // a peer still missing after the grace has left and is purged.
+            let discovered = tokio::time::timeout(HICACHE_G2_SNAPSHOT_TIMEOUT, async {
+                while !peers.is_live(instance_id) {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            })
+            .await;
+            if discovered.is_err() {
+                continue;
+            }
+            match tokio::time::timeout(HICACHE_G2_SNAPSHOT_TIMEOUT, peers.snapshot(instance_id))
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("snapshot timed out")))
+            {
+                Ok(snapshot) => {
+                    let entries = snapshot.blocks.len();
+                    let installed = tokio::task::spawn_blocking(move || {
+                        strong.install_snapshot(snapshot.source, snapshot.revision, snapshot.blocks)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    tracing::info!(
+                        instance_id,
+                        tp_rank = source.key.tp_rank,
+                        entries,
+                        installed,
+                        "HiCache G2 resynced a source's index entries"
+                    );
+                }
+                Err(error) => {
+                    // Keep its entries: a refused lease still removes them one
+                    // by one, and the source is retried on its next gap.
+                    strong.resync_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%error, instance_id, "HiCache G2 index resync failed");
+                }
+            }
+        }
+    });
+}
+
 struct HiCachePeerEngine {
     state: Arc<HiCacheG2State>,
 }
@@ -2143,6 +2268,10 @@ impl
                 self.state.leases.release(release.lease_id);
                 Annotated::from_data(HiCachePeerResponse::Ack)
             }
+            HiCachePeerRequest::Snapshot => match self.state.serve_snapshot() {
+                Ok(snapshot) => Annotated::from_data(HiCachePeerResponse::Snapshot(snapshot)),
+                Err(error) => Annotated::from_error(error.to_string()),
+            },
         };
         Ok(ResponseStream::new(
             Box::pin(stream::iter(vec![response])),
@@ -2229,7 +2358,9 @@ impl HiCacheG2Direct {
                 match start_node_relay_owner(&index_component, &name, Arc::clone(&metrics.relay))
                     .await?
                 {
-                    Some(relay) => ReplicaPublisher::through_relay(source.clone(), relay)?,
+                    Some(relay) => {
+                        ReplicaPublisher::through_relay(&index_component, source.clone(), relay)?
+                    }
                     None => {
                         tracing::warn!(
                             socket = %name,
@@ -2241,6 +2372,7 @@ impl HiCacheG2Direct {
                 }
             }
             (true, Some(replica_id)) => ReplicaPublisher::through_relay(
+                &index_component,
                 source.clone(),
                 connect_node_relay(relay_socket_name(replica_id), Arc::clone(&metrics.relay)),
             )?,
@@ -2316,11 +2448,16 @@ impl HiCacheG2Direct {
             host = std::env::var("HOSTNAME").ok(),
             "HiCache G2 started"
         );
-        let purge_index = match &directory {
+        // A node-mode non-owner has no directory: its owner purges departed
+        // peers and resyncs lost deltas for the whole replica.
+        let local_index = match &directory {
             Directory::Local(index) => Some(Arc::downgrade(index)),
             Directory::Node(_) => None,
         };
-        spawn_departed_peer_purger(purge_index, peers.clone(), Arc::downgrade(&state));
+        spawn_departed_peer_purger(local_index.clone(), peers.clone(), Arc::downgrade(&state));
+        if let Some(index) = local_index {
+            spawn_index_resync(index, peers.clone(), instance_id);
+        }
 
         Ok(Self {
             state,
@@ -2333,6 +2470,17 @@ impl HiCacheG2Direct {
 
     pub fn metrics(&self) -> &HiCacheG2Metrics {
         &self.state.metrics
+    }
+
+    /// [`HiCacheG2Metrics::snapshot`] plus the replica index's own counters.
+    pub fn metrics_snapshot(&self) -> Vec<(&'static str, u64)> {
+        let mut snapshot = self.state.metrics.snapshot();
+        // A node-mode non-owner reports none; its owner's counters cover the
+        // replica's directory.
+        if let Directory::Local(index) = &self.directory {
+            snapshot.extend(index.counters());
+        }
+        snapshot
     }
 
     pub fn instance_id(&self) -> u64 {
@@ -2584,32 +2732,49 @@ impl HiCacheG2Direct {
             .map(|(_, len)| *len)
             .sum::<u64>();
         let mut locations = self.query_locations(keys, Some(page_bytes));
-        let FetchedRuns { outcome, checksums } =
-            fetch_runs(&mut locations, deadline, |instance_id, range| {
-                let pool = PeerPoolKey {
-                    instance_id,
-                    page_bytes,
-                };
-                let result = self.fetch_run(
-                    instance_id,
-                    &keys[range.clone()],
-                    &destination[range],
-                    deadline,
-                );
-                match &result {
-                    Ok(_) => self.state.record_peer_success(pool),
-                    Err(error) => {
-                        self.state
-                            .metrics
-                            .fetch_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        if let Some(failure) = error.downcast_ref::<UnaddressablePeer>() {
-                            self.state.record_unaddressable(pool, failure);
-                        }
+        let FetchedRuns {
+            outcome,
+            checksums,
+            refused,
+        } = fetch_runs(&mut locations, deadline, |instance_id, range| {
+            let pool = PeerPoolKey {
+                instance_id,
+                page_bytes,
+            };
+            let result = self.fetch_run(
+                instance_id,
+                &keys[range.clone()],
+                &destination[range],
+                deadline,
+            );
+            match &result {
+                Ok(_) => self.state.record_peer_success(pool),
+                Err(error) => {
+                    self.state
+                        .metrics
+                        .fetch_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(failure) = error.downcast_ref::<UnaddressablePeer>() {
+                        self.state.record_unaddressable(pool, failure);
                     }
                 }
-                result
-            });
+            }
+            result
+        });
+        match &self.directory {
+            Directory::Local(index) => {
+                for (key, source) in refused {
+                    index.forget(key, source);
+                }
+            }
+            // The owner keeps this rank's directory; best effort, like lookups.
+            Directory::Node(client) if !refused.is_empty() => {
+                if let Err(error) = client.forget(&refused) {
+                    tracing::debug!(%error, "HiCache G2 node index forget failed");
+                }
+            }
+            Directory::Node(_) => {}
+        }
         self.publish_pulled(
             &keys[..outcome.completed],
             &destination[..outcome.completed],
@@ -2918,6 +3083,7 @@ fn fetch_runs(
 ) -> FetchedRuns {
     let mut completed = 0usize;
     let mut checksums = Vec::with_capacity(locations.len());
+    let mut refused = Vec::new();
     let mut run_cap = usize::MAX;
     while completed < locations.len() {
         if Instant::now() >= deadline {
@@ -2971,6 +3137,7 @@ fn fetch_runs(
                             unsettled_ticket: Some(unsettled.ticket),
                         },
                         checksums,
+                        refused,
                     };
                 }
                 if let Some(failure) = error.downcast_ref::<VerificationFailure>()
@@ -3030,6 +3197,16 @@ fn fetch_runs(
                         remaining_candidates = locations[completed].len() - 1,
                         "HiCache G2 peer read failed; trying the next candidate for this page"
                     );
+                    // Only this page is at fault, and the source says it is gone:
+                    // the delta withdrawing it never reached this index.
+                    if format!("{error:#}").contains(HICACHE_G2_NOT_HELD) {
+                        refused.extend(
+                            locations[completed]
+                                .iter()
+                                .filter(|location| location.source.key.instance_id == instance_id)
+                                .map(|location| (location.block.key, location.source.key)),
+                        );
+                    }
                     locations[completed]
                         .retain(|location| location.source.key.instance_id != instance_id);
                     run_cap = usize::MAX;
@@ -3043,6 +3220,7 @@ fn fetch_runs(
             unsettled_ticket: None,
         },
         checksums,
+        refused,
     }
 }
 
@@ -3052,6 +3230,9 @@ struct FetchedRuns {
     outcome: HiCacheFetchOutcome,
     /// One per completed page, in order: `checksums.len() == outcome.completed`.
     checksums: Vec<u64>,
+    /// Index entries whose source refused a single-page lease because it no
+    /// longer holds the page; the caller drops them from its index.
+    refused: Vec<(SequenceHash, ReplicaSourceKey)>,
 }
 
 fn start_peer_service(component: &Component, state: Arc<HiCacheG2State>) -> Result<()> {
@@ -3723,6 +3904,7 @@ mod tests {
                     unsettled_ticket: Some(4),
                 },
                 checksums: vec![700, 701],
+                refused: vec![],
             }
         );
     }
@@ -3848,6 +4030,34 @@ mod tests {
             locations.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![2, 1, 2, 2]
         );
+    }
+
+    #[test]
+    fn a_page_the_source_no_longer_holds_is_reported_for_index_removal() {
+        let mut locations = vec![
+            vec![location(7, 10), location(9, 10)],
+            vec![location(7, 11)],
+        ];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            if instance_id == 7 && range.start == 0 {
+                // As the peer client surfaces the source's refusal.
+                anyhow::bail!("remote error: {HICACHE_G2_NOT_HELD}");
+            }
+            Ok(sums(instance_id, range))
+        });
+        // The two-page run is halved first; only the single-page refusal names
+        // the entry, and the page is still read from the other candidate.
+        assert_eq!(fetched.outcome.completed, 2);
+        assert_eq!(fetched.refused, vec![(10, location(7, 10).source.key)]);
+
+        // Any other single-page failure leaves the index alone.
+        let mut locations = vec![vec![location(7, 10), location(9, 10)]];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |instance_id, range| {
+            anyhow::ensure!(instance_id != 7, "transfer failed");
+            Ok(sums(instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 1);
+        assert!(fetched.refused.is_empty());
     }
 
     #[test]
@@ -4033,6 +4243,7 @@ mod tests {
                     unsettled_ticket: Some(5),
                 },
                 checksums: vec![],
+                refused: vec![],
             }
         );
         // No second read into the pages the first one may still be writing.

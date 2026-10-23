@@ -14,7 +14,8 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ use dynamo_runtime::pipeline::{
     network::Ingress,
 };
 use dynamo_runtime::stream::{self, StreamExt};
+use dynamo_runtime::traits::DistributedRuntimeProvider;
 use dynamo_runtime::transports::event_plane::{EventPublisher, EventSubscriber};
 
 use crate::node_relay::RelaySender;
@@ -50,11 +52,30 @@ const REPLICA_EVENT_WORKERS: usize = 8;
 const REPLICA_BATCH_DEADLINE_MS: u64 = 50;
 const REPLICA_BATCH_MAX_BLOCKS: usize = 4_096;
 const REPLICA_PUBLISH_QUEUE_CAPACITY: usize = 1_024;
+/// Longest a batch may wait on one NATS publish. A stalled publish otherwise
+/// backs the queue up until callers' updates are dropped unseen.
+const REPLICA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often the publisher re-checks the connection while idle, to announce a
+/// revision gap left by a skipped batch.
+const REPLICA_PUBLISHER_TICK: Duration = Duration::from_secs(1);
+/// A source is resynced at most this often by one reader, so a source that
+/// cannot answer (or keeps losing deltas) costs one snapshot per interval.
+const REPLICA_RESYNC_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const REPLICA_SUBSCRIBE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReplicaPublishConfig {
     batch_deadline: Duration,
     batch_max_blocks: usize,
+}
+
+impl Default for ReplicaPublishConfig {
+    fn default() -> Self {
+        Self {
+            batch_deadline: Duration::from_millis(REPLICA_BATCH_DEADLINE_MS),
+            batch_max_blocks: REPLICA_BATCH_MAX_BLOCKS,
+        }
+    }
 }
 
 impl ReplicaPublishConfig {
@@ -365,7 +386,7 @@ pub fn encode_compact_replica_event(event: &ReplicaEvent) -> Result<Vec<u8>> {
 }
 
 /// Several sources' events in one message, applied in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaEventBatch {
     pub events: Vec<ReplicaEvent>,
 }
@@ -676,6 +697,21 @@ pub struct ReplicaIndex {
     /// lease ids and are never reused, so a late delta from one is dropped
     /// rather than re-creating entries nothing would purge again.
     departed: DashMap<u64, ()>,
+    /// Set while this process cannot receive deltas (NATS down): lookups miss
+    /// rather than serve a view that is silently going stale.
+    disconnected: AtomicBool,
+    /// Sources whose delta stream has a revision gap and need a snapshot.
+    resync_pending: DashMap<ReplicaSourceKey, ReplicaSource>,
+    /// When each source last entered `resync_pending`, to rate-limit resyncs.
+    resync_requested_at: DashMap<ReplicaSourceKey, Instant>,
+    resync_wakeup: tokio::sync::Notify,
+    pub revision_gaps: AtomicU64,
+    pub resyncs: AtomicU64,
+    pub resync_failures: AtomicU64,
+    /// Times this copy lost its delta stream (NATS disconnected).
+    pub disconnects: AtomicU64,
+    /// Entries removed because their source refused to lease them.
+    pub refused_entries: AtomicU64,
 }
 
 impl ReplicaIndex {
@@ -683,14 +719,46 @@ impl ReplicaIndex {
         Self::default()
     }
 
-    pub async fn subscribe(component: &Component) -> Result<Arc<Self>> {
+    /// Start empty and subscribe in the background, retrying with jittered
+    /// backoff, so a process starts (local-only, every lookup a miss) while
+    /// NATS is unreachable.
+    pub fn subscribe(component: &Component) -> Arc<Self> {
         let index = Arc::new(Self::new());
-        let subscriber =
-            EventSubscriber::for_component(component, SERVING_G2_REPLICA_TOPIC).await?;
-        let batch_subscriber =
-            EventSubscriber::for_component(component, SERVING_G2_REPLICA_BATCH_TOPIC).await?;
-        spawn_replica_subscriber(subscriber, batch_subscriber, Arc::downgrade(&index));
-        Ok(index)
+        let weak = Arc::downgrade(&index);
+        spawn_connection_watch(component.clone(), Arc::downgrade(&index));
+        let component = component.clone();
+        tokio::spawn(async move {
+            let mut attempt = 0u32;
+            loop {
+                // Single events and node-relayed batches. A source publishes on
+                // one of them only, so its revisions stay ordered.
+                let subscribed = async {
+                    let events =
+                        EventSubscriber::for_component(&component, SERVING_G2_REPLICA_TOPIC)
+                            .await?;
+                    let batches =
+                        EventSubscriber::for_component(&component, SERVING_G2_REPLICA_BATCH_TOPIC)
+                            .await?;
+                    anyhow::Ok((events, batches))
+                }
+                .await;
+                match subscribed {
+                    Ok((events, batches)) => {
+                        spawn_replica_subscriber(events, batches, weak);
+                        return;
+                    }
+                    Err(error) => {
+                        attempt += 1;
+                        tracing::warn!(%error, attempt, "serving-G2 replica index subscribe failed; retrying");
+                        tokio::time::sleep(jittered_backoff(attempt)).await;
+                        if weak.strong_count() == 0 {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        index
     }
 
     pub fn apply(&self, event: ReplicaEvent) -> bool {
@@ -711,6 +779,14 @@ impl ReplicaIndex {
         }
         if source.revision >= event.revision {
             return false;
+        }
+        // Revisions are consecutive per incarnation, and a publisher burns one
+        // for every batch it could not deliver, so any jump means lost deltas:
+        // removals this copy will never see. A first contact past revision 1
+        // (this process joined late) is the same case.
+        if event.revision > source.revision + 1 {
+            self.revision_gaps.fetch_add(1, Ordering::Relaxed);
+            self.request_resync(&event.source);
         }
         match event.kind {
             ReplicaEventKind::Upsert(blocks) => {
@@ -782,6 +858,124 @@ impl ReplicaIndex {
         removed
     }
 
+    fn request_resync(&self, source: &ReplicaSource) {
+        let now = Instant::now();
+        let mut due = false;
+        self.resync_requested_at
+            .entry(source.key)
+            .and_modify(|at| {
+                if now.duration_since(*at) >= REPLICA_RESYNC_MIN_INTERVAL {
+                    *at = now;
+                    due = true;
+                }
+            })
+            .or_insert_with(|| {
+                due = true;
+                now
+            });
+        if due {
+            self.resync_pending.insert(source.key, source.clone());
+            self.resync_wakeup.notify_one();
+        }
+    }
+
+    /// Wait until a source needs a snapshot and take it.
+    pub async fn next_resync(&self) -> ReplicaSource {
+        loop {
+            let notified = self.resync_wakeup.notified();
+            let next = self.resync_pending.iter().next().map(|entry| *entry.key());
+            if let Some((_key, source)) = next.and_then(|key| self.resync_pending.remove(&key)) {
+                return source;
+            }
+            notified.await;
+        }
+    }
+
+    /// Replace everything `source` advertised with a snapshot of what it holds
+    /// as of `revision`, and resume its deltas from there. Deltas newer than the
+    /// snapshot that already arrived keep the revision where it is; the few
+    /// keys they touched may briefly disagree with the source until their next
+    /// delta or a refused lease (`forget`) corrects them.
+    pub fn install_snapshot(
+        &self,
+        source: ReplicaSource,
+        revision: u64,
+        blocks: Vec<ReplicaBlock>,
+    ) -> bool {
+        let source_key = source.key;
+        if self.departed.contains_key(&source_key.instance_id) {
+            return false;
+        }
+        let mut state = self
+            .by_source
+            .entry(source_key)
+            .or_insert_with(|| SourceIndexState::new(&source));
+        if state.incarnation != source.incarnation {
+            state.incarnation = source.incarnation;
+            state.revision = 0;
+        }
+        let fresh = blocks.iter().map(|block| block.key).collect::<HashSet<_>>();
+        for key in state.keys.iter().filter(|key| !fresh.contains(key)) {
+            self.remove_replica(*key, source_key);
+        }
+        for block in blocks {
+            self.upsert_replica(source.clone(), revision, block);
+        }
+        state.keys = fresh;
+        state.revision = state.revision.max(revision);
+        drop(state);
+        self.resyncs.fetch_add(1, Ordering::Relaxed);
+        if self.departed.contains_key(&source_key.instance_id) {
+            self.remove_source(source_key);
+            return false;
+        }
+        true
+    }
+
+    /// Drop `key` from `source`'s entries: the source refused to lease it, so
+    /// the delta that withdrew it was lost. A later upsert re-adds it.
+    pub fn forget(&self, key: SequenceHash, source: ReplicaSourceKey) -> bool {
+        let removed = self
+            .by_source
+            .get_mut(&source)
+            .is_some_and(|mut state| state.keys.remove(&key));
+        if removed {
+            self.remove_replica(key, source);
+            self.refused_entries.fetch_add(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    pub fn counters(&self) -> Vec<(&'static str, u64)> {
+        vec![
+            (
+                "index_revision_gaps",
+                self.revision_gaps.load(Ordering::Relaxed),
+            ),
+            ("index_resyncs", self.resyncs.load(Ordering::Relaxed)),
+            (
+                "index_resync_failures",
+                self.resync_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "index_refused_entries",
+                self.refused_entries.load(Ordering::Relaxed),
+            ),
+            (
+                "index_disconnects",
+                self.disconnects.load(Ordering::Relaxed),
+            ),
+        ]
+    }
+
+    /// Lookups miss while disconnected. Cumulative transitions into that
+    /// state are counted, so the stat exports as a counter.
+    pub fn set_disconnected(&self, disconnected: bool) {
+        if !self.disconnected.swap(disconnected, Ordering::Relaxed) && disconnected {
+            self.disconnects.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Forget an instance that has left discovery: drop every source (TP rank)
     /// it published and ignore anything it still has in flight. Returns
     /// (sources, entries) removed.
@@ -823,11 +1017,15 @@ impl ReplicaIndex {
     }
 
     /// One sharded map lookup per physical key. Output order matches input.
+    /// Every key misses while this copy is disconnected from the delta stream.
     pub fn batch_locations(
         &self,
         keys: &[SequenceHash],
         block_size: Option<u32>,
     ) -> Vec<Vec<ReplicaLocation>> {
+        if self.disconnected.load(Ordering::Relaxed) {
+            return vec![Vec::new(); keys.len()];
+        }
         keys.iter()
             .map(|key| self.locations(*key, block_size))
             .collect()
@@ -843,7 +1041,7 @@ impl ReplicaIndex {
 /// Returns the copy: a process that runs one (the HiCache G2 transport) reads it
 /// directly, so a lookup never depends on another replica being reachable.
 pub async fn start_replica_index_service(component: &Component) -> Result<Arc<ReplicaIndex>> {
-    let index = ReplicaIndex::subscribe(component).await?;
+    let index = ReplicaIndex::subscribe(component);
     let ingress =
         Ingress::<SingleIn<ReplicaQueryRequest>, ManyOut<ReplicaQueryResponse>>::for_engine(
             Arc::new(ReplicaQueryEngine {
@@ -891,61 +1089,117 @@ impl AsyncEngine<SingleIn<ReplicaQueryRequest>, ManyOut<ReplicaQueryResponse>, a
 
 pub struct ReplicaPublisher {
     tx: mpsc::Sender<ReplicaEventKind>,
+    shared: Arc<PublisherShared>,
 }
 
-/// Where a publisher's finished events go: straight to NATS, or to the
-/// replica's node-index owner, which publishes them in a batch.
-enum ReplicaSink {
-    Nats(Box<EventPublisher>),
-    Relay(RelaySender),
-}
-
-impl ReplicaSink {
-    async fn send(&self, event: ReplicaEvent) {
-        match self {
-            ReplicaSink::Nats(publisher) => {
-                let published = match encode_compact_replica_event(&event) {
-                    Ok(bytes) => publisher.publish_bytes(bytes).await,
-                    Err(error) => Err(error),
-                };
-                if let Err(error) = published {
-                    tracing::warn!(error = %error, "failed to publish replica event batch");
-                }
-            }
-            ReplicaSink::Relay(relay) => relay.send(event),
-        }
-    }
+#[derive(Default)]
+struct PublisherShared {
+    /// Last revision the batcher assigned, delivered or not.
+    revision: AtomicU64,
+    /// An update was dropped: at this queue, or (shared with the node relay's
+    /// sender) on its way to the replica's owner. The batcher burns a revision
+    /// for it, so readers see the loss as a gap and resync.
+    lost: Arc<AtomicBool>,
 }
 
 impl ReplicaPublisher {
+    /// Never blocks on NATS: while it is down batches are skipped, and every
+    /// skipped batch leaves a revision gap that makes readers resync from a
+    /// snapshot (see `ReplicaIndex::install_snapshot`).
     pub async fn new(component: &Component, source: ReplicaSource) -> Result<Arc<Self>> {
         let config = ReplicaPublishConfig::from_env()?;
         tracing::info!(?config, "serving-G2 replica publisher");
-        let publisher = EventPublisher::for_component(component, SERVING_G2_REPLICA_TOPIC)
-            .await
-            .context("failed to create replica event publisher")?;
+        let publisher = Arc::new(
+            EventPublisher::for_component(component, SERVING_G2_REPLICA_TOPIC)
+                .await
+                .context("failed to create replica event publisher")?,
+        );
+        let component = component.clone();
         Ok(Self::spawn(
             source,
-            ReplicaSink::Nats(Box::new(publisher)),
+            move |event| {
+                let publisher = Arc::clone(&publisher);
+                async move {
+                    publisher
+                        .publish_bytes(encode_compact_replica_event(&event)?)
+                        .await
+                }
+            },
+            move || nats_connected(&component),
             config,
         ))
     }
 
     /// Number this source's deltas as usual, but hand each finished event to
-    /// the node-index owner instead of publishing it.
-    pub fn through_relay(source: ReplicaSource, relay: RelaySender) -> Result<Arc<Self>> {
+    /// the node-index owner, which publishes the replica's events in one batch
+    /// per window. The NATS gate still applies: while NATS is down the owner
+    /// could not publish either, and the skipped revisions read as a gap.
+    pub fn through_relay(
+        component: &Component,
+        source: ReplicaSource,
+        relay: RelaySender,
+    ) -> Result<Arc<Self>> {
         let config = ReplicaPublishConfig::from_env()?;
         tracing::info!(
             ?config,
             "serving-G2 replica publisher (through the node relay)"
         );
-        Ok(Self::spawn(source, ReplicaSink::Relay(relay), config))
+        let component = component.clone();
+        let lost = relay.lost_flag();
+        Ok(Self::spawn_with_lost(
+            source,
+            move |event| {
+                std::future::ready(if relay.send(event) {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("node relay queue rejected an event"))
+                })
+            },
+            move || nats_connected(&component),
+            config,
+            lost,
+        ))
     }
 
-    fn spawn(source: ReplicaSource, sink: ReplicaSink, config: ReplicaPublishConfig) -> Arc<Self> {
+    fn spawn<P, F>(
+        source: ReplicaSource,
+        publish: P,
+        connected: impl Fn() -> bool + Send + Sync + 'static,
+        config: ReplicaPublishConfig,
+    ) -> Arc<Self>
+    where
+        P: Fn(ReplicaEvent) -> F + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        Self::spawn_with_lost(source, publish, connected, config, Arc::default())
+    }
+
+    /// As `spawn`, with a `lost` flag shared with whatever delivers events.
+    fn spawn_with_lost<P, F>(
+        source: ReplicaSource,
+        publish: P,
+        connected: impl Fn() -> bool + Send + Sync + 'static,
+        config: ReplicaPublishConfig,
+        lost: Arc<AtomicBool>,
+    ) -> Arc<Self>
+    where
+        P: Fn(ReplicaEvent) -> F + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel(REPLICA_PUBLISH_QUEUE_CAPACITY);
-        tokio::spawn(run_replica_publisher(source, sink, config, rx));
-        Arc::new(Self { tx })
+        let shared = Arc::new(PublisherShared {
+            revision: AtomicU64::new(0),
+            lost,
+        });
+        tokio::spawn(run_replica_publisher(
+            source,
+            publish,
+            connected,
+            config,
+            Arc::clone(&shared),
+            rx,
+        ));
+        Arc::new(Self { tx, shared })
     }
 
     pub fn upsert(&self, blocks: Vec<ReplicaBlock>) -> Result<()> {
@@ -956,10 +1210,18 @@ impl ReplicaPublisher {
         self.publish(ReplicaEventKind::Remove(keys))
     }
 
+    /// Last revision assigned. Read it before snapshotting the local index:
+    /// every change already in that snapshot then arrives at a later revision,
+    /// where re-applying it is harmless.
+    pub fn revision(&self) -> u64 {
+        self.shared.revision.load(Ordering::Acquire)
+    }
+
     fn publish(&self, kind: ReplicaEventKind) -> Result<()> {
-        self.tx
-            .try_send(kind)
-            .map_err(|error| anyhow::anyhow!("replica publish queue rejected an event: {error}"))
+        self.tx.try_send(kind).map_err(|error| {
+            self.shared.lost.store(true, Ordering::Release);
+            anyhow::anyhow!("replica publish queue rejected an event: {error}")
+        })
     }
 }
 
@@ -1005,30 +1267,83 @@ impl PendingReplicaDelta {
     }
 }
 
-async fn publish_replica_event(
-    publisher: &ReplicaSink,
+/// Assign the next revision and try to deliver it. Returns whether it was
+/// delivered. An undelivered revision is never reused, which is what makes the
+/// loss visible to readers.
+async fn publish_replica_event<F>(
+    publish: &impl Fn(ReplicaEvent) -> F,
+    connected: &impl Fn() -> bool,
     source: &ReplicaSource,
-    revision: &mut u64,
+    shared: &PublisherShared,
     kind: ReplicaEventKind,
-) {
-    *revision += 1;
-    publisher
-        .send(ReplicaEvent {
-            source: source.clone(),
-            revision: *revision,
-            kind,
-        })
-        .await;
+) -> bool
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let revision = shared.revision.fetch_add(1, Ordering::AcqRel) + 1;
+    if !connected() {
+        return false;
+    }
+    let event = ReplicaEvent {
+        source: source.clone(),
+        revision,
+        kind,
+    };
+    match tokio::time::timeout(REPLICA_PUBLISH_TIMEOUT, publish(event)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, revision, "failed to publish replica event batch");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(revision, "replica event publish timed out");
+            false
+        }
+    }
 }
 
-async fn run_replica_publisher(
+async fn run_replica_publisher<P, F>(
     source: ReplicaSource,
-    publisher: ReplicaSink,
+    publish: P,
+    connected: impl Fn() -> bool,
     config: ReplicaPublishConfig,
+    shared: Arc<PublisherShared>,
     mut rx: mpsc::Receiver<ReplicaEventKind>,
-) {
-    let mut revision = 0;
-    while let Some(first) = rx.recv().await {
+) where
+    P: Fn(ReplicaEvent) -> F,
+    F: std::future::Future<Output = Result<()>>,
+{
+    // A revision readers have not seen followed by nothing they have: until
+    // some later event reaches them they cannot know they missed anything.
+    let mut gap_unannounced = false;
+    let mut tick = tokio::time::interval(REPLICA_PUBLISHER_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let first = tokio::select! {
+            next = rx.recv() => match next {
+                Some(first) => Some(first),
+                None => break,
+            },
+            _ = tick.tick() => None,
+        };
+        if shared.lost.swap(false, Ordering::AcqRel) {
+            shared.revision.fetch_add(1, Ordering::AcqRel);
+            gap_unannounced = true;
+        }
+        let Some(first) = first else {
+            if gap_unannounced && connected() {
+                // An empty upsert carries only the revision, exposing the gap.
+                gap_unannounced = !publish_replica_event(
+                    &publish,
+                    &connected,
+                    &source,
+                    &shared,
+                    ReplicaEventKind::Upsert(Vec::new()),
+                )
+                .await;
+            }
+            continue;
+        };
         let mut pending = PendingReplicaDelta::default();
         pending.absorb(first);
 
@@ -1045,21 +1360,64 @@ async fn run_replica_publisher(
         }
 
         for kind in pending.into_kinds(config.batch_max_blocks) {
-            publish_replica_event(&publisher, &source, &mut revision, kind).await;
+            gap_unannounced =
+                !publish_replica_event(&publish, &connected, &source, &shared, kind).await;
         }
     }
     publish_replica_event(
-        &publisher,
+        &publish,
+        &connected,
         &source,
-        &mut revision,
+        &shared,
         ReplicaEventKind::RemoveSource,
     )
     .await;
 }
 
+/// Equal-jitter exponential backoff, 100 ms doubling up to
+/// `REPLICA_SUBSCRIBE_RETRY_MAX`.
+fn jittered_backoff(attempt: u32) -> Duration {
+    let ceiling = Duration::from_millis(100)
+        .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+        .min(REPLICA_SUBSCRIBE_RETRY_MAX);
+    ceiling / 2 + ceiling.mul_f64(rand::random::<f64>() / 2.0)
+}
+
+/// Whether the replica events' NATS transport is connected; true for another
+/// event transport, which does not report connectivity here.
+fn nats_connected(component: &Component) -> bool {
+    let drt = component.drt();
+    drt.default_event_transport_kind() != dynamo_runtime::discovery::EventTransportKind::Nats
+        || drt.nats_connected().unwrap_or(true)
+}
+
+/// Mirror NATS connectivity onto the index: while disconnected every lookup
+/// misses. Deltas lost meanwhile show up as revision gaps once they resume.
+fn spawn_connection_watch(component: Component, index: std::sync::Weak<ReplicaIndex>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(REPLICA_PUBLISHER_TICK);
+        let mut was_connected = true;
+        loop {
+            interval.tick().await;
+            let Some(index) = index.upgrade() else {
+                return;
+            };
+            let connected = nats_connected(&component);
+            if connected != was_connected {
+                tracing::warn!(
+                    connected,
+                    "serving-G2 replica index NATS connectivity changed"
+                );
+                was_connected = connected;
+            }
+            index.set_disconnected(!connected);
+        }
+    });
+}
+
 fn spawn_replica_subscriber(
-    mut subscriber: EventSubscriber,
-    mut batch_subscriber: EventSubscriber,
+    mut events: EventSubscriber,
+    mut batches: EventSubscriber,
     index: std::sync::Weak<ReplicaIndex>,
 ) {
     let mut workers = Vec::with_capacity(REPLICA_EVENT_WORKERS);
@@ -1077,19 +1435,19 @@ fn spawn_replica_subscriber(
         });
     }
 
-    // Events of one source always go to the same worker, so a source's
-    // revisions apply in order whichever topic (single or batch) carried them.
     let route = move |event: ReplicaEvent| {
         let sticky = event.source.key.instance_id as usize ^ event.source.key.tp_rank as usize;
         workers[sticky % workers.len()].send(event).is_ok()
     };
     tokio::spawn(async move {
         loop {
+            // A batch's events go to the same per-source workers as single
+            // events, so each source's revisions still apply in order.
             let decoded = tokio::select! {
-                Some(envelope) = subscriber.next() => envelope
+                Some(envelope) = events.next() => envelope
                     .and_then(|envelope| decode_compact_replica_event(&envelope.payload))
                     .map(|event| vec![event]),
-                Some(envelope) = batch_subscriber.next() => envelope
+                Some(envelope) = batches.next() => envelope
                     .and_then(|envelope| decode_compact_replica_batch(&envelope.payload)),
                 else => break,
             };
@@ -1367,22 +1725,152 @@ mod tests {
         assert_eq!(index.locations(13, None).len(), 1);
     }
 
-    #[test]
-    fn micro_batch_is_last_change_wins_and_bounded() {
-        let mut pending = PendingReplicaDelta::default();
-        pending.absorb(ReplicaEventKind::Upsert(vec![block(11), block(12)]));
-        pending.absorb(ReplicaEventKind::Remove(vec![11, 12]));
-        pending.absorb(ReplicaEventKind::Upsert(vec![block(11)]));
-        let kinds = pending.into_kinds(1);
-        assert_eq!(kinds.len(), 2);
-        assert!(matches!(&kinds[0], ReplicaEventKind::Remove(keys) if keys == &[12]));
-        assert!(matches!(&kinds[1], ReplicaEventKind::Upsert(blocks) if blocks[0].key == 11));
+    #[tokio::test]
+    async fn revision_gap_and_late_join_request_one_rate_limited_resync() {
+        let index = ReplicaIndex::new();
+        let src = source(7, 0, 1);
+        let event = |revision, key| ReplicaEvent {
+            source: src.clone(),
+            revision,
+            kind: ReplicaEventKind::Upsert(vec![block(key)]),
+        };
+        assert!(index.apply(event(1, 11)));
+        assert!(index.apply(event(2, 12)));
+        assert_eq!(index.revision_gaps.load(Ordering::Relaxed), 0);
+        assert!(index.resync_pending.is_empty());
+
+        // Revision 3 was lost: the delta still applies, and a resync is queued.
+        assert!(index.apply(event(4, 14)));
+        assert_eq!(index.revision_gaps.load(Ordering::Relaxed), 1);
+        assert_eq!(index.locations(14, None).len(), 1);
+        assert_eq!(index.next_resync().await, src);
+
+        // Another gap inside the rate-limit window is counted, not re-queued.
+        assert!(index.apply(event(6, 16)));
+        assert_eq!(index.revision_gaps.load(Ordering::Relaxed), 2);
+        assert!(index.resync_pending.is_empty());
+
+        // A source first seen past revision 1 (this copy joined late) is a gap.
+        let late = source(9, 0, 2);
+        assert!(index.apply(ReplicaEvent {
+            source: late.clone(),
+            revision: 40,
+            kind: ReplicaEventKind::Upsert(vec![block(11)]),
+        }));
+        assert_eq!(index.next_resync().await, late);
     }
 
-    fn compact_round_trip(event: ReplicaEvent) -> usize {
-        let bytes = encode_compact_replica_event(&event).expect("encode compact");
-        assert_eq!(decode_compact_replica_event(&bytes).expect("decode"), event);
-        bytes.len()
+    #[test]
+    fn snapshot_replaces_a_sources_entries_and_resumes_its_deltas() {
+        let index = ReplicaIndex::new();
+        let src = source(7, 0, 1);
+        upsert(&index, 7, 0, &[11, 12]);
+        upsert(&index, 9, 0, &[12]);
+
+        // 12 was withdrawn in a lost delta; 13 was published in another.
+        assert!(index.install_snapshot(src.clone(), 10, vec![block(11), block(13)]));
+        assert_eq!(index.locations(11, None).len(), 1);
+        assert_eq!(
+            index.locations(12, None)[0].source.key.instance_id,
+            9,
+            "only the other source's entry is left"
+        );
+        assert_eq!(index.locations(13, None).len(), 1);
+        assert_eq!(index.resyncs.load(Ordering::Relaxed), 1);
+
+        // Deltas the snapshot covers are dropped; the next one applies, no gap.
+        assert!(!index.apply(ReplicaEvent {
+            source: src.clone(),
+            revision: 10,
+            kind: ReplicaEventKind::Upsert(vec![block(12)]),
+        }));
+        assert!(index.apply(ReplicaEvent {
+            source: src.clone(),
+            revision: 11,
+            kind: ReplicaEventKind::Remove(vec![11]),
+        }));
+        assert!(index.locations(11, None).is_empty());
+        assert_eq!(index.revision_gaps.load(Ordering::Relaxed), 0);
+
+        // A departed instance's snapshot is ignored.
+        index.purge_instance(7);
+        assert!(!index.install_snapshot(src, 20, vec![block(11)]));
+        assert!(index.locations(11, None).is_empty());
+    }
+
+    #[test]
+    fn forget_drops_one_sources_entry_and_a_later_upsert_restores_it() {
+        let index = ReplicaIndex::new();
+        upsert(&index, 7, 0, &[11]);
+        upsert(&index, 9, 0, &[11]);
+        let refused = source(7, 0, 7).key;
+        assert!(index.forget(11, refused));
+        assert!(!index.forget(11, refused));
+        assert!(!index.forget(99, refused));
+        let left = index.locations(11, None);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].source.key.instance_id, 9);
+        assert_eq!(index.refused_entries.load(Ordering::Relaxed), 1);
+        // The source's reverse state forgot it too: a source removal is exact.
+        index.apply(ReplicaEvent {
+            source: source(7, 0, 7),
+            revision: 2,
+            kind: ReplicaEventKind::Upsert(vec![block(11)]),
+        });
+        assert_eq!(index.locations(11, None).len(), 2);
+    }
+
+    #[test]
+    fn lookups_miss_while_disconnected() {
+        let index = ReplicaIndex::new();
+        upsert(&index, 7, 0, &[11]);
+        index.set_disconnected(true);
+        index.set_disconnected(true);
+        assert_eq!(index.batch_locations(&[11, 12], None), vec![vec![], vec![]]);
+        index.set_disconnected(false);
+        assert_eq!(index.batch_locations(&[11], None)[0].len(), 1);
+        assert_eq!(index.disconnects.load(Ordering::Relaxed), 1);
+    }
+
+    /// A publisher whose deliveries land in a vector, behind a connectivity flag.
+    fn test_publisher() -> (
+        Arc<ReplicaPublisher>,
+        Arc<std::sync::Mutex<Vec<ReplicaEvent>>>,
+        Arc<AtomicBool>,
+    ) {
+        test_publisher_with(ReplicaPublishConfig::default())
+    }
+
+    /// Records what readers would decode: under v2 every event goes through
+    /// the compact encoding and back.
+    fn test_publisher_with(
+        config: ReplicaPublishConfig,
+    ) -> (
+        Arc<ReplicaPublisher>,
+        Arc<std::sync::Mutex<Vec<ReplicaEvent>>>,
+        Arc<AtomicBool>,
+    ) {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connected = Arc::new(AtomicBool::new(true));
+        let publisher = ReplicaPublisher::spawn(
+            source(7, 0, 1),
+            {
+                let sent = Arc::clone(&sent);
+                move |event| {
+                    // Through the wire encoding and back, as a reader sees it.
+                    let event = encode_compact_replica_event(&event)
+                        .and_then(|bytes| decode_compact_replica_event(&bytes));
+                    let result = event.map(|event| sent.lock().unwrap().push(event));
+                    async { result }
+                }
+            },
+            {
+                let connected = Arc::clone(&connected);
+                move || connected.load(Ordering::Relaxed)
+            },
+            config,
+        );
+        (publisher, sent, connected)
     }
 
     #[test]
@@ -1402,6 +1890,238 @@ mod tests {
             .collect::<Vec<_>>();
         let encoded = encode_compact_replica_batch(&events).unwrap();
         assert_eq!(decode_compact_replica_batch(&encoded).unwrap(), events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_batch_reaches_readers_as_a_gap_through_the_wire() {
+        let (publisher, sent, connected) = test_publisher_with(ReplicaPublishConfig::default());
+        publisher.upsert(vec![block(11)]).unwrap();
+        settle().await;
+        connected.store(false, Ordering::Relaxed);
+        publisher.remove(vec![11]).unwrap();
+        settle().await;
+        connected.store(true, Ordering::Relaxed);
+        settle().await;
+        let events = sent.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        // The gap announcement survives the compact encoding as an empty upsert.
+        assert!(matches!(&events[1].kind, ReplicaEventKind::Upsert(blocks) if blocks.is_empty()));
+        let index = ReplicaIndex::new();
+        for event in events {
+            index.apply(event);
+        }
+        assert_eq!(index.revision_gaps.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configured_batch_window_coalesces_updates() {
+        let (publisher, sent, _connected) = test_publisher_with(ReplicaPublishConfig {
+            batch_deadline: Duration::from_millis(5_000),
+            ..ReplicaPublishConfig::default()
+        });
+        publisher.upsert(vec![block(11)]).unwrap();
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        publisher.upsert(vec![block(12)]).unwrap();
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        assert!(sent.lock().unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        let events = sent.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0].kind, ReplicaEventKind::Upsert(blocks) if blocks.len() == 2));
+    }
+
+    async fn settle() {
+        tokio::time::sleep(REPLICA_PUBLISHER_TICK * 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batches_skipped_while_disconnected_reach_readers_as_a_gap() {
+        let (publisher, sent, connected) = test_publisher();
+        publisher.upsert(vec![block(11)]).unwrap();
+        settle().await;
+        connected.store(false, Ordering::Relaxed);
+        // Never blocks, never queues behind NATS: the batch is skipped.
+        publisher.remove(vec![11]).unwrap();
+        settle().await;
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(publisher.revision(), 2);
+
+        // Back up and idle: an empty upsert announces the skipped revision.
+        connected.store(true, Ordering::Relaxed);
+        settle().await;
+        let events = sent.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].revision, 3);
+        assert!(matches!(&events[1].kind, ReplicaEventKind::Upsert(blocks) if blocks.is_empty()));
+
+        let index = ReplicaIndex::new();
+        for event in events {
+            index.apply(event);
+        }
+        assert_eq!(index.revision_gaps.load(Ordering::Relaxed), 1);
+        // Until the resync lands the reader still holds the stale entry; the
+        // snapshot (or a refused lease) is what removes it.
+        assert_eq!(index.locations(11, None).len(), 1);
+
+        // Nothing more is sent once the gap is announced.
+        settle().await;
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_dropped_at_the_queue_burns_a_revision() {
+        let (publisher, sent, _connected) = test_publisher();
+        publisher.upsert(vec![block(11)]).unwrap();
+        settle().await;
+        publisher.shared.lost.store(true, Ordering::Relaxed);
+        settle().await;
+        let events = sent.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+    }
+
+    /// The node relay's writer drops an event after the publisher handed it
+    /// over (owner unreachable): the shared `lost` flag makes the publisher
+    /// burn a revision and announce the gap on its next tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_drop_after_handoff_burns_a_revision_and_announces_the_gap() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let lost = Arc::new(AtomicBool::new(false));
+        let publisher = ReplicaPublisher::spawn_with_lost(
+            source(7, 0, 1),
+            {
+                let sent = Arc::clone(&sent);
+                move |event: ReplicaEvent| {
+                    sent.lock().unwrap().push(event);
+                    async { Ok(()) }
+                }
+            },
+            || true,
+            ReplicaPublishConfig::default(),
+            Arc::clone(&lost),
+        );
+        publisher.upsert(vec![block(11)]).unwrap();
+        settle().await;
+        // The relay writer could not reach the owner with revision 1.
+        lost.store(true, Ordering::Release);
+        tokio::time::sleep(REPLICA_PUBLISHER_TICK * 2).await;
+        let events = sent.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.revision, event.kind.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, ReplicaEventKind::Upsert(vec![block(11)])),
+                (3, ReplicaEventKind::Upsert(Vec::new())),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_publish_times_out_instead_of_backing_up_the_queue() {
+        let delivered = Arc::new(AtomicU64::new(0));
+        let publisher = ReplicaPublisher::spawn(
+            source(7, 0, 1),
+            {
+                let delivered = Arc::clone(&delivered);
+                move |event: ReplicaEvent| {
+                    let delivered = Arc::clone(&delivered);
+                    async move {
+                        if event.revision == 1 {
+                            std::future::pending::<()>().await;
+                        }
+                        delivered.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                }
+            },
+            || true,
+            ReplicaPublishConfig::default(),
+        );
+        publisher.upsert(vec![block(11)]).unwrap();
+        settle().await;
+        // Revision 1 timed out; an idle tick announced the gap at revision 2.
+        assert_eq!(delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(publisher.revision(), 2);
+        publisher.upsert(vec![block(12)]).unwrap();
+        settle().await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 2);
+        assert_eq!(publisher.revision(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn starts_local_only_when_nats_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = format!("nats://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        let mut config = dynamo_runtime::distributed::DistributedConfig::process_local();
+        config.nats_config = Some(
+            dynamo_runtime::transports::nats::ClientOptions::builder()
+                .server(server)
+                .build()
+                .unwrap()
+                .with_retry_on_initial_connect(),
+        );
+        config.event_transport_kind = dynamo_runtime::discovery::EventTransportKind::Nats;
+        let runtime =
+            DistributedRuntime::new(dynamo_runtime::Runtime::from_current().unwrap(), config)
+                .await
+                .expect("a worker starts while NATS is down");
+        assert_eq!(runtime.nats_connected(), Some(false));
+
+        let component = serving_g2_namespace(&runtime, "test")
+            .unwrap()
+            .component(SERVING_G2_INDEX_COMPONENT)
+            .unwrap();
+        let publisher = ReplicaPublisher::new(&component, source(7, 0, 1))
+            .await
+            .unwrap();
+        let index = start_replica_index_service(&component).await.unwrap();
+        upsert(&index, 9, 0, &[11]);
+        tokio::time::sleep(REPLICA_PUBLISHER_TICK * 2).await;
+        assert!(index.batch_locations(&[11], None)[0].is_empty());
+        assert!(index.counters().contains(&("index_disconnects", 1)));
+        // Batches are skipped, never queued behind the dead connection, so the
+        // queue keeps draining: several queues' worth of updates are accepted.
+        let burst = REPLICA_PUBLISH_QUEUE_CAPACITY as u64 / 2;
+        for round in 0..6 {
+            for key in round * burst..(round + 1) * burst {
+                publisher.upsert(vec![block(key)]).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(REPLICA_BATCH_DEADLINE_MS * 4)).await;
+        }
+        assert!(publisher.revision() >= 6);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn micro_batch_is_last_change_wins_and_bounded() {
+        let mut pending = PendingReplicaDelta::default();
+        pending.absorb(ReplicaEventKind::Upsert(vec![block(11), block(12)]));
+        pending.absorb(ReplicaEventKind::Remove(vec![11, 12]));
+        pending.absorb(ReplicaEventKind::Upsert(vec![block(11)]));
+        let kinds = pending.into_kinds(1);
+        assert_eq!(kinds.len(), 2);
+        assert!(matches!(&kinds[0], ReplicaEventKind::Remove(keys) if keys == &[12]));
+        assert!(matches!(&kinds[1], ReplicaEventKind::Upsert(blocks) if blocks[0].key == 11));
+    }
+
+    fn compact_round_trip(event: ReplicaEvent) -> usize {
+        let bytes = encode_compact_replica_event(&event).expect("encode compact");
+        assert_eq!(decode_compact_replica_event(&bytes).expect("decode"), event);
+        bytes.len()
     }
 
     #[test]
