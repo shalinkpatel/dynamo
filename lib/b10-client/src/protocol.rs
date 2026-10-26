@@ -117,11 +117,10 @@ pub fn validate_request(request: &NewRequestV1) -> anyhow::Result<()> {
             "new_request.mm_payloads kwargs require values"
         );
         ensure!(
-            payloads
-                .native_inputs
-                .iter()
-                .all(|input| !input.kind.is_empty() && !input.url.is_empty()),
-            "new_request.mm_payloads native inputs require kind and url"
+            payloads.native_inputs.iter().all(|input| {
+                !input.kind.is_empty() && (!input.data.is_empty() || !input.url.is_empty())
+            }),
+            "new_request.mm_payloads native inputs require kind and media"
         );
     }
     Ok(())

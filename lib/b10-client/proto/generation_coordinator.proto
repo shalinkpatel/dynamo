@@ -302,7 +302,11 @@ message MmKwarg
 message NativeMmInput
 {
   string kind = 1;
+  // Base64 data URL written by frontends that predate `data`. New writers send
+  // bytes only; this stays for receivers on the older protocol.
   string url = 2;
+  // Resolved media bytes. Frontends that send this never populate `url`.
+  bytes data = 3;
 }
 
 message TraceContext

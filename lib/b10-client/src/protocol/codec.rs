@@ -143,7 +143,7 @@ struct MmArgs {
 struct NativeMmInput {
     #[serde(rename = "type")]
     kind: String,
-    url: String,
+    data: Value,
 }
 
 fn mm_routing_args_from_blocks(
@@ -217,11 +217,17 @@ fn mm_payloads_from_args(args: MmArgs) -> Result<MmPayloadsV1> {
             .mm_native_inputs
             .unwrap_or_default()
             .into_iter()
-            .map(|input| NativeMmInputV1 {
-                kind: input.kind,
-                url: input.url,
+            .map(|input| {
+                let Value::Binary(data) = input.data else {
+                    bail!("worker_args.mm_args.mm_native_inputs must contain bytes");
+                };
+                Ok(NativeMmInputV1 {
+                    kind: input.kind,
+                    url: String::new(),
+                    data,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -347,10 +353,14 @@ fn mm_payloads_to_value(payloads: MmPayloadsV1) -> Result<Value> {
         .native_inputs
         .into_iter()
         .map(|input| {
-            Value::Map(vec![
-                (Value::from("type"), Value::from(input.kind)),
-                (Value::from("url"), Value::from(input.url)),
-            ])
+            // New deployments exchange resolved media as bytes. A data URL is
+            // passed through unchanged only for a frontend that predates `data`.
+            let media = if input.data.is_empty() {
+                (Value::from("url"), Value::from(input.url))
+            } else {
+                (Value::from("data"), Value::Binary(input.data))
+            };
+            Value::Map(vec![(Value::from("type"), Value::from(input.kind)), media])
         })
         .collect::<Vec<_>>();
     Ok(Value::Map(vec![
@@ -531,6 +541,62 @@ mod tests {
     use super::*;
     use dynamo_runtime::pipeline::context::Controller;
     use std::sync::Arc;
+
+    #[test]
+    fn native_media_round_trip_carries_binary_bytes() {
+        let context = RequestContext::new(
+            Arc::new(Controller::new("native-media".to_string())),
+            None,
+            Default::default(),
+        );
+        let bytes: Vec<u8> = (0..=255).collect();
+        let worker = Value::Map(vec![
+            ("model".into(), "test-model".into()),
+            ("sampling_params".into(), Value::Map(vec![])),
+            (
+                "mm_args".into(),
+                Value::Map(vec![
+                    ("media_token_id".into(), (-1).into()),
+                    (
+                        "mm_native_inputs".into(),
+                        Value::Array(vec![Value::Map(vec![
+                            (Value::from("type"), Value::from("image_url")),
+                            (Value::from("data"), Value::Binary(bytes.clone())),
+                        ])]),
+                    ),
+                ]),
+            ),
+        ]);
+        let wire = encode_request(
+            &context,
+            GenerationRequest {
+                routing_request: RouterRequestNew {
+                    tokens: vec![1, 2],
+                    ..Default::default()
+                },
+                primary_worker_request: worker,
+                decode_worker_request: None,
+            },
+        )
+        .unwrap();
+        let input = &wire.mm_payloads.as_ref().unwrap().native_inputs[0];
+        assert_eq!(input.kind, "image_url");
+        assert_eq!(input.data, bytes);
+        assert!(input.url.is_empty(), "new writers must not emit a data URL");
+
+        let decoded = decode_new_request(
+            "native-media".to_string(),
+            wire,
+            DisaggregationStrategy::PrefillFirst,
+        )
+        .unwrap();
+        let input = &decoded.primary_worker_request["mm_args"]["mm_native_inputs"][0];
+        assert_eq!(input["type"].as_str(), Some("image_url"));
+        let Value::Binary(round_tripped) = &input["data"] else {
+            panic!("worker input must retain binary encoding")
+        };
+        assert_eq!(round_tripped, &bytes);
+    }
 
     #[test]
     fn request_round_trip_preserves_worker_field_shapes() {

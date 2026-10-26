@@ -500,7 +500,7 @@ mod tests {
             Some(trace_context),
             BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
         );
-        let worker_request = value(serde_json::json!({
+        let mut worker_request = value(serde_json::json!({
             "model": "test-model",
             "streaming": true,
             "sampling_params": {"temperature": 0.25, "max_tokens": 8},
@@ -515,10 +515,28 @@ mod tests {
                 "media_token_id": 32000,
                 "mm_hashes": ["image-hash"],
                 "mm_positions": [2],
-                "mm_lengths": [4],
-                "mm_native_inputs": [{"type": "image_url", "url": "https://example.invalid/image"}]
+                "mm_lengths": [4]
             }
         }));
+        // Resolved media crosses as MessagePack binary, which a JSON fixture
+        // cannot express; attach it to the parsed map directly.
+        let Value::Map(entries) = &mut worker_request else {
+            panic!("worker request must be a map")
+        };
+        let (_, Value::Map(mm_args)) = entries
+            .iter_mut()
+            .find(|(key, _)| key.as_str() == Some("mm_args"))
+            .expect("mm_args present")
+        else {
+            panic!("mm_args must be a map")
+        };
+        mm_args.push((
+            Value::from("mm_native_inputs"),
+            Value::Array(vec![Value::Map(vec![
+                (Value::from("type"), Value::from("image_url")),
+                (Value::from("data"), Value::Binary(b"image-bytes".to_vec())),
+            ])]),
+        ));
         let routing_request = crate::RouterRequestNew {
             tokens: vec![1, 2, 3, 4],
             block_mm_infos: Some(vec![
@@ -599,6 +617,13 @@ mod tests {
         assert!(routing.do_not_queue);
         assert_eq!(routing.allowed_worker_ids, vec![5, 7]);
         assert_eq!(request.mm_routing_args.unwrap().blocks.len(), 2);
+        let native = &request.mm_payloads.as_ref().unwrap().native_inputs[0];
+        assert_eq!(native.kind, "image_url");
+        assert_eq!(native.data.as_slice(), b"image-bytes".as_slice());
+        assert!(
+            native.url.is_empty(),
+            "new writers must not emit a base64 URL"
+        );
         assert_eq!(request.mm_payloads.unwrap().hashes, vec!["image-hash"]);
         let sampling: Value = rmp_serde::from_slice(&request.worker_msgpack).unwrap();
         assert_eq!(
