@@ -143,7 +143,11 @@ struct MmArgs {
 struct NativeMmInput {
     #[serde(rename = "type")]
     kind: String,
-    data: Value,
+    // Resolved media bytes; preferred when the sender is on the new wire.
+    data: Option<Value>,
+    // Base64 data URL, still sent by frontends running with
+    // NATIVE_MEDIA_LEGACY_WIRE=1 while the migration is in flight.
+    url: Option<String>,
 }
 
 fn mm_routing_args_from_blocks(
@@ -217,15 +221,31 @@ fn mm_payloads_from_args(args: MmArgs) -> Result<MmPayloadsV1> {
             .mm_native_inputs
             .unwrap_or_default()
             .into_iter()
-            .map(|input| {
-                let Value::Binary(data) = input.data else {
-                    bail!("worker_args.mm_args.mm_native_inputs must contain bytes");
-                };
-                Ok(NativeMmInputV1 {
-                    kind: input.kind,
-                    url: String::new(),
-                    data,
-                })
+            .map(|input| match input.data {
+                Some(value) => {
+                    let Value::Binary(data) = value else {
+                        bail!("worker_args.mm_args.mm_native_inputs.data must contain bytes");
+                    };
+                    Ok(NativeMmInputV1 {
+                        kind: input.kind,
+                        url: String::new(),
+                        data,
+                    })
+                }
+                None => {
+                    // Legacy sender: pass its data URL through unchanged rather
+                    // than re-encoding, so receivers on the old protocol are
+                    // unaffected.
+                    let url = input
+                        .url
+                        .filter(|url| !url.is_empty())
+                        .context("worker_args.mm_args.mm_native_inputs needs data or url")?;
+                    Ok(NativeMmInputV1 {
+                        kind: input.kind,
+                        url,
+                        data: Vec::new(),
+                    })
+                }
             })
             .collect::<Result<Vec<_>>>()?,
     })
@@ -541,6 +561,61 @@ mod tests {
     use super::*;
     use dynamo_runtime::pipeline::context::Controller;
     use std::sync::Arc;
+
+    #[test]
+    fn legacy_data_url_input_is_passed_through_unchanged() {
+        let context = RequestContext::new(
+            Arc::new(Controller::new("legacy-media".to_string())),
+            None,
+            Default::default(),
+        );
+        let data_url = "data:application/octet-stream;base64,AAAA";
+        let worker = Value::Map(vec![
+            ("model".into(), "test-model".into()),
+            ("sampling_params".into(), Value::Map(vec![])),
+            (
+                "mm_args".into(),
+                Value::Map(vec![
+                    ("media_token_id".into(), (-1).into()),
+                    (
+                        "mm_native_inputs".into(),
+                        Value::Array(vec![Value::Map(vec![
+                            (Value::from("type"), Value::from("image_url")),
+                            (Value::from("url"), Value::from(data_url)),
+                        ])]),
+                    ),
+                ]),
+            ),
+        ]);
+        let wire = encode_request(
+            &context,
+            GenerationRequest {
+                routing_request: RouterRequestNew {
+                    tokens: vec![1, 2],
+                    ..Default::default()
+                },
+                primary_worker_request: worker,
+                decode_worker_request: None,
+            },
+        )
+        .unwrap();
+        let input = &wire.mm_payloads.as_ref().unwrap().native_inputs[0];
+        assert_eq!(input.url, data_url, "legacy URL must pass through verbatim");
+        assert!(input.data.is_empty());
+
+        let decoded = decode_new_request(
+            "legacy-media".to_string(),
+            wire,
+            DisaggregationStrategy::PrefillFirst,
+        )
+        .unwrap();
+        let input = &decoded.primary_worker_request["mm_args"]["mm_native_inputs"][0];
+        assert_eq!(input["url"].as_str(), Some(data_url));
+        assert!(
+            input["data"].is_nil(),
+            "worker must not see an empty data key"
+        );
+    }
 
     #[test]
     fn native_media_round_trip_carries_binary_bytes() {
