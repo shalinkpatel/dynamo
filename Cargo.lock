@@ -2771,6 +2771,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
+ "tower-http",
  "tracing",
  "url",
  "uuid",

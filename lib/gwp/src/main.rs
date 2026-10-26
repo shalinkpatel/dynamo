@@ -45,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
     let grpc_served = tonic::transport::Server::builder()
+        .layer(
+            tower_http::trace::TraceLayer::new_for_grpc()
+                .make_span_with(dynamo_gwp::grpc::request_span),
+        )
         .add_service(reflection)
         .add_service(built.kvlocator_service)
         .add_service(built.authorization_service)

@@ -307,6 +307,21 @@ impl Authorization for GrpcAuthorization {
     }
 }
 
+/// Server span for one gRPC call, parented on the caller's W3C `traceparent` (Alyx's
+/// KVLocator client sends it). Request-path calls get the always-on request span;
+/// health and reflection, polled by probes, get the system span (debug, filtered).
+pub fn request_span<B>(req: &http::Request<B>) -> tracing::Span {
+    if is_system_rpc(req.uri().path()) {
+        dynamo_runtime::logging::make_system_request_span(req)
+    } else {
+        dynamo_runtime::logging::make_inference_request_span(req)
+    }
+}
+
+fn is_system_rpc(path: &str) -> bool {
+    path.starts_with("/grpc.health.") || path.starts_with("/grpc.reflection.")
+}
+
 pub(crate) fn authorization_server(state: ControlState) -> AuthorizationServer<GrpcAuthorization> {
     AuthorizationServer::new(GrpcAuthorization::new(state))
         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
@@ -438,6 +453,20 @@ fn response_result(response: &CheckResponse) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probes_and_reflection_get_system_spans() {
+        assert!(super::is_system_rpc("/grpc.health.v1.Health/Check"));
+        assert!(super::is_system_rpc(
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        ));
+        assert!(!super::is_system_rpc(
+            "/dynamo.b10.generation.v1.KVLocatorService/Locate"
+        ));
+        assert!(!super::is_system_rpc(
+            "/envoy.service.auth.v3.Authorization/Check"
+        ));
+    }
+
     use super::*;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
