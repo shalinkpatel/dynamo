@@ -2741,6 +2741,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
+ "tmq",
  "tokio",
  "tracing",
  "uuid",
@@ -3926,6 +3927,7 @@ dependencies = [
 name = "g2direct-py3"
 version = "1.2.0"
 dependencies = [
+ "anyhow",
  "dynamo-g2direct",
  "dynamo-runtime",
  "pyo3",

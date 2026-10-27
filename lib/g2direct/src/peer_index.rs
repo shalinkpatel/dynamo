@@ -472,6 +472,12 @@ pub fn decode_compact_replica_event(bytes: &[u8]) -> Result<ReplicaEvent> {
     })
 }
 
+/// Where a key was last advertised, as a lookup returns it.
+///
+/// The directory keeps per source, not per key, so `block.size_bytes` is 0,
+/// `block.checksum` is `None` and `revision` is the source's latest revision.
+/// Verify a read against the checksum the source returns with the lease, never
+/// against this.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicaLocation {
     pub source: ReplicaSource,
@@ -508,6 +514,8 @@ impl ReplicaIndexClient {
         Ok(Self { query })
     }
 
+    /// Where each key is advertised. See [`ReplicaLocation`] for which fields
+    /// a lookup fills.
     pub async fn query(&self, request: ReplicaQueryRequest) -> Result<Vec<Vec<ReplicaLocation>>> {
         let mut response = self.query.round_robin(SingleIn::new(request)).await?;
         match response.next().await {
@@ -676,23 +684,73 @@ struct SourceIndexState {
     incarnation: Uuid,
     revision: u64,
     keys: HashSet<SequenceHash>,
+    /// This source's id in `by_key`, and its record, kept once rather than in
+    /// every entry it advertises.
+    slot: u32,
+    source: Arc<ReplicaSource>,
 }
 
-impl SourceIndexState {
-    fn new(source: &ReplicaSource) -> Self {
-        Self {
-            incarnation: source.incarnation,
-            revision: 0,
-            keys: HashSet::new(),
+/// The sources advertising one key. Almost every key has exactly one, so it is
+/// held inline; a key several replicas hold keeps a small boxed list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyHolders {
+    One(u32),
+    Many(Box<[u32]>),
+}
+
+impl KeyHolders {
+    fn slots(&self) -> &[u32] {
+        match self {
+            Self::One(slot) => std::slice::from_ref(slot),
+            Self::Many(slots) => slots,
+        }
+    }
+
+    fn insert(&mut self, slot: u32) {
+        if self.slots().contains(&slot) {
+            return;
+        }
+        let mut slots = self.slots().to_vec();
+        slots.push(slot);
+        *self = Self::Many(slots.into_boxed_slice());
+    }
+
+    /// Drop `slot`; returns whether no source is left.
+    fn remove(&mut self, slot: u32) -> bool {
+        let slots = self
+            .slots()
+            .iter()
+            .copied()
+            .filter(|held| *held != slot)
+            .collect::<Vec<_>>();
+        match slots.as_slice() {
+            [] => true,
+            [only] => {
+                *self = Self::One(*only);
+                false
+            }
+            _ => {
+                *self = Self::Many(slots.into_boxed_slice());
+                false
+            }
         }
     }
 }
 
 /// Sharded exact-replica directory with reverse state per physical producer.
+///
+/// An entry is just "key -> which sources hold it": each source's record is
+/// kept once (`by_slot`), not copied into every page it advertises, which cut
+/// the directory from ~550 to ~45 bytes per entry (`tests/directory_memory.rs`).
+/// The published size, checksum and per-entry revision are not kept: readers
+/// verify against the checksum the source returns with a fetch, so a lookup
+/// returns them as zero/none and the source's latest revision.
 #[derive(Default)]
 pub struct ReplicaIndex {
-    by_key: DashMap<SequenceHash, Vec<ReplicaLocation>>,
+    by_key: DashMap<SequenceHash, KeyHolders>,
     by_source: DashMap<ReplicaSourceKey, SourceIndexState>,
+    by_slot: DashMap<u32, (Arc<ReplicaSource>, u64)>,
+    next_slot: std::sync::atomic::AtomicU32,
     /// Instances purged after leaving discovery. Instance ids are discovery
     /// lease ids and are never reused, so a late delta from one is dropped
     /// rather than re-creating entries nothing would purge again.
@@ -766,19 +824,26 @@ impl ReplicaIndex {
         if self.departed.contains_key(&source_key.instance_id) {
             return false;
         }
+        if self.out_of_slots(source_key) {
+            return false;
+        }
         let mut source = self
             .by_source
             .entry(source_key)
-            .or_insert_with(|| SourceIndexState::new(&event.source));
+            .or_insert_with(|| self.new_source_state(&event.source));
+        let slot = source.slot;
         if source.incarnation != event.source.incarnation {
             for key in std::mem::take(&mut source.keys) {
-                self.remove_replica(key, source_key);
+                self.remove_replica(key, slot);
             }
             source.incarnation = event.source.incarnation;
             source.revision = 0;
         }
         if source.revision >= event.revision {
             return false;
+        }
+        if *source.source != event.source {
+            source.source = Arc::new(event.source.clone());
         }
         // Revisions are consecutive per incarnation, and a publisher burns one
         // for every batch it could not deliver, so any jump means lost deltas:
@@ -792,22 +857,24 @@ impl ReplicaIndex {
             ReplicaEventKind::Upsert(blocks) => {
                 for block in blocks {
                     source.keys.insert(block.key);
-                    self.upsert_replica(event.source.clone(), event.revision, block);
+                    self.upsert_replica(block.key, slot);
                 }
             }
             ReplicaEventKind::Remove(keys) => {
                 for key in keys {
                     source.keys.remove(&key);
-                    self.remove_replica(key, source_key);
+                    self.remove_replica(key, slot);
                 }
             }
             ReplicaEventKind::RemoveSource => {
                 for key in std::mem::take(&mut source.keys) {
-                    self.remove_replica(key, source_key);
+                    self.remove_replica(key, slot);
                 }
             }
         }
         source.revision = event.revision;
+        self.by_slot
+            .insert(slot, (Arc::clone(&source.source), event.revision));
         drop(source);
         // The instance may have been purged while this event was applied.
         if self.departed.contains_key(&source_key.instance_id) {
@@ -817,33 +884,44 @@ impl ReplicaIndex {
         true
     }
 
-    fn upsert_replica(&self, source: ReplicaSource, revision: u64, block: ReplicaBlock) {
-        let key = block.key;
-        let location = ReplicaLocation {
-            source,
-            block,
-            revision,
-        };
-        let mut locations = self.by_key.entry(key).or_default();
-        if let Some(existing) = locations
-            .iter_mut()
-            .find(|existing| existing.source.key == location.source.key)
-        {
-            *existing = location;
-        } else {
-            locations.push(location);
+    /// Slots are never reused (a lookup may still hold a departed source's
+    /// slot), so after 2^32 sources new ones are refused rather than given a
+    /// live source's slot.
+    fn out_of_slots(&self, source_key: ReplicaSourceKey) -> bool {
+        let out = !self.by_source.contains_key(&source_key)
+            && self.next_slot.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX;
+        if out {
+            tracing::error!(?source_key, "replica directory is out of source slots");
+        }
+        out
+    }
+
+    fn new_source_state(&self, source: &ReplicaSource) -> SourceIndexState {
+        let slot = self
+            .next_slot
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let record = Arc::new(source.clone());
+        self.by_slot.insert(slot, (Arc::clone(&record), 0));
+        SourceIndexState {
+            incarnation: source.incarnation,
+            revision: 0,
+            keys: HashSet::new(),
+            slot,
+            source: record,
         }
     }
 
-    fn remove_replica(&self, key: SequenceHash, source: ReplicaSourceKey) {
-        if let Some(mut locations) = self.by_key.get_mut(&key) {
-            locations.retain(|location| location.source.key != source);
-            let empty = locations.is_empty();
-            drop(locations);
-            if empty {
-                self.by_key.remove(&key);
-            }
-        }
+    fn upsert_replica(&self, key: SequenceHash, slot: u32) {
+        self.by_key
+            .entry(key)
+            .and_modify(|holders| holders.insert(slot))
+            .or_insert(KeyHolders::One(slot));
+    }
+
+    fn remove_replica(&self, key: SequenceHash, slot: u32) {
+        // Under the shard lock: drops the key once its last source leaves.
+        self.by_key
+            .remove_if_mut(&key, |_, holders| holders.remove(slot));
     }
 
     /// Drop every entry one physical producer advertised. Returns how many.
@@ -853,8 +931,9 @@ impl ReplicaIndex {
         };
         let removed = state.keys.len();
         for key in state.keys {
-            self.remove_replica(key, source);
+            self.remove_replica(key, state.slot);
         }
+        self.by_slot.remove(&state.slot);
         removed
     }
 
@@ -906,23 +985,32 @@ impl ReplicaIndex {
         if self.departed.contains_key(&source_key.instance_id) {
             return false;
         }
+        if self.out_of_slots(source_key) {
+            return false;
+        }
         let mut state = self
             .by_source
             .entry(source_key)
-            .or_insert_with(|| SourceIndexState::new(&source));
+            .or_insert_with(|| self.new_source_state(&source));
+        let slot = state.slot;
         if state.incarnation != source.incarnation {
             state.incarnation = source.incarnation;
             state.revision = 0;
         }
         let fresh = blocks.iter().map(|block| block.key).collect::<HashSet<_>>();
         for key in state.keys.iter().filter(|key| !fresh.contains(key)) {
-            self.remove_replica(*key, source_key);
+            self.remove_replica(*key, slot);
         }
-        for block in blocks {
-            self.upsert_replica(source.clone(), revision, block);
+        for key in &fresh {
+            self.upsert_replica(*key, slot);
         }
         state.keys = fresh;
+        if *state.source != source {
+            state.source = Arc::new(source);
+        }
         state.revision = state.revision.max(revision);
+        self.by_slot
+            .insert(slot, (Arc::clone(&state.source), state.revision));
         drop(state);
         self.resyncs.fetch_add(1, Ordering::Relaxed);
         if self.departed.contains_key(&source_key.instance_id) {
@@ -935,15 +1023,15 @@ impl ReplicaIndex {
     /// Drop `key` from `source`'s entries: the source refused to lease it, so
     /// the delta that withdrew it was lost. A later upsert re-adds it.
     pub fn forget(&self, key: SequenceHash, source: ReplicaSourceKey) -> bool {
-        let removed = self
+        let slot = self
             .by_source
             .get_mut(&source)
-            .is_some_and(|mut state| state.keys.remove(&key));
-        if removed {
-            self.remove_replica(key, source);
+            .and_then(|mut state| state.keys.remove(&key).then_some(state.slot));
+        if let Some(slot) = slot {
+            self.remove_replica(key, slot);
             self.refused_entries.fetch_add(1, Ordering::Relaxed);
         }
-        removed
+        slot.is_some()
     }
 
     pub fn counters(&self) -> Vec<(&'static str, u64)> {
@@ -997,19 +1085,28 @@ impl ReplicaIndex {
     }
 
     fn locations(&self, key: SequenceHash, block_size: Option<u32>) -> Vec<ReplicaLocation> {
-        let mut result = self
-            .by_key
-            .get(&key)
-            .map(|locations| {
-                locations
-                    .iter()
-                    .filter(|location| {
-                        block_size.is_none_or(|expected| location.source.block_size == expected)
+        let slots = match self.by_key.get(&key) {
+            Some(holders) => holders.slots().to_vec(),
+            None => return Vec::new(),
+        };
+        let mut result = slots
+            .into_iter()
+            .filter_map(|slot| {
+                let entry = self.by_slot.get(&slot)?;
+                let (source, revision) = entry.value();
+                block_size
+                    .is_none_or(|expected| source.block_size == expected)
+                    .then(|| ReplicaLocation {
+                        source: ReplicaSource::clone(source),
+                        block: ReplicaBlock {
+                            key,
+                            size_bytes: 0,
+                            checksum: None,
+                        },
+                        revision: *revision,
                     })
-                    .cloned()
-                    .collect::<Vec<_>>()
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         result.sort_unstable_by_key(|location| {
             (location.source.key.instance_id, location.source.key.tp_rank)
         });
@@ -1536,6 +1633,63 @@ mod tests {
             size_bytes: 4096,
             checksum: Some(key.wrapping_mul(17)),
         }
+    }
+
+    #[test]
+    fn key_holders_track_several_sources_and_shrink_back() {
+        let mut holders = KeyHolders::One(3);
+        holders.insert(3);
+        assert_eq!(holders, KeyHolders::One(3));
+        holders.insert(5);
+        holders.insert(9);
+        assert_eq!(holders.slots(), &[3, 5, 9]);
+        assert!(!holders.remove(5));
+        assert_eq!(holders.slots(), &[3, 9]);
+        assert!(!holders.remove(3));
+        assert_eq!(holders, KeyHolders::One(9));
+        assert!(!holders.remove(4));
+        assert!(holders.remove(9));
+    }
+
+    #[test]
+    fn a_shared_key_keeps_its_other_sources_and_each_source_its_latest_record() {
+        let index = ReplicaIndex::new();
+        for instance in [7, 9] {
+            assert!(index.apply(ReplicaEvent {
+                source: source(instance, 0, 1),
+                revision: 1,
+                kind: ReplicaEventKind::Upsert(vec![block(11)]),
+            }));
+        }
+        assert_eq!(index.locations(11, None).len(), 2);
+        assert!(index.apply(ReplicaEvent {
+            source: source(7, 0, 1),
+            revision: 2,
+            kind: ReplicaEventKind::Remove(vec![11]),
+        }));
+        let left = index.locations(11, None);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].source.key.instance_id, 9);
+        // A record change (here the row) is seen on lookups without re-adding.
+        let mut moved = source(9, 0, 1);
+        moved.row = Some("row-b".into());
+        assert!(index.apply(ReplicaEvent {
+            source: moved,
+            revision: 2,
+            kind: ReplicaEventKind::Upsert(vec![block(12)]),
+        }));
+        let at_11 = index.locations(11, None);
+        assert_eq!(at_11[0].source.row.as_deref(), Some("row-b"));
+        assert_eq!(at_11[0].revision, 2);
+        // The last source leaving removes the key.
+        assert!(index.apply(ReplicaEvent {
+            source: source(9, 0, 1),
+            revision: 3,
+            kind: ReplicaEventKind::RemoveSource,
+        }));
+        assert!(index.locations(11, None).is_empty());
+        assert!(index.locations(12, None).is_empty());
+        assert_eq!(index.entry_count(), 0);
     }
 
     #[test]

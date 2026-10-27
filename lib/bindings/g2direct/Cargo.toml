@@ -14,6 +14,7 @@ default = []
 python-extension = ["pyo3/extension-module"]
 
 [dependencies]
+anyhow = { workspace = true }
 dynamo-g2direct = { workspace = true, features = ["transport"] }
 dynamo-runtime = { workspace = true }
 pyo3 = { version = "0.23.4", default-features = false, features = ["macros", "abi3-py310"] }

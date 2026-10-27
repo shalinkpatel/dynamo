@@ -16,6 +16,10 @@
 //! tokens. Nothing on the source side can promise more: HiCache never tells this
 //! backend when it rewrites a host slot, so no source-side check is sound.
 
+use super::hicache_staging::{
+    FAILED_SLOT_QUARANTINE, HiCacheL3Stager, L3Directory, L3ObjectEvent, StagingArea, StagingGrant,
+    StagingRefusal, decode_l3_events, hicache_g2_l3_object_id, hicache_g2_staged_key,
+};
 use super::lease::{G2pbFetchLeaseId, release_fetch_lease_bounded, unix_time_ms};
 use super::nixl::create_worker_ucx_backend;
 use super::nixl::new_hicache_g2_nixl_agent;
@@ -199,6 +203,12 @@ pub struct HiCacheFetchRequest {
     pub lease_id: G2pbFetchLeaseId,
     pub keys: Vec<SequenceHash>,
     pub lease_expires_at_unix_ms: u64,
+    /// Serve the pages from the source's L3 through its staging slots rather
+    /// than from its host tier; see [`super::hicache_staging`]. The source may
+    /// answer with a leading subset of `keys`. Only sources that advertise
+    /// staged keys receive one, so older sources never see it set.
+    #[serde(default)]
+    pub staged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,6 +827,30 @@ pub struct HiCacheG2Metrics {
     pub lease_rpc_ns: AtomicU64,
     pub rdma_ns: AtomicU64,
     pub verify_ns: AtomicU64,
+    /// L3 pages advertised for staged reads, and those withdrawn again: pushed
+    /// out of the capped directory, or missing from the L3 when a peer asked.
+    pub staged_published_pages: AtomicU64,
+    pub staged_evicted_pages: AtomicU64,
+    pub staged_missing_pages: AtomicU64,
+    /// Withdrawn because the L3's own events reported the page gone, and L3
+    /// event batches received, skipped by sequence gaps, or undecodable.
+    pub staged_l3_evicted_pages: AtomicU64,
+    pub l3_event_batches: AtomicU64,
+    pub l3_event_gaps: AtomicU64,
+    pub l3_event_restarts: AtomicU64,
+    pub l3_event_errors: AtomicU64,
+    /// Source side: pages staged from the L3 and served, staged fetches refused
+    /// because every staging slot was leased, and stager calls that failed.
+    pub staged_served_pages: AtomicU64,
+    pub staging_busy: AtomicU64,
+    pub stager_failures: AtomicU64,
+    pub stage_ns: AtomicU64,
+    /// Staged-read pages the L3 failed to load into staging (missing, or a
+    /// read it could not serve).
+    pub staged_unloaded_pages: AtomicU64,
+    /// Reader side: pages read from a peer's staging slots (also counted in
+    /// `fetched_pages`).
+    pub staged_fetched_pages: AtomicU64,
 }
 
 impl HiCacheG2Metrics {
@@ -958,6 +992,56 @@ impl HiCacheG2Metrics {
                 "verify_ms",
                 self.verify_ns.load(Ordering::Relaxed) / 1_000_000,
             ),
+            (
+                "staged_published_pages",
+                self.staged_published_pages.load(Ordering::Relaxed),
+            ),
+            (
+                "staged_evicted_pages",
+                self.staged_evicted_pages.load(Ordering::Relaxed),
+            ),
+            (
+                "staged_missing_pages",
+                self.staged_missing_pages.load(Ordering::Relaxed),
+            ),
+            (
+                "staged_l3_evicted_pages",
+                self.staged_l3_evicted_pages.load(Ordering::Relaxed),
+            ),
+            (
+                "l3_event_batches",
+                self.l3_event_batches.load(Ordering::Relaxed),
+            ),
+            ("l3_event_gaps", self.l3_event_gaps.load(Ordering::Relaxed)),
+            (
+                "l3_event_restarts",
+                self.l3_event_restarts.load(Ordering::Relaxed),
+            ),
+            (
+                "l3_event_errors",
+                self.l3_event_errors.load(Ordering::Relaxed),
+            ),
+            (
+                "staged_served_pages",
+                self.staged_served_pages.load(Ordering::Relaxed),
+            ),
+            ("staging_busy", self.staging_busy.load(Ordering::Relaxed)),
+            (
+                "stager_failures",
+                self.stager_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "stage_ms",
+                self.stage_ns.load(Ordering::Relaxed) / 1_000_000,
+            ),
+            (
+                "staged_unloaded_pages",
+                self.staged_unloaded_pages.load(Ordering::Relaxed),
+            ),
+            (
+                "staged_fetched_pages",
+                self.staged_fetched_pages.load(Ordering::Relaxed),
+            ),
         ]
     }
 }
@@ -980,6 +1064,10 @@ pub struct HiCacheG2Config {
     pub max_transfer_bytes: u64,
     pub verify: HiCacheVerify,
     pub hash_threads: usize,
+    /// Most L3 pages this process advertises to peers; 0 advertises none. See
+    /// [`L3Directory`]. Every peer process holds one directory entry per
+    /// advertised page, so this bounds their memory too.
+    pub l3_directory_pages: usize,
 }
 
 /// A fetch whose reads were still in flight at its deadline. Their destination
@@ -1188,6 +1276,48 @@ fn run_unsettled_read_reaper(state: Weak<HiCacheG2State>) {
 /// Shared state both halves of the protocol touch. `publish` runs on the
 /// engine's backup thread while `fetch` runs on its prefetch-IO thread and the
 /// peer endpoint runs on the Tokio runtime, so every field is behind a lock.
+/// Ends a staged fetch's staging on every exit of `serve_staged`, including
+/// errors and panics: keeps the served prefix under the lease and gives back
+/// the rest, quarantined when a load may have written it.
+struct StagingFinish<'a> {
+    state: &'a HiCacheG2State,
+    lease_id: G2pbFetchLeaseId,
+    keep: usize,
+    quarantine: bool,
+    done: bool,
+}
+
+impl StagingFinish<'_> {
+    /// Finish now; returns whether the lease still holds the kept slots (a
+    /// reader that released mid-staging gets nothing back).
+    fn complete(mut self) -> bool {
+        self.done = true;
+        self.run()
+    }
+
+    fn run(&self) -> bool {
+        let quarantine_until = self.quarantine.then(|| {
+            unix_time_ms()
+                .unwrap_or_default()
+                .saturating_add(FAILED_SLOT_QUARANTINE.as_millis() as u64)
+        });
+        // A poisoned lock leaves the slots leased until expiry, not leaked:
+        // `expire` reclaims a lease whose staging finished.
+        match self.state.staging.lock() {
+            Ok(mut staging) => staging.finish_staging(self.lease_id, self.keep, quarantine_until),
+            Err(_) => false,
+        }
+    }
+}
+
+impl Drop for StagingFinish<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.run();
+        }
+    }
+}
+
 struct HiCacheG2State {
     config: HiCacheG2Config,
     source: ReplicaSource,
@@ -1208,6 +1338,14 @@ struct HiCacheG2State {
     hash_pool: rayon::ThreadPool,
     metrics: HiCacheG2Metrics,
     reaper: UnsettledReadReaper,
+    /// L3 pages this replica advertises, and the staging slots it serves them
+    /// through; see [`super::hicache_staging`].
+    l3_directory: Mutex<L3Directory>,
+    staging: Mutex<StagingArea>,
+    stager: RwLock<Option<Arc<dyn HiCacheL3Stager>>>,
+    /// Set once the L3's own events are followed: they, not failed loads,
+    /// then decide when an advertised page is gone.
+    l3_events_followed: std::sync::atomic::AtomicBool,
 }
 
 /// Outcome of building and posting one chunk.
@@ -1431,24 +1569,366 @@ impl HiCacheG2State {
             Err(error) => return Err(error.into()),
         };
 
+        self.metrics
+            .served_pages
+            .fetch_add(leased.len() as u64, Ordering::Relaxed);
+        self.fetch_response(
+            request.lease_id,
+            leased.iter().map(|page| page.segments.clone()).collect(),
+            leased.iter().map(|page| page.checksum).collect(),
+        )
+    }
+
+    /// This agent's metadata plus the source descriptors and checksums of the
+    /// pages a lease covers.
+    fn fetch_response(
+        &self,
+        lease_id: G2pbFetchLeaseId,
+        pages: Vec<HiCachePageSegments>,
+        checksums: Vec<u64>,
+    ) -> Result<HiCacheFetchResponse> {
         let regions = self.region_guard()?;
         anyhow::ensure!(
             !regions.regions.is_empty(),
             "HiCache G2 has no registered host region yet"
         );
-        self.metrics
-            .served_pages
-            .fetch_add(leased.len() as u64, Ordering::Relaxed);
         Ok(HiCacheFetchResponse {
-            lease_id: request.lease_id,
+            lease_id,
             instance_id: self.source.key.instance_id,
             agent_name: self.agent.name(),
             agent_metadata: regions.local_metadata.clone(),
             // Read under the same guard as the metadata it describes.
             metadata_generation: self.map_generation.load(Ordering::Acquire),
-            pages: leased.iter().map(|page| page.segments.clone()).collect(),
-            checksums: leased.iter().map(|page| page.checksum).collect(),
+            pages,
+            checksums,
         })
+    }
+
+    /// Record pages this replica's L3 holds now (it just stored or loaded
+    /// them) and advertise the new ones under their staged keys. `tokens` are
+    /// what the stager finds each page by. Returns how many were advertised.
+    ///
+    /// `objects[i]` names the L3 objects page `i` is stored as, so the L3's
+    /// events can withdraw it ([`Self::apply_l3_events`]); empty when the
+    /// engine does not name them.
+    fn publish_staged(
+        &self,
+        pool: &str,
+        keys: &[SequenceHash],
+        tokens: Vec<String>,
+        page_bytes: u64,
+        objects: Vec<Vec<String>>,
+    ) -> Result<usize> {
+        anyhow::ensure!(
+            keys.len() == tokens.len(),
+            "HiCache G2 staged publish got {} keys for {} tokens",
+            keys.len(),
+            tokens.len()
+        );
+        anyhow::ensure!(
+            objects.is_empty() || objects.len() == keys.len(),
+            "HiCache G2 staged publish got {} object lists for {} keys",
+            objects.len(),
+            keys.len()
+        );
+        let mut objects = objects.into_iter();
+        let pool: Arc<str> = Arc::from(pool);
+        let mut directory = self.l3_directory_guard()?;
+        let mut added = Vec::new();
+        let mut evicted = Vec::new();
+        for (key, token) in keys.iter().zip(tokens) {
+            let page_objects = objects
+                .next()
+                .unwrap_or_default()
+                .iter()
+                .map(|name| hicache_g2_l3_object_id(name))
+                .collect();
+            let (new, out) =
+                directory.insert(*key, Arc::clone(&pool), token, page_bytes, page_objects);
+            if new {
+                added.push(*key);
+            }
+            evicted.extend(out);
+        }
+        // A batch larger than the directory can push out keys it added (or
+        // re-add keys it pushed out): advertise only what the directory holds
+        // now, and withdraw only what it no longer holds.
+        added.retain(|key| directory.contains(key));
+        evicted.retain(|key| !directory.contains(key));
+        evicted.sort_unstable();
+        evicted.dedup();
+        // The index is updated under the directory lock, so its updates are
+        // queued in the order the directory changed: the publisher coalesces
+        // per key with the last update winning.
+        if !evicted.is_empty() {
+            self.metrics
+                .staged_evicted_pages
+                .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+            self.advertise(
+                "removal",
+                self.publisher
+                    .remove(evicted.into_iter().map(hicache_g2_staged_key).collect()),
+            );
+        }
+        if added.is_empty() {
+            return Ok(0);
+        }
+        self.metrics
+            .staged_published_pages
+            .fetch_add(added.len() as u64, Ordering::Relaxed);
+        let count = added.len();
+        self.advertise(
+            "upsert",
+            self.publisher.upsert(
+                added
+                    .into_iter()
+                    .map(|key| ReplicaBlock {
+                        key: hicache_g2_staged_key(key),
+                        size_bytes: page_bytes,
+                        // The source hashes what it stages instead: the L3 may
+                        // hold an earlier copy of the page than the one this
+                        // replica last backed up (Mooncake keeps the first put).
+                        checksum: None,
+                    })
+                    .collect(),
+            ),
+        );
+        drop(directory);
+        Ok(count)
+    }
+
+    fn l3_directory_guard(&self) -> Result<std::sync::MutexGuard<'_, L3Directory>> {
+        self.l3_directory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HiCache G2 L3 directory poisoned"))
+    }
+
+    /// Withdraw the staged keys of `pages` from the replica index, counting
+    /// them on `counter`. Called with the directory lock held (see
+    /// `publish_staged`).
+    fn advertise_staged_removal(&self, pages: Vec<SequenceHash>, counter: &AtomicU64) -> usize {
+        if pages.is_empty() {
+            return 0;
+        }
+        counter.fetch_add(pages.len() as u64, Ordering::Relaxed);
+        let count = pages.len();
+        self.advertise(
+            "removal",
+            self.publisher
+                .remove(pages.into_iter().map(hicache_g2_staged_key).collect()),
+        );
+        count
+    }
+
+    /// Stop advertising the L3 copies of `keys`. Returns how many were
+    /// advertised and adds that to `counter`.
+    fn withdraw_staged(&self, keys: &[SequenceHash], counter: &AtomicU64) -> Result<usize> {
+        let mut directory = self.l3_directory_guard()?;
+        let removed = keys
+            .iter()
+            .copied()
+            .filter(|key| directory.remove(key))
+            .collect::<Vec<_>>();
+        Ok(self.advertise_staged_removal(removed, counter))
+    }
+
+    /// Apply a batch of the L3's own events: withdraw every page they report
+    /// gone. Returns how many pages were withdrawn.
+    fn apply_l3_events(&self, events: &[L3ObjectEvent]) -> Result<usize> {
+        let mut directory = self.l3_directory_guard()?;
+        let gone = events
+            .iter()
+            .flat_map(|event| directory.apply(event))
+            .collect::<Vec<_>>();
+        Ok(self.advertise_staged_removal(gone, &self.metrics.staged_l3_evicted_pages))
+    }
+
+    /// The L3 restarted (its event sequence went back): what it holds is
+    /// unknown, so withdraw every page advertised from it. Pages come back as
+    /// this replica stores or loads them again.
+    fn forget_l3(&self) -> Result<usize> {
+        let mut directory = self.l3_directory_guard()?;
+        let gone = directory.clear();
+        Ok(self.advertise_staged_removal(gone, &self.metrics.staged_l3_evicted_pages))
+    }
+
+    fn staging_guard(&self) -> Result<std::sync::MutexGuard<'_, StagingArea>> {
+        self.staging
+            .lock()
+            .map_err(|_| anyhow::anyhow!("HiCache G2 staging area poisoned"))
+    }
+
+    /// Answer a peer's staged fetch: load the leading requested pages from
+    /// this replica's L3 into staging slots leased to the reader, and hand back
+    /// the slots with the checksums of what landed in them.
+    ///
+    /// Serves a leading subset of the request: the pages up to the first one
+    /// the directory no longer lists (or that is in another pool), as many as
+    /// there are free staging slots, and up to the first one the L3 fails to
+    /// load. A page that fails to load counts against it
+    /// ([`L3Directory::record_load`]). Blocks on the stager, so it runs off the
+    /// async workers.
+    fn serve_staged(&self, request: HiCacheFetchRequest) -> Result<HiCacheFetchResponse> {
+        let now_unix_ms = unix_time_ms()?;
+        anyhow::ensure!(
+            request.lease_expires_at_unix_ms > now_unix_ms,
+            "HiCache G2 staged fetch lease {} expiry is not in the future",
+            request.lease_id
+        );
+        let stager = self
+            .stager
+            .read()
+            .map_err(|_| anyhow::anyhow!("HiCache G2 stager lock poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("HiCache G2 source has no L3 stager"))?;
+        let (pool, tokens) = {
+            let directory = self.l3_directory_guard()?;
+            let mut pool: Option<Arc<str>> = None;
+            let mut tokens = Vec::new();
+            for key in &request.keys {
+                let Some(entry) = directory.get(key) else {
+                    break;
+                };
+                match &pool {
+                    Some(pool) if **pool != *entry.pool => break,
+                    Some(_) => {}
+                    None => pool = Some(Arc::clone(&entry.pool)),
+                }
+                tokens.push(entry.token.clone());
+            }
+            if pool.is_none()
+                && let Some(first) = request.keys.first()
+            {
+                // The reader's index still lists a page this directory dropped
+                // (an upsert that outran a removal, or a removal the publisher
+                // dropped): withdraw it again, so readers stop asking.
+                self.advertise(
+                    "removal",
+                    self.publisher.remove(vec![hicache_g2_staged_key(*first)]),
+                );
+            }
+            (pool, tokens)
+        };
+        let Some(pool) = pool else {
+            // The same refusal as the host tier's: a single-page reader drops
+            // the entry at once rather than wait for the removal above.
+            anyhow::bail!("{HICACHE_G2_NOT_HELD} (the first requested L3 page)")
+        };
+        let grant = {
+            let mut staging = self.staging_guard()?;
+            let expired = staging.expire(now_unix_ms);
+            if expired != 0 {
+                tracing::debug!(expired, "HiCache G2 staging leases expired");
+            }
+            staging.reserve(
+                &pool,
+                tokens.len(),
+                request.lease_id,
+                request.lease_expires_at_unix_ms,
+                now_unix_ms,
+            )
+        };
+        let StagingGrant { slots, pages } = match grant {
+            Ok(grant) => grant,
+            Err(StagingRefusal::Busy) => {
+                self.metrics.staging_busy.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("HiCache G2 source has no free staging slot for pool {pool}")
+            }
+            Err(StagingRefusal::KnownLease) => anyhow::bail!(
+                "HiCache G2 staged fetch lease {} was already served or released",
+                request.lease_id
+            ),
+        };
+        // From here every exit gives the slots back; any path that does not
+        // say otherwise quarantines them, as a load may have written them.
+        let mut finish = StagingFinish {
+            state: self,
+            lease_id: request.lease_id,
+            keep: 0,
+            quarantine: true,
+            done: false,
+        };
+        let flags = match self.stage_into(&*stager, &pool, &tokens[..slots.len()], &slots) {
+            Ok(flags) => flags,
+            Err(error) => {
+                self.metrics.stager_failures.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let staged_prefix = flags.iter().take_while(|ok| **ok).count();
+        {
+            let events_followed = self.l3_events_followed.load(Ordering::Acquire);
+            let mut directory = self.l3_directory_guard()?;
+            for key in &request.keys[..staged_prefix] {
+                directory.record_load(key, true, events_followed);
+            }
+            if staged_prefix < flags.len() {
+                self.metrics.staged_unloaded_pages.fetch_add(
+                    flags.iter().filter(|ok| !**ok).count() as u64,
+                    Ordering::Relaxed,
+                );
+                // Only the first failure is a page the L3 surely could not
+                // serve; one batch stops there.
+                let first_failed = request.keys[staged_prefix];
+                if directory.record_load(&first_failed, false, events_followed) {
+                    self.advertise_staged_removal(
+                        vec![first_failed],
+                        &self.metrics.staged_missing_pages,
+                    );
+                }
+            }
+        }
+        anyhow::ensure!(
+            staged_prefix != 0,
+            "HiCache G2 source's L3 did not load the first requested page"
+        );
+        let checksums = self.checksum_batch(&pages[..staged_prefix])?;
+        let mut pages = pages;
+        pages.truncate(staged_prefix);
+        let response = self.fetch_response(request.lease_id, pages, checksums)?;
+        // Served: the reader holds the prefix until it releases the lease.
+        finish.keep = staged_prefix;
+        finish.quarantine = staged_prefix < flags.len();
+        anyhow::ensure!(
+            finish.complete(),
+            "HiCache G2 staged lease was released while its pages were staged"
+        );
+        self.metrics
+            .staged_served_pages
+            .fetch_add(staged_prefix as u64, Ordering::Relaxed);
+        self.metrics
+            .served_pages
+            .fetch_add(staged_prefix as u64, Ordering::Relaxed);
+        Ok(response)
+    }
+
+    fn stage_into(
+        &self,
+        stager: &dyn HiCacheL3Stager,
+        pool: &str,
+        tokens: &[String],
+        slots: &[usize],
+    ) -> Result<Vec<bool>> {
+        let started = Instant::now();
+        let flags = stager.stage(pool, tokens, slots);
+        self.metrics
+            .stage_ns
+            .fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        let flags = flags.context("HiCache G2 L3 stager failed")?;
+        anyhow::ensure!(
+            flags.len() == slots.len(),
+            "HiCache G2 L3 stager returned {} flags for {} pages",
+            flags.len(),
+            slots.len()
+        );
+        Ok(flags)
+    }
+
+    fn release_lease(&self, lease_id: G2pbFetchLeaseId) {
+        self.leases.release(lease_id);
+        if let Ok(mut staging) = self.staging.lock() {
+            staging.release(lease_id);
+        }
     }
 
     /// Answer a reader's resync. The revision is read before the map, so every
@@ -1459,7 +1939,7 @@ impl HiCacheG2State {
             .published
             .lock()
             .map_err(|_| anyhow::anyhow!("HiCache G2 published map poisoned"))?;
-        let blocks = published
+        let mut blocks = published
             .by_key
             .iter()
             .map(|(key, page)| ReplicaBlock {
@@ -1467,7 +1947,19 @@ impl HiCacheG2State {
                 size_bytes: page.segments.total_bytes(),
                 checksum: Some(page.checksum),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        drop(published);
+        // A reader installs the snapshot as this source's whole advertisement,
+        // so the staged (L3) keys go in too, as `publish_staged` sends them.
+        blocks.extend(
+            self.l3_directory_guard()?
+                .pages()
+                .map(|(key, page_bytes)| ReplicaBlock {
+                    key: hicache_g2_staged_key(key),
+                    size_bytes: page_bytes,
+                    checksum: None,
+                }),
+        );
         Ok(HiCacheSnapshotResponse {
             source: self.source.clone(),
             revision,
@@ -2260,12 +2752,25 @@ impl
     ) -> Result<ManyOut<Annotated<HiCachePeerResponse>>> {
         let (request, context) = request.into_parts();
         let response = match request {
-            HiCachePeerRequest::Fetch(fetch) => match self.state.serve_fetch(fetch) {
-                Ok(response) => Annotated::from_data(HiCachePeerResponse::Fetch(response)),
-                Err(error) => Annotated::from_error(error.to_string()),
-            },
+            HiCachePeerRequest::Fetch(fetch) => {
+                let served = if fetch.staged {
+                    // The stager blocks on the L3 (and the engine's GIL).
+                    let state = Arc::clone(&self.state);
+                    tokio::task::spawn_blocking(move || state.serve_staged(fetch))
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(anyhow::anyhow!("HiCache G2 staged fetch panicked: {error}"))
+                        })
+                } else {
+                    self.state.serve_fetch(fetch)
+                };
+                match served {
+                    Ok(response) => Annotated::from_data(HiCachePeerResponse::Fetch(response)),
+                    Err(error) => Annotated::from_error(format!("{error:#}")),
+                }
+            }
             HiCachePeerRequest::Release(release) => {
-                self.state.leases.release(release.lease_id);
+                self.state.release_lease(release.lease_id);
                 Annotated::from_data(HiCachePeerResponse::Ack)
             }
             HiCachePeerRequest::Snapshot => match self.state.serve_snapshot() {
@@ -2383,6 +2888,7 @@ impl HiCacheG2Direct {
             .thread_name(|index| format!("hicache-g2-hash-{index}"))
             .build()
             .context("failed to build the HiCache G2 hashing pool")?;
+        let config_l3_directory_pages = config.l3_directory_pages;
         let state = Arc::new(HiCacheG2State {
             config,
             source,
@@ -2400,6 +2906,10 @@ impl HiCacheG2Direct {
             hash_pool,
             metrics,
             reaper: UnsettledReadReaper::default(),
+            l3_directory: Mutex::new(L3Directory::new(config_l3_directory_pages)),
+            staging: Mutex::new(StagingArea::default()),
+            stager: RwLock::new(None),
+            l3_events_followed: std::sync::atomic::AtomicBool::new(false),
         });
         let reaper_state = Arc::downgrade(&state);
         std::thread::Builder::new()
@@ -2632,19 +3142,126 @@ impl HiCacheG2Direct {
             .invalidate_slots(&slots, &self.state.metrics.invalidated_by_caller)
     }
 
+    /// Install the engine's L3 stager. Until one is installed (and a staging
+    /// pool registered), staged fetches from peers are refused.
+    pub fn set_l3_stager(&self, stager: Arc<dyn HiCacheL3Stager>) -> Result<()> {
+        *self
+            .state
+            .stager
+            .write()
+            .map_err(|_| anyhow::anyhow!("HiCache G2 stager lock poisoned"))? = Some(stager);
+        Ok(())
+    }
+
+    /// Hand G2Direct the staging slots it serves `pool`'s L3 pages through:
+    /// pages of that pool's geometry, owned by the engine for good, inside a
+    /// region already registered with [`Self::register_host_region`]. Slot `i`
+    /// is page `i` here, which is how the stager is told where to load.
+    pub fn register_staging_pool(
+        &self,
+        pool: &str,
+        ptrs: &[u64],
+        sizes: &[u64],
+        ptrs_per_page: usize,
+    ) -> Result<usize> {
+        let slots = HiCachePageSegments::split_flat(ptrs, sizes, ptrs_per_page)?;
+        {
+            let regions = self.state.region_guard()?;
+            for slot in &slots {
+                for (addr, len) in &slot.segments {
+                    anyhow::ensure!(
+                        regions.contains(*addr, *len),
+                        "HiCache G2 staging segment [0x{addr:x}, 0x{:x}) of pool {pool} is \
+                         outside every registered host region",
+                        addr + len
+                    );
+                }
+            }
+        }
+        let count = slots.len();
+        self.state
+            .staging_guard()?
+            .register(Arc::from(pool), slots)?;
+        tracing::info!(
+            pool,
+            slots = count,
+            "HiCache G2 registered L3 staging slots"
+        );
+        Ok(count)
+    }
+
+    /// Advertise that this replica's L3 holds `keys` of `pool` (the engine just
+    /// stored or loaded them), so peers can read them through staging after
+    /// they leave the host tier. `tokens` are what the stager finds each page
+    /// by. A no-op without a staging pool for `pool`. Returns how many pages
+    /// were newly advertised.
+    /// `objects[i]` names the L3 objects page `i` is stored as (or is empty
+    /// for every page); see [`Self::subscribe_l3_events`].
+    pub fn publish_staged(
+        &self,
+        pool: &str,
+        keys: &[SequenceHash],
+        tokens: Vec<String>,
+        page_bytes: u64,
+        objects: Vec<Vec<String>>,
+    ) -> Result<usize> {
+        if !self.state.staging_guard()?.has_pool(pool) {
+            return Ok(0);
+        }
+        self.state
+            .publish_staged(pool, keys, tokens, page_bytes, objects)
+    }
+
+    /// Follow the L3's KV events (Mooncake's master with `--enable_kv_events`
+    /// publishes them over ZMQ PUB at `endpoint`) and withdraw an advertised
+    /// page as soon as one of its objects is gone from every tier. Without
+    /// this, a page the L3 evicted stays advertised until it falls out of the
+    /// capped directory or a peer's staged read misses it. The subscriber
+    /// runs until this transport is dropped and reconnects on its own.
+    pub fn subscribe_l3_events(&self, endpoint: &str) -> Result<()> {
+        // The socket registers with the runtime's reactor, and the engine calls
+        // this from one of its own threads.
+        let _runtime = self.runtime.enter();
+        let socket = tmq::subscribe(&tmq::Context::new())
+            .set_reconnect_ivl(100)
+            .set_reconnect_ivl_max(5_000)
+            .connect(endpoint)
+            .with_context(|| format!("HiCache G2 could not connect to L3 events at {endpoint}"))?
+            .subscribe(b"")
+            .with_context(|| {
+                format!("HiCache G2 could not subscribe to L3 events at {endpoint}")
+            })?;
+        let state = Arc::downgrade(&self.state);
+        let endpoint = endpoint.to_string();
+        tracing::info!(%endpoint, "HiCache G2 following L3 events");
+        self.runtime
+            .spawn(run_l3_event_subscriber(socket, state, endpoint));
+        Ok(())
+    }
+
+    /// Stop advertising the L3 copies of `keys` (the L3 no longer holds them).
+    pub fn withdraw_staged(&self, keys: &[SequenceHash]) -> Result<usize> {
+        self.state
+            .withdraw_staged(keys, &self.state.metrics.staged_missing_pages)
+    }
+
     /// Which of `keys` some *other* replica advertises, key by key.
     ///
     /// The hybrid pools need this rather than a prefix: a `TRAILING_PAGES` pool
     /// (Mamba/KDA state) only holds a window ending on an offloaded node
     /// boundary, so page 5 can be restorable while 3 and 4 are not.
-    pub fn lookup_mask(&self, keys: &[SequenceHash]) -> Result<Vec<bool>> {
+    ///
+    /// `include_staged` also counts a peer's L3 copy (see [`Self::fetch`]);
+    /// only a caller whose fetch passes `staged_from` may count it.
+    pub fn lookup_mask(&self, keys: &[SequenceHash], include_staged: bool) -> Result<Vec<bool>> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let locations = self.query_locations(keys, None);
+        let include_staged = include_staged && self.staged_reads_allowed();
+        let locations = self.query_locations(keys, None, include_staged);
         let mask = locations
             .iter()
-            .map(|candidates| !candidates.is_empty())
+            .map(|candidates| has_candidate(candidates, include_staged))
             .collect::<Vec<_>>();
         if mask.iter().any(|hit| *hit) {
             self.state
@@ -2660,12 +3277,14 @@ impl HiCacheG2Direct {
         Ok(mask)
     }
 
-    /// Longest prefix of `keys` that some *other* replica advertises.
-    pub fn lookup_prefix(&self, keys: &[SequenceHash]) -> Result<usize> {
-        let locations = self.query_locations(keys, None);
+    /// Longest prefix of `keys` that some *other* replica advertises; see
+    /// [`Self::lookup_mask`] for `include_staged`.
+    pub fn lookup_prefix(&self, keys: &[SequenceHash], include_staged: bool) -> Result<usize> {
+        let include_staged = include_staged && self.staged_reads_allowed();
+        let locations = self.query_locations(keys, None, include_staged);
         let mut prefix = 0;
         for candidates in &locations {
-            if candidates.is_empty() {
+            if !has_candidate(candidates, include_staged) {
                 break;
             }
             prefix += 1;
@@ -2701,10 +3320,16 @@ impl HiCacheG2Direct {
     ///
     /// The completed pages are published from this replica before it returns;
     /// see [`Self::publish_pulled`].
+    ///
+    /// Pages from `staged_from` on may also be read from a peer's L3 through
+    /// its staging slots; pass `keys.len()` to read host-tier pages only. A
+    /// caller with its own L3 passes the length of the prefix that L3 holds, so
+    /// a page it can load locally is not staged on a peer.
     pub fn fetch(
         &self,
         keys: &[SequenceHash],
         destination: &[HiCachePageSegments],
+        staged_from: usize,
     ) -> Result<HiCacheFetchOutcome> {
         anyhow::ensure!(
             keys.len() == destination.len(),
@@ -2731,22 +3356,26 @@ impl HiCacheG2Direct {
             .iter()
             .map(|(_, len)| *len)
             .sum::<u64>();
-        let mut locations = self.query_locations(keys, Some(page_bytes));
+        let staged_from = if self.staged_reads_allowed() {
+            staged_from.min(keys.len())
+        } else {
+            keys.len()
+        };
+        let mut locations = self.query_locations(keys, Some(page_bytes), staged_from < keys.len());
+        for candidates in locations.iter_mut().take(staged_from) {
+            candidates.retain(|candidate| !candidate.staged());
+        }
         let FetchedRuns {
             outcome,
             checksums,
             refused,
-        } = fetch_runs(&mut locations, deadline, |instance_id, range| {
+        } = fetch_runs(&mut locations, deadline, |run: PeerRun, range| {
+            let instance_id = run.instance_id;
             let pool = PeerPoolKey {
                 instance_id,
                 page_bytes,
             };
-            let result = self.fetch_run(
-                instance_id,
-                &keys[range.clone()],
-                &destination[range],
-                deadline,
-            );
+            let result = self.fetch_run(run, &keys[range.clone()], &destination[range], deadline);
             match &result {
                 Ok(_) => self.state.record_peer_success(pool),
                 Err(error) => {
@@ -2858,13 +3487,17 @@ impl HiCacheG2Direct {
     ///
     /// Returns the checksum each page was published with, which the read
     /// verified against what landed (unless verification is off).
+    ///
+    /// A staged run may be served in part: the source answers for a leading
+    /// subset of the pages, and only those are read and returned.
     fn fetch_run(
         &self,
-        instance_id: u64,
+        run: PeerRun,
         keys: &[SequenceHash],
         destination: &[HiCachePageSegments],
         deadline: Instant,
     ) -> Result<Vec<u64>> {
+        let instance_id = run.instance_id;
         let remaining = deadline.saturating_duration_since(Instant::now());
         anyhow::ensure!(
             !remaining.is_zero(),
@@ -2876,6 +3509,7 @@ impl HiCacheG2Direct {
             lease_id,
             keys: keys.to_vec(),
             lease_expires_at_unix_ms: expires_at,
+            staged: run.staged,
         };
         let peers = self.peers.clone();
         let lease_started = Instant::now();
@@ -2889,29 +3523,38 @@ impl HiCacheG2Direct {
                         remaining.as_millis()
                     )
                 })?
-        })?;
+        });
         self.state
             .metrics
             .lease_rpc_ns
             .fetch_add(elapsed_ns(lease_started), Ordering::Relaxed);
+        // A lease that did not answer is released at once: a source still
+        // serving a request this reader gave up on then frees its staging
+        // slots when staging ends (and refuses the request if it arrives after
+        // the release) instead of holding them to the lease's expiry. One that
+        // answered is released only after the read below, so the source never
+        // unpins or reuses pages this reader is still reading.
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.release_lease_later(instance_id, lease_id, expires_at);
+                return Err(error);
+            }
+        };
 
-        let result = self
-            .state
-            .read_from_peer(&response, keys, destination, deadline);
-
-        let owner = self.peers.clone();
-        let releaser = self.peers.clone();
-        self.runtime.spawn(release_fetch_lease_bounded(
-            lease_id,
-            instance_id,
-            expires_at,
-            "HiCache G2 fetch",
-            move || owner.instance_ids().contains(&instance_id),
-            move || {
-                let releaser = releaser.clone();
-                async move { releaser.release(instance_id, lease_id).await }
-            },
-        ));
+        let served = response.pages.len();
+        let result = if run.staged && (served == 0 || served > keys.len()) {
+            Err(anyhow::anyhow!(
+                "HiCache G2 staged fetch from instance {instance_id} returned {served} pages \
+                 for {} requested",
+                keys.len()
+            ))
+        } else {
+            let served = if run.staged { served } else { keys.len() };
+            self.state
+                .read_from_peer(&response, &keys[..served], &destination[..served], deadline)
+        };
+        self.release_lease_later(instance_id, lease_id, expires_at);
 
         let moved = match result {
             Ok(moved) => moved,
@@ -2931,7 +3574,13 @@ impl HiCacheG2Direct {
         self.state
             .metrics
             .fetched_pages
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            .fetch_add(response.checksums.len() as u64, Ordering::Relaxed);
+        if run.staged {
+            self.state
+                .metrics
+                .staged_fetched_pages
+                .fetch_add(response.checksums.len() as u64, Ordering::Relaxed);
+        }
         self.state
             .metrics
             .fetched_bytes
@@ -2939,17 +3588,80 @@ impl HiCacheG2Direct {
         Ok(response.checksums)
     }
 
+    /// A staged page is read from a slot its source refills once the lease
+    /// ends; only destination verification catches a read that outlived it
+    /// (clock skew past the grace), so without it staged copies are not read.
+    fn staged_reads_allowed(&self) -> bool {
+        self.state.config.verify != HiCacheVerify::Off
+    }
+
+    fn release_lease_later(&self, instance_id: u64, lease_id: G2pbFetchLeaseId, expires_at: u64) {
+        let owner = self.peers.clone();
+        let releaser = self.peers.clone();
+        self.runtime.spawn(release_fetch_lease_bounded(
+            lease_id,
+            instance_id,
+            expires_at,
+            "HiCache G2 fetch",
+            move || owner.instance_ids().contains(&instance_id),
+            move || {
+                let releaser = releaser.clone();
+                async move { releaser.release(instance_id, lease_id).await }
+            },
+        ));
+    }
+
     /// Ask the directory where each key lives, dropping this replica's own
     /// entries (a local hit is HiCache's own L2 business, not ours), those of
     /// sources that are no longer live peers, and those of suspended peer pools.
     /// A lookup names no pool (`None`) and skips a peer with any pool suspended:
     /// a page it cannot restore in every pool is not a hit.
+    ///
+    /// Each page's host-tier candidates come first and its staged (L3)
+    /// candidates after them, so a run prefers a peer's host tier.
     fn query_locations(
         &self,
         keys: &[SequenceHash],
         page_bytes: Option<u64>,
-    ) -> Vec<Vec<ReplicaLocation>> {
+        include_staged: bool,
+    ) -> Vec<Vec<PeerCandidate>> {
         let query_started = Instant::now();
+        let hot = self.filtered_locations(keys, page_bytes);
+        let staged = if include_staged {
+            let staged_keys = keys
+                .iter()
+                .map(|key| hicache_g2_staged_key(*key))
+                .collect::<Vec<_>>();
+            self.filtered_locations(&staged_keys, page_bytes)
+        } else {
+            vec![Vec::new(); keys.len()]
+        };
+        self.state
+            .metrics
+            .index_query_ns
+            .fetch_add(elapsed_ns(query_started), Ordering::Relaxed);
+        hot.into_iter()
+            .zip(staged)
+            .map(|(hot, staged)| {
+                hot.into_iter()
+                    .map(|location| PeerCandidate::from_location(&location, false))
+                    .chain(
+                        staged
+                            .into_iter()
+                            .map(|location| PeerCandidate::from_location(&location, true)),
+                    )
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The directory's candidates for `keys` that a fetch may lease from; see
+    /// [`Self::query_locations`].
+    fn filtered_locations(
+        &self,
+        keys: &[SequenceHash],
+        page_bytes: Option<u64>,
+    ) -> Vec<Vec<ReplicaLocation>> {
         let page_size = self.state.config.page_size;
         let locations = match &self.directory {
             Directory::Local(index) => index.batch_locations(keys, Some(page_size)),
@@ -2964,10 +3676,6 @@ impl HiCacheG2Direct {
                 })
             }
         };
-        self.state
-            .metrics
-            .index_query_ns
-            .fetch_add(elapsed_ns(query_started), Ordering::Relaxed);
         let live_instances = self.peers.instance_ids().into_iter().collect();
         let (locations, dead) =
             remote_live_candidates(locations, self.state.source.replica_id(), &live_instances);
@@ -3051,6 +3759,169 @@ fn without_suspended_candidates(
     (locations, dropped)
 }
 
+/// Apply the L3's event stream until the transport is dropped. A message is
+/// `[topic, sequence (u64 BE), payload]`.
+///
+/// Events count as followed (so a failed staging load no longer withdraws a
+/// page at once; see `serve_staged`) only once a batch has arrived: connecting
+/// succeeds whether or not a publisher is there, and a master without
+/// `--kv_events_backend_id` publishes nothing. A sequence that goes back means
+/// the master restarted and lost its objects, so every page advertised from it
+/// is withdrawn. A gap means lost events, which can leave a gone page listed
+/// until its loads fail ([`super::hicache_staging::FAILED_LOADS_BEFORE_WITHDRAW`]);
+/// it is counted.
+async fn run_l3_event_subscriber(
+    mut socket: tmq::subscribe::Subscribe,
+    state: Weak<HiCacheG2State>,
+    endpoint: String,
+) {
+    let mut last_sequence: Option<u64> = None;
+    while let Some(message) = socket.next().await {
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        let frames = match message {
+            Ok(frames) => frames,
+            Err(error) => {
+                state
+                    .metrics
+                    .l3_event_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%error, %endpoint, "HiCache G2 L3 event receive failed");
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let frames = frames.iter().collect::<Vec<_>>();
+        let Some(payload) = frames.last() else {
+            continue;
+        };
+        if let Some(sequence) = frames
+            .get(1)
+            .filter(|_| frames.len() >= 3)
+            .and_then(|frame| <[u8; 8]>::try_from(&frame[..]).ok())
+            .map(u64::from_be_bytes)
+        {
+            match last_sequence {
+                Some(last) if sequence <= last => {
+                    state
+                        .metrics
+                        .l3_event_restarts
+                        .fetch_add(1, Ordering::Relaxed);
+                    match state.forget_l3() {
+                        Ok(withdrawn) => tracing::warn!(
+                            %endpoint,
+                            last,
+                            sequence,
+                            withdrawn,
+                            "HiCache G2 L3 event sequence went back (master restart); \
+                             withdrew every staged page"
+                        ),
+                        Err(error) => {
+                            tracing::warn!(%error, "HiCache G2 could not forget the L3")
+                        }
+                    }
+                }
+                Some(last) if sequence > last + 1 => {
+                    state.metrics.l3_event_gaps.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            last_sequence = Some(sequence);
+        }
+        state
+            .metrics
+            .l3_event_batches
+            .fetch_add(1, Ordering::Relaxed);
+        match decode_l3_events(payload) {
+            Ok(events) => {
+                state.l3_events_followed.store(true, Ordering::Release);
+                if let Err(error) = state.apply_l3_events(&events) {
+                    tracing::warn!(%error, "HiCache G2 could not apply L3 events");
+                }
+            }
+            Err(error) => {
+                state
+                    .metrics
+                    .l3_event_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(%error, %endpoint, "HiCache G2 skipped an L3 event batch");
+            }
+        }
+    }
+}
+
+/// Where one page can be read from: a peer process, from its host tier or,
+/// `staged`, from its L3 through its staging slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerCandidate {
+    run: PeerRun,
+    /// The index entry this candidate came from (its key is the staged key for
+    /// a staged candidate), for dropping it when the source refuses the page.
+    key: SequenceHash,
+    source: ReplicaSourceKey,
+}
+
+impl PeerCandidate {
+    fn from_location(location: &ReplicaLocation, staged: bool) -> Self {
+        Self {
+            run: PeerRun {
+                instance_id: location.source.key.instance_id,
+                staged,
+            },
+            key: location.block.key,
+            source: location.source.key,
+        }
+    }
+
+    fn staged(&self) -> bool {
+        self.run.staged
+    }
+}
+
+fn has_candidate(candidates: &[PeerCandidate], include_staged: bool) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| include_staged || !candidate.staged())
+}
+
+/// What one peer run reads from: a peer process's host tier or its staging,
+/// as `fetch_runs` groups pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerRun {
+    instance_id: u64,
+    staged: bool,
+}
+
+/// A page candidate as [`fetch_runs`] sees it: the run it would belong to.
+trait RunCandidate {
+    type Run: Copy + Eq + std::fmt::Debug;
+    fn run(&self) -> Self::Run;
+    /// The index entry to drop when the source refuses the page.
+    fn index_entry(&self) -> (SequenceHash, ReplicaSourceKey);
+}
+
+impl RunCandidate for PeerCandidate {
+    type Run = PeerRun;
+    fn run(&self) -> PeerRun {
+        self.run
+    }
+    fn index_entry(&self) -> (SequenceHash, ReplicaSourceKey) {
+        (self.key, self.source)
+    }
+}
+
+impl RunCandidate for ReplicaLocation {
+    type Run = u64;
+    fn run(&self) -> u64 {
+        self.source.key.instance_id
+    }
+    fn index_entry(&self) -> (SequenceHash, ReplicaSourceKey) {
+        (self.block.key, self.source.key)
+    }
+}
+
 /// Walk `locations` from the front, one peer run at a time, and return how many
 /// leading pages were fetched.
 ///
@@ -3076,10 +3947,14 @@ fn without_suspended_candidates(
 /// `fetch_run` returns the verified checksum of each page of a successful run
 /// (a verification failure carries those of its verified prefix), and the
 /// result holds one per completed page, for publishing them.
-fn fetch_runs(
-    locations: &mut [Vec<ReplicaLocation>],
+///
+/// A run may also be served in part (a staged run, when the source has fewer
+/// free staging slots or L3 pages than asked for): fewer checksums than pages,
+/// but at least one, completes those pages and the next run starts after them.
+fn fetch_runs<C: RunCandidate>(
+    locations: &mut [Vec<C>],
     deadline: Instant,
-    mut fetch_run: impl FnMut(u64, Range<usize>) -> Result<Vec<u64>>,
+    mut fetch_run: impl FnMut(C::Run, Range<usize>) -> Result<Vec<u64>>,
 ) -> FetchedRuns {
     let mut completed = 0usize;
     let mut checksums = Vec::with_capacity(locations.len());
@@ -3094,29 +3969,29 @@ fn fetch_runs(
             );
             break;
         }
-        let Some(instance_id) = locations[completed]
-            .first()
-            .map(|location| location.source.key.instance_id)
-        else {
+        let Some(run) = locations[completed].first().map(RunCandidate::run) else {
             break;
         };
         let mut end = completed + 1;
         while end < locations.len()
             && end - completed < run_cap
-            && locations[end]
-                .iter()
-                .any(|location| location.source.key.instance_id == instance_id)
+            && locations[end].iter().any(|location| location.run() == run)
         {
             end += 1;
         }
         let run_len = end - completed;
-        match fetch_run(instance_id, completed..end) {
+        match fetch_run(run, completed..end) {
+            Ok(run_checksums) if !run_checksums.is_empty() && run_checksums.len() < run_len => {
+                completed += run_checksums.len();
+                checksums.extend(run_checksums);
+                run_cap = usize::MAX;
+            }
             Ok(run_checksums) => {
                 if run_checksums.len() != run_len {
                     // Never publish under a checksum that may belong to another
                     // page; read_from_peer rules this out.
                     tracing::warn!(
-                        instance_id,
+                        ?run,
                         pages = run_len,
                         checksums = run_checksums.len(),
                         "HiCache G2 peer run returned the wrong number of checksums"
@@ -3146,7 +4021,7 @@ fn fetch_runs(
                     let stale_pages = &failure.stale_pages;
                     tracing::warn!(
                         %error,
-                        instance_id,
+                        ?run,
                         pages = run_len,
                         stale = stale_pages.len(),
                         verified_prefix = stale_pages[0],
@@ -3154,8 +4029,7 @@ fn fetch_runs(
                          trying the next candidate for the stale pages"
                     );
                     for &page in stale_pages {
-                        locations[completed + page]
-                            .retain(|location| location.source.key.instance_id != instance_id);
+                        locations[completed + page].retain(|location| location.run() != run);
                     }
                     let Some(verified) = failure.verified_checksums.get(..stale_pages[0]) else {
                         // read_from_peer rules this out; see the Ok arm.
@@ -3169,13 +4043,12 @@ fn fetch_runs(
                     // for nothing; no page of this run can be read from it.
                     tracing::warn!(
                         %error,
-                        instance_id,
+                        ?run,
                         pages = run_len,
                         "HiCache G2 peer is unaddressable; trying the next candidate for the run"
                     );
                     for candidates in &mut locations[completed..end] {
-                        candidates
-                            .retain(|location| location.source.key.instance_id != instance_id);
+                        candidates.retain(|location| location.run() != run);
                     }
                     run_cap = usize::MAX;
                 } else if run_len > 1 {
@@ -3184,7 +4057,7 @@ fn fetch_runs(
                     run_cap = run_len / 2;
                     tracing::warn!(
                         %error,
-                        instance_id,
+                        ?run,
                         pages = run_len,
                         retry_pages = run_cap,
                         "HiCache G2 peer read failed without naming a page; retrying the first \
@@ -3193,7 +4066,7 @@ fn fetch_runs(
                 } else {
                     tracing::warn!(
                         %error,
-                        instance_id,
+                        ?run,
                         remaining_candidates = locations[completed].len() - 1,
                         "HiCache G2 peer read failed; trying the next candidate for this page"
                     );
@@ -3203,12 +4076,11 @@ fn fetch_runs(
                         refused.extend(
                             locations[completed]
                                 .iter()
-                                .filter(|location| location.source.key.instance_id == instance_id)
-                                .map(|location| (location.block.key, location.source.key)),
+                                .filter(|location| location.run() == run)
+                                .map(RunCandidate::index_entry),
                         );
                     }
-                    locations[completed]
-                        .retain(|location| location.source.key.instance_id != instance_id);
+                    locations[completed].retain(|location| location.run() != run);
                     run_cap = usize::MAX;
                 }
             }
@@ -3287,6 +4159,7 @@ mod tests {
             max_transfer_bytes: 1 << 20,
             verify: HiCacheVerify::Destination,
             hash_threads: 1,
+            l3_directory_pages: 0,
         };
         // TP8 without attention DP, attention TP2 x DP4, and pure attention DP8
         // (where every process reports attention-TP rank 0 of 1).
@@ -3921,6 +4794,99 @@ mod tests {
         });
         assert_eq!(fetched.outcome.completed, 1);
         assert_eq!(fetched.checksums, vec![700]);
+    }
+
+    fn hot(instance_id: u64) -> PeerRun {
+        PeerRun {
+            instance_id,
+            staged: false,
+        }
+    }
+
+    fn staged(instance_id: u64) -> PeerRun {
+        PeerRun {
+            instance_id,
+            staged: true,
+        }
+    }
+
+    /// A candidate for page `key` read through `run`, as `query_locations`
+    /// builds it (a staged candidate carries the staged key).
+    fn candidate(run: PeerRun, key: SequenceHash) -> PeerCandidate {
+        PeerCandidate {
+            run,
+            key: if run.staged {
+                hicache_g2_staged_key(key)
+            } else {
+                key
+            },
+            source: ReplicaSourceKey {
+                instance_id: run.instance_id,
+                tp_rank: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_partly_served_run_completes_its_prefix_and_the_next_run_starts_after_it() {
+        // Peer 7 stages two of the four pages asked for (it had two free
+        // staging slots); the rest is read again, still from 7.
+        let mut locations: Vec<_> = (0..4).map(|key| vec![candidate(staged(7), key)]).collect();
+        let mut calls = Vec::new();
+        let fetched = fetch_runs(&mut locations, future_deadline(), |run: PeerRun, range| {
+            calls.push((run, range.clone()));
+            let served = range.start..range.end.min(range.start + 2);
+            Ok(sums(run.instance_id, served))
+        });
+        assert_eq!(fetched.outcome.completed, 4);
+        assert_eq!(fetched.checksums, vec![700, 701, 702, 703]);
+        assert_eq!(calls, vec![(staged(7), 0..4), (staged(7), 2..4)]);
+    }
+
+    #[test]
+    fn a_host_tier_copy_is_read_before_a_staged_one_and_runs_do_not_mix_tiers() {
+        let mut locations = vec![
+            vec![candidate(hot(7), 0), candidate(staged(9), 0)],
+            vec![candidate(staged(7), 1)],
+            vec![candidate(staged(7), 2)],
+        ];
+        let mut calls = Vec::new();
+        let fetched = fetch_runs(&mut locations, future_deadline(), |run: PeerRun, range| {
+            calls.push((run, range.clone()));
+            Ok(sums(run.instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 3);
+        // Peer 7's host tier serves page 0; its staged copies are another run.
+        assert_eq!(calls, vec![(hot(7), 0..1), (staged(7), 1..3)]);
+    }
+
+    #[test]
+    fn a_failed_staged_page_falls_back_to_another_peer_only_for_that_tier() {
+        let mut locations = vec![vec![candidate(staged(7), 0), candidate(staged(9), 0)]];
+        let mut calls = Vec::new();
+        let fetched = fetch_runs(&mut locations, future_deadline(), |run: PeerRun, range| {
+            calls.push(run);
+            anyhow::ensure!(run != staged(7), "no free staging slot");
+            Ok(sums(run.instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 1);
+        assert_eq!(calls, vec![staged(7), staged(9)]);
+        // Not a refusal: no index entry is dropped.
+        assert!(fetched.refused.is_empty());
+    }
+
+    #[test]
+    fn a_refused_page_drops_only_the_entry_of_the_tier_that_refused_it() {
+        // Peer 7 advertises page 10 in both tiers; its host tier refuses it.
+        let mut locations = vec![vec![candidate(hot(7), 10), candidate(staged(7), 10)]];
+        let fetched = fetch_runs(&mut locations, future_deadline(), |run: PeerRun, range| {
+            if !run.staged {
+                anyhow::bail!("remote error: {HICACHE_G2_NOT_HELD}");
+            }
+            Ok(sums(run.instance_id, range))
+        });
+        assert_eq!(fetched.outcome.completed, 1);
+        assert_eq!(fetched.refused, vec![(10, candidate(hot(7), 10).source)]);
     }
 
     fn location(instance_id: u64, key: SequenceHash) -> ReplicaLocation {

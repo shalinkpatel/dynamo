@@ -2772,6 +2772,9 @@ Source commits:
 - fix(g2direct): unique NIXL agent names; suspend peer pools readers cannot address
 - fix(g2direct): drop index entries for host slots refilled by a fetch
 - feat(g2direct): publish pages a replica pulls from peers
+- feat(g2direct): share a replica's node-local L3 with peers through host
+  staging (staged keys, L3 directory, Mooncake KV events, compact replica
+  directory)
 - feat(g2direct): opt-in node-scoped replica index (`DYN_HICACHE_G2_INDEX_MODE=node`)
 - feat(g2direct): compact replica-index wire format (replaces the named encoding; topic `kvbm.serving_g2.replicas.v2`) and env-tunable publish batching
 - feat(g2direct): start without NATS, never block publishing, resync the index on revision gaps
@@ -2829,8 +2832,27 @@ or times out undeliverable batches and burns their revision; readers treat a
 revision jump (or a first contact past revision 1) as lost deltas and pull a
 snapshot from the source over the peer endpoint (`HiCachePeerRequest::Snapshot`).
 A single-page "no longer holds" refusal drops that entry from the reader's
-index. The SGLang adapter, the deferred host release
-patch, and MLA host dedup live in the monorepo.
+index.
+
+A replica can also serve pages from its own node-local L3 (Mooncake with SSD
+offload). It advertises them under a second, staged key per page
+(`hicache_g2_staged_key`), kept in an LRU-capped `L3Directory`. On a peer's
+staged fetch (`HiCacheFetchRequest.staged`, serde default off, so older peers
+never see it) the source loads the pages through the engine's
+`HiCacheL3Stager` into G2Direct-owned staging slots, hashes them and answers
+like a host-tier fetch; it may serve a leading subset. Slots stay leased until
+release or expiry plus a 5 s grace (lease capped at 60 s); slots a failed load
+may have written are quarantined 30 s; released lease ids are remembered.
+`subscribe_l3_events` follows the Mooncake master's KV events (RFC #1527, ZMQ):
+at our Mooncake pin a removal is reported only once an object has no copy left
+(labelled `cpu`), so any removal withdraws the page; a sequence that goes back
+(master restart) withdraws everything; a page that fails to load 3 times in a
+row is withdrawn anyway. The replica directory keeps each source's record once
+and an entry is just its source ids (~45 B/entry, from ~554), so lookups return
+`size_bytes` 0 and no checksum. A resync snapshot carries a source's staged
+keys too, and a refusal drops only the refusing tier's entry. The SGLang
+adapter, the deferred host release patch, and MLA host dedup live in the
+monorepo.
 
 Shared pieces outside the crates: `dynamo-memory` registration chunking
 (`registration_chunk_bytes` / `registration_chunks`), the

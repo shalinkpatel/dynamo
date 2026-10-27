@@ -10,7 +10,7 @@ description = "Direct peer transport for engine-owned host KV caches"
 default = ["transport"]
 # Replica index and publisher only (no NIXL), e.g. for the mocker.
 index = ["dep:dashmap", "dep:dynamo-runtime", "dep:rand", "dep:rmp-serde", "dep:serde_bytes"]
-transport = ["index", "dep:dynamo-memory", "dep:nixl-sys", "dep:rayon", "dep:xxhash-rust"]
+transport = ["index", "dep:dynamo-memory", "dep:nixl-sys", "dep:rayon", "dep:tmq", "dep:xxhash-rust"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -28,6 +28,7 @@ rand = { workspace = true, optional = true }
 rayon = { version = "1", optional = true }
 rmp-serde = { workspace = true, optional = true }
 serde_bytes = { workspace = true, optional = true }
+tmq = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
 
 [dev-dependencies]

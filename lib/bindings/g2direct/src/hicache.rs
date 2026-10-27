@@ -15,6 +15,7 @@ use dynamo_g2direct::hicache_g2::{
     HiCacheG2Config, HiCacheG2Direct, HiCachePageSegments, HiCacheVerify, hicache_g2_cache_key,
     hicache_g2_hash_threads,
 };
+use dynamo_g2direct::hicache_staging::HiCacheL3Stager;
 use dynamo_runtime::distributed::DistributedConfig;
 use dynamo_runtime::{DistributedRuntime, Runtime};
 use pyo3::exceptions::PyValueError;
@@ -37,6 +38,25 @@ fn page_segments(
 ) -> PyResult<Vec<HiCachePageSegments>> {
     HiCachePageSegments::split_flat(ptrs, sizes, segments_per_page)
         .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+/// The engine's L3 loader, a Python callable
+/// `stage(pool: str, tokens: list[str], slots: list[int]) -> list[bool]`.
+/// Called from a blocking thread of the peer service, never from an engine
+/// thread, so taking the GIL here cannot deadlock a call that released it.
+struct PyL3Stager {
+    callable: Py<PyAny>,
+}
+
+impl HiCacheL3Stager for PyL3Stager {
+    fn stage(&self, pool: &str, tokens: &[String], slots: &[usize]) -> anyhow::Result<Vec<bool>> {
+        Python::with_gil(|py| {
+            self.callable
+                .call1(py, (pool, tokens.to_vec(), slots.to_vec()))
+                .and_then(|flags| flags.extract::<Vec<bool>>(py))
+                .map_err(|error| anyhow::anyhow!("L3 stager raised: {error}"))
+        })
+    }
 }
 
 #[pyclass(name = "HiCacheG2Direct")]
@@ -73,6 +93,7 @@ impl PyHiCacheG2Direct {
         ucx_devices = None,
         dp_rank = 0,
         cp_rank = 0,
+        l3_directory_pages = 0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -84,6 +105,7 @@ impl PyHiCacheG2Direct {
         ucx_devices: Option<String>,
         dp_rank: u32,
         cp_rank: u32,
+        l3_directory_pages: usize,
     ) -> PyResult<Self> {
         if tp_world_size == 0 || tp_rank >= tp_world_size {
             return Err(PyValueError::new_err(format!(
@@ -106,6 +128,7 @@ impl PyHiCacheG2Direct {
             max_transfer_bytes: max_transfer_mib * 1024 * 1024,
             verify: HiCacheVerify::from_env().map_err(to_pyerr)?,
             hash_threads: hicache_g2_hash_threads().map_err(to_pyerr)?,
+            l3_directory_pages,
         };
         let runtime = get_current_tokio_handle();
         let inner = runtime
@@ -186,17 +209,112 @@ impl PyHiCacheG2Direct {
             .map_err(to_pyerr)
     }
 
-    /// Length of the leading run of `page_hashes` that a peer advertises.
-    fn lookup_prefix(&self, py: Python<'_>, page_hashes: Vec<String>) -> PyResult<usize> {
+    /// Install the L3 loader peers' staged reads go through:
+    /// `stage(pool, tokens, slots) -> list[bool]` loads the page each token
+    /// names into the staging slot at the same position.
+    fn set_l3_stager(&self, stager: Py<PyAny>) -> PyResult<()> {
+        self.inner
+            .set_l3_stager(Arc::new(PyL3Stager { callable: stager }))
+            .map_err(to_pyerr)
+    }
+
+    /// Hand over the staging slots for `pool`, one page of that pool's
+    /// geometry per slot, described as for `publish`. Their memory must be
+    /// registered with `register_host_region` first. Returns the slot count.
+    fn register_staging_pool(
+        &self,
+        py: Python<'_>,
+        pool: String,
+        ptrs: Vec<u64>,
+        sizes: Vec<u64>,
+        segments_per_page: usize,
+    ) -> PyResult<usize> {
+        page_segments(&ptrs, &sizes, segments_per_page)?;
+        py.allow_threads(|| {
+            self.inner
+                .register_staging_pool(&pool, &ptrs, &sizes, segments_per_page)
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Advertise pages of `pool` this replica's L3 now holds, for peers to
+    /// read through staging. `tokens[i]` is what the stager is handed to load
+    /// `page_hashes[i]`; `objects[i]`, when given, names the L3 objects the
+    /// page is stored as, so the L3's events can withdraw it (see
+    /// `subscribe_l3_events`). Returns how many pages were newly advertised.
+    #[pyo3(signature = (pool, page_hashes, tokens, page_bytes, objects = None))]
+    fn publish_staged(
+        &self,
+        py: Python<'_>,
+        pool: String,
+        page_hashes: Vec<String>,
+        tokens: Vec<String>,
+        page_bytes: u64,
+        objects: Option<Vec<Vec<String>>>,
+    ) -> PyResult<usize> {
+        if tokens.len() != page_hashes.len() {
+            return Err(PyValueError::new_err(format!(
+                "{} tokens for {} keys",
+                tokens.len(),
+                page_hashes.len()
+            )));
+        }
+        let objects = objects.unwrap_or_default();
+        if !objects.is_empty() && objects.len() != page_hashes.len() {
+            return Err(PyValueError::new_err(format!(
+                "{} object lists for {} keys",
+                objects.len(),
+                page_hashes.len()
+            )));
+        }
         let keys = self.keys(&page_hashes);
-        py.allow_threads(|| self.inner.lookup_prefix(&keys))
+        py.allow_threads(|| {
+            self.inner
+                .publish_staged(&pool, &keys, tokens, page_bytes, objects)
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Follow the L3's KV events at `endpoint` (a ZMQ PUB socket, e.g. a
+    /// Mooncake master's `--kv_events_bind_endpoint`) and withdraw advertised
+    /// pages the L3 no longer holds in any tier.
+    fn subscribe_l3_events(&self, py: Python<'_>, endpoint: String) -> PyResult<()> {
+        py.allow_threads(|| self.inner.subscribe_l3_events(&endpoint))
+            .map_err(to_pyerr)
+    }
+
+    /// Stop advertising the L3 copies of `page_hashes`.
+    fn withdraw_staged(&self, py: Python<'_>, page_hashes: Vec<String>) -> PyResult<usize> {
+        let keys = self.keys(&page_hashes);
+        py.allow_threads(|| self.inner.withdraw_staged(&keys))
+            .map_err(to_pyerr)
+    }
+
+    /// Length of the leading run of `page_hashes` that a peer advertises.
+    /// `include_staged` also counts peers' L3 copies, for a caller whose
+    /// `fetch` passes `staged_from`.
+    #[pyo3(signature = (page_hashes, include_staged = false))]
+    fn lookup_prefix(
+        &self,
+        py: Python<'_>,
+        page_hashes: Vec<String>,
+        include_staged: bool,
+    ) -> PyResult<usize> {
+        let keys = self.keys(&page_hashes);
+        py.allow_threads(|| self.inner.lookup_prefix(&keys, include_staged))
             .map_err(to_pyerr)
     }
 
     /// Per-key availability, for hybrid pools whose restorable set has holes.
-    fn lookup_mask(&self, py: Python<'_>, page_hashes: Vec<String>) -> PyResult<Vec<bool>> {
+    #[pyo3(signature = (page_hashes, include_staged = false))]
+    fn lookup_mask(
+        &self,
+        py: Python<'_>,
+        page_hashes: Vec<String>,
+        include_staged: bool,
+    ) -> PyResult<Vec<bool>> {
         let keys = self.keys(&page_hashes);
-        py.allow_threads(|| self.inner.lookup_mask(&keys))
+        py.allow_threads(|| self.inner.lookup_mask(&keys, include_staged))
             .map_err(to_pyerr)
     }
 
@@ -205,6 +323,10 @@ impl PyHiCacheG2Direct {
     /// settlement ticket when reads were still in flight at the deadline: the
     /// pages after the completed prefix must not be reused until
     /// `is_settled(ticket)` returns true.
+    ///
+    /// Pages from `staged_from` on may be read from a peer's L3 through its
+    /// staging slots (default: none; pass 0 to allow it for every page).
+    #[pyo3(signature = (page_hashes, ptrs, sizes, segments_per_page, staged_from = None))]
     fn fetch(
         &self,
         py: Python<'_>,
@@ -212,6 +334,7 @@ impl PyHiCacheG2Direct {
         ptrs: Vec<u64>,
         sizes: Vec<u64>,
         segments_per_page: usize,
+        staged_from: Option<usize>,
     ) -> PyResult<(usize, Option<u64>)> {
         let destination = page_segments(&ptrs, &sizes, segments_per_page)?;
         if destination.len() != page_hashes.len() {
@@ -223,7 +346,13 @@ impl PyHiCacheG2Direct {
         }
         let keys = self.keys(&page_hashes);
         let outcome = py
-            .allow_threads(|| self.inner.fetch(&keys, &destination))
+            .allow_threads(|| {
+                self.inner.fetch(
+                    &keys,
+                    &destination,
+                    staged_from.unwrap_or(page_hashes.len()),
+                )
+            })
             .map_err(to_pyerr)?;
         Ok((outcome.completed, outcome.unsettled_ticket))
     }
