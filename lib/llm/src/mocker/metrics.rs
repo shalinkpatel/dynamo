@@ -24,6 +24,8 @@ const SGLANG_SCHEDULER_LABELS: &[&str] = &[
     "moe_ep_rank",
 ];
 const SGLANG_REQUEST_LABELS: &[&str] = &["model_name", "engine_type"];
+/// SGLang's `cache_source` label values, in `sglang_cached_tokens_by_tier` order.
+const SGLANG_CACHE_SOURCES: [&str; 3] = ["device", "host", "storage"];
 
 pub(crate) struct NativeMockerMetrics {
     dp_size: u32,
@@ -38,6 +40,7 @@ struct NativeMockerMetricsState {
     warned_model_mismatch: bool,
     latest_snapshots: HashMap<u32, MockerMetrics>,
     vllm_preemptions_seen: HashMap<u32, u64>,
+    sglang_cached_tiers_seen: HashMap<u32, [u64; 3]>,
     handles: Option<NativeMetricHandles>,
 }
 
@@ -61,6 +64,7 @@ struct SglangCollectors {
     num_running_reqs: IntGaugeVec,
     num_queue_reqs: IntGaugeVec,
     cache_hit_rate: GaugeVec,
+    cached_tokens_total: IntCounterVec,
     num_requests_total: IntCounterVec,
     time_to_first_token_seconds: HistogramVec,
     inter_token_latency_seconds: HistogramVec,
@@ -85,6 +89,8 @@ struct SglangHandles {
     num_running_reqs: IntGauge,
     num_queue_reqs: IntGauge,
     cache_hit_rate: Gauge,
+    /// By `cache_source`: device, host, storage.
+    cached_tokens_total: [IntCounter; 3],
     request_metrics: NativeRequestMetricHandles,
 }
 
@@ -270,6 +276,11 @@ impl NativeMockerMetrics {
                     cache_hit_rate: collectors
                         .cache_hit_rate
                         .with_label_values(&scheduler_label_values),
+                    cached_tokens_total: SGLANG_CACHE_SOURCES.map(|source| {
+                        let mut labels = scheduler_label_values.to_vec();
+                        labels.push(source);
+                        collectors.cached_tokens_total.with_label_values(&labels)
+                    }),
                     request_metrics: NativeRequestMetricHandles::Sglang {
                         num_requests_total: collectors
                             .num_requests_total
@@ -353,6 +364,22 @@ impl NativeMockerMetrics {
                 } else {
                     cache_hits as f64 / cache_total as f64
                 });
+
+                let seen = state
+                    .sglang_cached_tiers_seen
+                    .entry(metrics.dp_rank)
+                    .or_insert([0; 3]);
+                for ((counter, total), seen) in handles
+                    .cached_tokens_total
+                    .iter()
+                    .zip(metrics.sglang_cached_tokens_by_tier)
+                    .zip(seen.iter_mut())
+                {
+                    if total > *seen {
+                        counter.inc_by(total - *seen);
+                        *seen = total;
+                    }
+                }
             }
             None => {}
         }
@@ -468,6 +495,13 @@ impl SglangCollectors {
                 Opts::new("sglang:cache_hit_rate", "Cache hit rate."),
                 SGLANG_SCHEDULER_LABELS,
             )?,
+            cached_tokens_total: IntCounterVec::new(
+                Opts::new(
+                    "sglang:cached_tokens_total",
+                    "Reused prefix tokens by cache source.",
+                ),
+                &[SGLANG_SCHEDULER_LABELS, &["cache_source"]].concat(),
+            )?,
             num_requests_total: IntCounterVec::new(
                 Opts::new("sglang:num_requests_total", "Number of requests processed."),
                 SGLANG_REQUEST_LABELS,
@@ -503,6 +537,7 @@ impl SglangCollectors {
         registry.add_metric(Box::new(self.num_running_reqs.clone()))?;
         registry.add_metric(Box::new(self.num_queue_reqs.clone()))?;
         registry.add_metric(Box::new(self.cache_hit_rate.clone()))?;
+        registry.add_metric(Box::new(self.cached_tokens_total.clone()))?;
         registry.add_metric(Box::new(self.num_requests_total.clone()))?;
         registry.add_metric(Box::new(self.time_to_first_token_seconds.clone()))?;
         registry.add_metric(Box::new(self.inter_token_latency_seconds.clone()))?;
@@ -653,7 +688,7 @@ fn sglang_e2e_buckets() -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
     use dynamo_mocker::common::protocols::EngineType;
@@ -780,6 +815,42 @@ mod tests {
         metrics.update_scheduler_snapshot(&MockerMetrics::from_parts(0, 0, 10, 0, 0, 5, 0, 0));
 
         assert_eq!(counter_value(&registry, "vllm:num_preemptions_total"), 5.0);
+    }
+
+    #[tokio::test]
+    async fn sglang_cached_tokens_counter_sums_ranks_by_cache_source() {
+        let registry = MetricsRegistry::new();
+        let metrics = NativeMockerMetrics::new(EngineType::Sglang, 2).unwrap();
+        metrics.register(&registry).unwrap();
+        let _ = metrics
+            .request_timing("llama", 0, false, Instant::now())
+            .await;
+        let snapshot = |dp_rank, tiers| {
+            MockerMetrics::from_parts(dp_rank, 0, 10, 0, 0, 0, 0, 0)
+                .with_sglang_cached_tokens_by_tier(tiers)
+        };
+        metrics.update_scheduler_snapshot(&snapshot(0, [10, 2, 0]));
+        metrics.update_scheduler_snapshot(&snapshot(1, [5, 0, 7]));
+        metrics.update_scheduler_snapshot(&snapshot(0, [12, 2, 3]));
+
+        let family = gather_family(&registry, "sglang:cached_tokens_total");
+        let by_source: HashMap<String, f64> = family
+            .get_metric()
+            .iter()
+            .map(|m| {
+                let source = m
+                    .get_label()
+                    .iter()
+                    .find(|l| l.name() == "cache_source")
+                    .unwrap()
+                    .value()
+                    .to_string();
+                (source, m.counter.as_ref().unwrap().value())
+            })
+            .collect();
+        assert_eq!(by_source["device"], 17.0);
+        assert_eq!(by_source["host"], 2.0);
+        assert_eq!(by_source["storage"], 10.0);
     }
 
     #[tokio::test]

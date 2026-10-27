@@ -4,7 +4,15 @@
 //! Radix-tree KV cache for SGLang engine simulation.
 //!
 //! Reference: sglang/python/sglang/srt/mem_cache/radix_cache.py
+//!
+//! Every page carries the router's block hashes, and inserts and evictions
+//! are queued in [`RadixCache::events`] for the KV manager to publish.
 
+use dynamo_kv_router::protocols::{
+    BlockHashOptions, ExternalSequenceBlockHash, KvCacheEventData, KvCacheRemoveData,
+    KvCacheStoreData, KvCacheStoredBlockData, compute_block_hash_for_seq,
+};
+use dynamo_tokens::compute_next_sequence_hash;
 use slotmap::{SlotMap, new_key_type};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -59,6 +67,8 @@ pub struct TreeNode {
     pub key: Vec<u64>,
     /// KV cache pool token indices. Length = `key.len()`.
     pub value: Vec<usize>,
+    /// The router's sequence hash of each page of `key`.
+    pub seq_hashes: Vec<u64>,
     /// Walk-to-root reference count (protected when > 0).
     pub lock_ref: usize,
     /// Monotonic timestamp for LRU eviction.
@@ -71,11 +81,14 @@ pub struct RadixCache {
     root: NodeId,
     pub token_pool: TokenPool,
     page_size: usize,
-    /// Total token count in evictable nodes.
     pub evictable_leaves: HashSet<NodeId>,
+    /// Token count in unlocked nodes, i.e. reclaimable by repeated leaf
+    /// eviction (SGLang's `evictable_size_`), not just current leaves.
     pub evictable_size: usize,
     /// Total token count in protected (locked) nodes.
     pub protected_size: usize,
+    /// Pending router events with per-page token ids, drained by the KV manager.
+    pub events: Vec<(KvCacheEventData, Option<Vec<Vec<u32>>>)>,
 }
 
 impl RadixCache {
@@ -87,6 +100,7 @@ impl RadixCache {
             parent: None,
             key: Vec::new(),
             value: Vec::new(),
+            seq_hashes: Vec::new(),
             lock_ref: 0,
             last_access_time: Instant::now(),
         });
@@ -98,6 +112,7 @@ impl RadixCache {
             evictable_leaves: HashSet::new(),
             evictable_size: 0,
             protected_size: 0,
+            events: Vec::new(),
         }
     }
 
@@ -256,6 +271,8 @@ impl RadixCache {
         let child_parent = child.parent;
         let child_key = child.key.clone();
         let child_value = child.value.clone();
+        let child_hashes = child.seq_hashes.clone();
+        let page_split = split_pos / self.page_size;
         let child_lock_ref = child.lock_ref;
         let child_last_access = child.last_access_time;
 
@@ -268,6 +285,7 @@ impl RadixCache {
             parent: child_parent,
             key: child_key[..split_pos].to_vec(),
             value: child_value[..split_pos].to_vec(),
+            seq_hashes: child_hashes[..page_split].to_vec(),
             lock_ref: child_lock_ref,
             last_access_time: child_last_access,
         };
@@ -276,6 +294,7 @@ impl RadixCache {
         let child = &mut self.nodes[child_id];
         child.key = child_key[split_pos..].to_vec();
         child.value = child_value[split_pos..].to_vec();
+        child.seq_hashes = child_hashes[page_split..].to_vec();
         child.parent = Some(inter_id);
 
         let original_ck = self.child_key(&child_key);
@@ -283,35 +302,52 @@ impl RadixCache {
             self.nodes[parent_id].children.insert(original_ck, inter_id);
         }
 
-        // Size tracking: intermediate inherits child's lock_ref, so
-        // protected_size is unchanged (split_pos + remainder = original).
-        // For evictable: intermediate is NOT a leaf (has child), so only
-        // the child's contribution changes.
-        if self.evictable_leaves.contains(&child_id) {
-            let old_tokens = child_key.len();
-            let new_tokens = child_key.len() - split_pos;
-            self.evictable_size = self.evictable_size - old_tokens + new_tokens;
-        }
-
+        // Intermediate inherits child's lock_ref, so protected_size and
+        // evictable_size are unchanged (split_pos + remainder = original).
         inter_id
     }
 
     fn create_child(&mut self, parent_id: NodeId, key: &[u64], value: &[usize]) {
+        // Router hashes per page; a root page's sequence hash is its local hash.
+        let parent_hash = self.nodes[parent_id].seq_hashes.last().copied();
+        let tokens: Vec<u32> = key.iter().map(|&t| t as u32).collect();
+        let locals =
+            compute_block_hash_for_seq(&tokens, self.page_size as u32, BlockHashOptions::default());
+        let mut prev = parent_hash;
+        let blocks: Vec<_> = locals
+            .into_iter()
+            .map(|local| {
+                let seq = prev.map_or(local.0, |p| compute_next_sequence_hash(p, local.0));
+                prev = Some(seq);
+                KvCacheStoredBlockData {
+                    block_hash: ExternalSequenceBlockHash(seq),
+                    tokens_hash: local,
+                    mm_extra_info: None,
+                }
+            })
+            .collect();
+        let seq_hashes = blocks.iter().map(|b| b.block_hash.0).collect();
+        let token_ids = tokens.chunks(self.page_size).map(<[u32]>::to_vec).collect();
+        let store = KvCacheStoreData {
+            parent_hash: parent_hash.map(ExternalSequenceBlockHash),
+            start_position: None,
+            blocks,
+        };
+        self.events
+            .push((KvCacheEventData::Stored(store), Some(token_ids)));
         let new_node = TreeNode {
             children: HashMap::new(),
             parent: Some(parent_id),
             key: key.to_vec(),
             value: value.to_vec(),
+            seq_hashes,
             lock_ref: 0,
             last_access_time: Instant::now(),
         };
         let ck = self.child_key(key);
         let new_id = self.nodes.insert(new_node);
 
-        if self.evictable_leaves.remove(&parent_id) {
-            let parent_tokens = self.nodes[parent_id].key.len();
-            self.evictable_size -= parent_tokens;
-        }
+        self.evictable_leaves.remove(&parent_id);
 
         self.nodes[parent_id].children.insert(ck, new_id);
 
@@ -333,9 +369,8 @@ impl RadixCache {
             let tokens = node.key.len();
             node.lock_ref += 1;
             if node.lock_ref == 1 {
-                if self.evictable_leaves.remove(&id) {
-                    self.evictable_size -= tokens;
-                }
+                self.evictable_leaves.remove(&id);
+                self.evictable_size -= tokens;
                 self.protected_size += tokens;
             }
             current = self.nodes[id].parent;
@@ -357,9 +392,9 @@ impl RadixCache {
             if node.lock_ref == 0 {
                 let tokens = node.key.len();
                 self.protected_size -= tokens;
+                self.evictable_size += tokens;
                 if self.is_leaf(id) {
                     self.evictable_leaves.insert(id);
-                    self.evictable_size += tokens;
                 }
             }
             current = self.nodes[id].parent;
@@ -394,6 +429,13 @@ impl RadixCache {
 
             evicted_indices.extend_from_slice(&pool_indices);
             self.token_pool.free(&pool_indices);
+            let block_hashes = self.nodes[victim_id]
+                .seq_hashes
+                .iter()
+                .map(|&h| ExternalSequenceBlockHash(h))
+                .collect();
+            let remove = KvCacheRemoveData { block_hashes };
+            self.events.push((KvCacheEventData::Removed(remove), None));
 
             if let Some(pid) = parent_id {
                 let ck = self.child_key(&victim_key);
@@ -403,9 +445,7 @@ impl RadixCache {
                     && self.nodes[pid].children.is_empty()
                     && self.nodes[pid].lock_ref == 0
                 {
-                    let parent_tokens = self.nodes[pid].key.len();
                     self.evictable_leaves.insert(pid);
-                    self.evictable_size += parent_tokens;
                 }
             }
 

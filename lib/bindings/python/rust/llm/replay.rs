@@ -125,8 +125,18 @@ impl SglangArgs {
             chunked_prefill_size,
             clip_max_new_tokens,
             schedule_conservativeness,
+            ..Default::default()
         };
         Ok(Self { inner })
+    }
+
+    /// Build from the JSON shape of `MockEngineArgs.sglang`, including fields
+    /// the constructor does not list (e.g. `hicache`).
+    #[staticmethod]
+    fn from_json(config_json: &str) -> PyResult<Self> {
+        serde_json::from_str(config_json)
+            .map(|inner| Self { inner })
+            .map_err(|e| PyException::new_err(format!("Failed to parse SglangArgs JSON: {e}")))
     }
 }
 

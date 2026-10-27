@@ -8,7 +8,7 @@ pub mod hicache_g2;
 pub mod nixl;
 #[cfg(feature = "transport")]
 pub mod node_index;
-#[cfg(feature = "transport")]
+#[cfg(feature = "index")]
 pub mod node_relay;
-#[cfg(feature = "transport")]
+#[cfg(feature = "index")]
 pub mod peer_index;

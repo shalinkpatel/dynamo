@@ -98,6 +98,14 @@ impl SglangScheduler {
                 capture_deferred_kv_publish_sink(kv_event_publishers.raw_enabled());
             let deferred_fpm = DeferredFpmBuffer::default();
             let mut core = SglangCore::new_with_sink(args, dp_rank, buffering_publishers);
+            // Baseten: advertise HiCache pages to peers at pass end.
+            if let Some(hicache) = core.kv_manager.hicache_mut() {
+                hicache.defer_peer_updates();
+            }
+
+            // Baseten: wall-clock simulated time, as in the vLLM scheduler, so
+            // HiCache peer reads finish in real time.
+            let scheduler_start = Instant::now();
 
             loop {
                 if receive_requests(
@@ -113,7 +121,8 @@ impl SglangScheduler {
                 }
 
                 let iteration_start = Instant::now();
-                let pass = core.execute_pass_internal(None, 0.0);
+                let now_ms = scheduler_start.elapsed().as_secs_f64() * 1000.0;
+                let pass = core.execute_pass_internal(None, now_ms);
                 if let Some(admission_tx) = admission_tx.as_ref() {
                     for admission in &pass.admissions {
                         let _ = admission_tx.send(admission.clone());
@@ -126,9 +135,13 @@ impl SglangScheduler {
                     publish_deferred_kv_events(&kv_event_publishers, deferred_kv_events.drain());
                     publish_deferred_fpm(&fpm_publisher, deferred_fpm.drain());
                 }
-                let total_time = std::time::Duration::from_secs_f64(pass.end_ms / 1000.0);
+                let total_time =
+                    std::time::Duration::from_secs_f64((pass.end_ms - now_ms).max(0.0) / 1000.0);
                 if total_time > std::time::Duration::ZERO {
                     sleep_until_precise(iteration_start + total_time).await;
+                }
+                if let Some(hicache) = core.kv_manager.hicache_mut() {
+                    hicache.publish_peer_updates();
                 }
                 if pass.router_event_visibility == RouterEventVisibility::PassEnd {
                     publish_deferred_kv_events(&kv_event_publishers, deferred_kv_events.drain());

@@ -32,6 +32,8 @@ pub struct MockerMetrics {
     pub vllm_preemptions_total: u64,
     pub sglang_cache_hit_tokens: u64,
     pub sglang_cache_total_tokens: u64,
+    /// Cumulative reused prefix tokens by tier: device, host, peer storage.
+    pub sglang_cached_tokens_by_tier: [u64; 3],
 }
 
 impl MockerMetrics {
@@ -71,7 +73,13 @@ impl MockerMetrics {
             vllm_preemptions_total,
             sglang_cache_hit_tokens,
             sglang_cache_total_tokens,
+            sglang_cached_tokens_by_tier: [0; 3],
         }
+    }
+
+    pub fn with_sglang_cached_tokens_by_tier(mut self, tiers: [u64; 3]) -> Self {
+        self.sglang_cached_tokens_by_tier = tiers;
+        self
     }
 
     pub(crate) fn with_iteration_tokens(self, fpm: &ForwardPassSnapshot) -> Self {

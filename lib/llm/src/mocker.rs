@@ -415,8 +415,18 @@ impl MockEngine {
                 None => (KvEventPublishers::default(), None),
             };
 
+            // Baseten: fleet-wide G2PB peer directory for the HiCache host tier.
+            let mut rank_args = args.clone();
+            rank_args.peer_directory = baseten_mocker::g2pb::peer_directory(
+                args.sglang.as_ref().and_then(|s| s.hicache.as_ref()),
+                component,
+                dp_rank,
+                args.block_size,
+                args.kv_bytes_per_token,
+            )
+            .await;
             let scheduler = create_engine(
-                args.clone(),
+                rank_args,
                 dp_rank,
                 Some(output_tx),
                 kv_event_publishers,

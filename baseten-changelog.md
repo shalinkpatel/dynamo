@@ -2867,6 +2867,73 @@ publishes a `b10.drain/until=<RFC 3339>` taint on its base model card (via PATCH
 `b10_routing_config.router_honor_draining` (`scheduling/{filter,queue}/b10_draining.rs`).
 PR: https://github.com/basetenlabs/dynamo/pull/962.
 
+## PATCH-025: SGLang mocker HiCache host tier and G2PB peer reads
+
+Status: `keep`
+
+Source commits:
+
+- Current PR: feat(mocker): SGLang HiCache host tier and G2PB peer reads
+
+Purpose:
+
+Lets SGLang mocker fleets simulate HiCache L2 and G2Direct peer reads (G2PB),
+with page hashes only. Configured by `SglangArgs::hicache` (`HiCacheArgs`:
+`size` GB, `write_policy`, `bandwidth_gb_per_sec`, `peer_group`,
+`peer_bandwidth_gb_per_sec`); Python builds it with `SglangArgs.from_json`.
+As with SGLang's `wait_complete` storage prefetch, a request reads its peer
+pages while queued, so the read delays only that request; transfer times are
+bytes / bandwidth, independent of `speedup_ratio`.
+`tp_size` / `dcp_size` / `mla` give the engine's KV layout: host capacity and
+transfers use per-rank bytes derived from the model's `kv_bytes_per_token`, and
+peer keys are tagged per rank like G2Direct's key suffixes, so replicas with
+different layouts never share and a page hits only if every rank finds it.
+`lib/baseten-mocker/README.md` documents the per-rank semantics and how to
+calibrate bandwidths.
+
+Baseten-owned crate `lib/baseten-mocker` (no upstream equivalent):
+
+- `hicache.rs`: `HiCache`, the host tier after SGLang HiRadixCache (write
+  policies, host LRU eviction, load-back, timing). It follows the device KV
+  events the SGLang mocker publishes, keyed by page sequence hash.
+- `peer.rs`: the peer directory seam and the in-process `PeerIndex` (offline
+  replay).
+- `g2pb.rs` (feature `g2direct`): live peer directory on the real G2Direct
+  replica index and publisher via the `dynamo-g2direct` `index` feature (no
+  NIXL; the workspace dependency is `default-features = false` and
+  `lib/bindings/g2direct` opts into `transport`).
+
+Seam in vendored code: `SglangArgs::hicache`, `MockEngineArgs::peer_directory`,
+and in `SglangKvManager` an `Option<HiCache>` fed every flushed device event,
+asked for host/peer pages at admission (`take_prefix`/`peek_prefix`) and for
+prefill timing; `lib/llm/src/mocker.rs` attaches the live peer directory per
+DP rank.
+
+Vendored SGLang mocker fixes in the same PR (candidates for upstream):
+
+- KV events follow radix-tree contents, one block per page hashed with the
+  router's `compute_block_hash_for_seq` and sequence-hash recurrence
+  (previously one block per token, router-correct only at `page_size=1`).
+- Fresh requests match the whole cached prefix before chunking.
+- Like SGLang, a fresh request reuses at most all but its last token, so a
+  fully cached page-aligned prompt recomputes its last page; finishing frees
+  slots that duplicate tree content.
+- `evictable_size` counts every unlocked device token (leaf-only counting
+  stalled an idle scheduler on chunked long prompts).
+- Retraction no longer frees tree-owned prefix slots; `cached_tokens` is
+  reported on the first output; `sglang:cached_tokens_total{cache_source}`.
+
+Validated against real SGLang + HiCache + G2Direct on 4x L4 (Qwen2.5-7B),
+token hit rate real vs mock: 64.3% vs 64.0% (kv-aware routing), 61.8% vs
+61.7% (cache-blind), 62.1% vs 62.0% (glm-53-sgl-agg-fast router config).
+
+Replay notes:
+
+When upstream reworks the SGLang mocker KV manager, keep the `HiCache` calls
+in `SglangKvManager` (event flush, admission, prefill time) and re-port the
+vendored fixes above if upstream lacks them. `node_relay` builds under the
+`index` feature because `peer_index` depends on it.
+
 ## GWP Control Plane (global-routing)
 
 GWP supports coordinator-backed pub-sub affinity; deployment affinity no longer

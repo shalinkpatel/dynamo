@@ -1163,6 +1163,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "baseten-mocker"
+version = "1.2.0"
+dependencies = [
+ "anyhow",
+ "dynamo-g2direct",
+ "dynamo-kv-router",
+ "dynamo-runtime",
+ "dynamo-tokens",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "baseten-parsers"
 version = "1.2.0"
 dependencies = [
@@ -2855,6 +2870,7 @@ dependencies = [
  "b10-dynamo-api-translation",
  "base64 0.22.1",
  "baseten-configmap",
+ "baseten-mocker",
  "bincode 2.0.1",
  "bitflags 2.11.1",
  "blake3",
@@ -2972,6 +2988,7 @@ version = "1.2.0"
 dependencies = [
  "aiconfigurator-core",
  "anyhow",
+ "baseten-mocker",
  "bytes",
  "dashmap",
  "derive-getters",

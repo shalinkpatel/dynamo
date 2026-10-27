@@ -244,23 +244,6 @@ pub(crate) fn stored_hashes(events: &[RouterEvent]) -> Vec<LocalBlockHash> {
         .collect()
 }
 
-pub(crate) fn nth_stored_hashes(events: &[RouterEvent], nth: usize) -> Vec<LocalBlockHash> {
-    events
-        .iter()
-        .filter_map(|event| match &event.event.data {
-            KvCacheEventData::Stored(store) => Some(
-                store
-                    .blocks
-                    .iter()
-                    .map(|block| block.tokens_hash)
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .nth(nth)
-        .unwrap_or_default()
-}
-
 pub(crate) fn removed_event_count(events: &[RouterEvent]) -> usize {
     events
         .iter()

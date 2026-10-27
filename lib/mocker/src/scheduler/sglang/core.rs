@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use dynamo_kv_router::protocols::WorkerId;
@@ -29,6 +29,12 @@ pub(crate) struct SglangCore {
     pub(super) new_token_ratio: f64,
     pub(super) kv_manager: SglangKvManager,
     kv_event_buffer: Option<CapturedRouterEventBuffer>,
+    /// Prefix tokens reused at a request's first admission, reported as
+    /// `cached_tokens` on its first output signal.
+    /// shortcut: entries of requests dropped before any output linger.
+    first_admission_cached: HashMap<Uuid, usize>,
+    /// Cumulative reused prefix tokens by tier (device, host, peer).
+    pub(super) cached_tokens_by_tier: [u64; 3],
 }
 
 impl SglangCore {
@@ -75,8 +81,11 @@ impl SglangCore {
                 args.block_size,
                 kv_event_publishers,
                 dp_rank,
-            ),
+            )
+            .with_hicache(&args),
             kv_event_buffer,
+            first_admission_cached: HashMap::new(),
+            cached_tokens_by_tier: [0; 3],
         }
     }
 
@@ -114,6 +123,9 @@ impl SglangCore {
         now_ms: f64,
     ) -> EnginePassResult {
         apply_schedule_policy(&mut self.waiting, &self.kv_manager, &self.config);
+        if let Some(hicache) = self.kv_manager.hicache_mut() {
+            hicache.set_now_ms(now_ms);
+        }
 
         let admit = get_new_batch_prefill(
             &mut self.waiting,
@@ -126,8 +138,18 @@ impl SglangCore {
         if admit.oom {
             self.new_token_ratio = self.config.init_new_token_ratio;
         }
+        for (total, tokens) in self
+            .cached_tokens_by_tier
+            .iter_mut()
+            .zip(admit.cached_by_tier)
+        {
+            *total += tokens as u64;
+        }
 
         for admission in &admit.admissions {
+            self.first_admission_cached
+                .entry(admission.uuid)
+                .or_insert(admission.reused_input_tokens);
             if let Some(collector) = collector.as_deref_mut() {
                 collector.on_admit(admission.uuid, now_ms, admission.reused_input_tokens);
             }
@@ -149,6 +171,10 @@ impl SglangCore {
         };
         let prefill_time =
             simulate_prefill_duration(batch_size, mean_isl, mean_prefix, &self.config, true);
+        let prefill_time = match self.kv_manager.hicache_mut() {
+            Some(h) => h.prefill_time(prefill_time, admit.cached_by_tier),
+            None => prefill_time,
+        };
 
         for mut req in admit.can_run {
             if req.materialized_tokens < req.current_sequence_len() {
@@ -174,6 +200,20 @@ impl SglangCore {
             decode_start_ms,
             true,
         );
+
+        for signal in &mut decode.output_signals {
+            signal.cached_tokens = self.first_admission_cached.remove(&signal.uuid);
+        }
+        // Baseten: an idle pass with requests waiting on HiCache peer reads
+        // ends at the next prefetch wakeup, so replay time advances.
+        if decode.end_ms <= now_ms
+            && let Some(ready_ms) = self
+                .kv_manager
+                .hicache_mut()
+                .and_then(|h| h.next_prefetch_wakeup_ms())
+        {
+            decode.end_ms = ready_ms;
+        }
 
         if let Some(collector) = collector {
             for signal in &decode.output_signals {
@@ -232,7 +272,8 @@ impl SglangCore {
             sglang_cache_hit_tokens,
             sglang_cache_total_tokens,
         )
-        .with_iteration_tokens(&fpm);
+        .with_iteration_tokens(&fpm)
+        .with_sglang_cached_tokens_by_tier(self.cached_tokens_by_tier);
         EnginePassResult {
             end_ms: decode.end_ms,
             completed_requests: decode

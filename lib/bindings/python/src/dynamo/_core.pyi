@@ -2579,6 +2579,11 @@ class SglangArgs:
     ) -> None:
         ...
 
+    @staticmethod
+    def from_json(config_json: str) -> "SglangArgs":
+        """Build from the JSON shape of MockEngineArgs.sglang, e.g. with `hicache`."""
+        ...
+
 class MockEngineArgs:
     def __init__(
         self,

@@ -17,4 +17,6 @@ pub(crate) use core::SglangCore;
 pub use live::SglangScheduler;
 
 #[cfg(test)]
+mod b10_hicache_tests;
+#[cfg(test)]
 mod tests;

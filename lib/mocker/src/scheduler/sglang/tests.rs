@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use dynamo_kv_router::indexer::{METRIC_EVENT_REMOVED, METRIC_EVENT_STORED};
+use dynamo_kv_router::indexer::METRIC_EVENT_REMOVED;
 use dynamo_kv_router::protocols::WorkerId;
 use rstest::rstest;
 use tokio::sync::mpsc;
@@ -23,9 +23,7 @@ use crate::common::protocols::{
     SglangArgs,
 };
 use crate::kv_manager::SglangKvManager;
-use crate::scheduler::test_utils::{
-    RouterIndexerHarness, nth_stored_hashes, removed_event_count, stored_hashes,
-};
+use crate::scheduler::test_utils::{RouterIndexerHarness, removed_event_count, stored_hashes};
 use crate::scheduler::{RouterEventVisibility, SchedulerHandle, capture_router_event_sink};
 
 const ROUTER_TEST_WORKER_ID: WorkerId = 17;
@@ -49,7 +47,7 @@ fn test_args(
         .unwrap()
 }
 
-fn direct_request(tokens: Vec<u32>, max_output_tokens: usize) -> DirectRequest {
+pub(super) fn direct_request(tokens: Vec<u32>, max_output_tokens: usize) -> DirectRequest {
     DirectRequest {
         tokens,
         max_output_tokens,
@@ -600,6 +598,134 @@ async fn assert_sglang_scheduler_completes_all(
     assert!((0.0..=1.0).contains(&metrics.gpu_cache_usage_perc));
 }
 
+pub(super) mod cache_reuse {
+    use super::*;
+
+    /// Run passes until `core` drains; returns `(reused tokens, pass duration)`
+    /// for each admission.
+    pub(crate) fn drain(core: &mut SglangCore, now_ms: &mut f64) -> Vec<(usize, f64)> {
+        let mut admitted = Vec::new();
+        while !core.is_empty() {
+            let pass = core.execute_pass_internal(None, *now_ms);
+            for a in &pass.admissions {
+                admitted.push((a.reused_input_tokens, pass.end_ms - *now_ms));
+            }
+            *now_ms = pass.end_ms;
+        }
+        admitted
+    }
+
+    /// Long chunked prompts leave multi-node chains in the tree; admission
+    /// must count every unlocked device token as reclaimable, not just leaves,
+    /// or an idle scheduler stops admitting.
+    #[test]
+    fn test_long_prompt_churn_never_stalls() {
+        let args = MockEngineArgs::builder()
+            .engine_type(EngineType::Sglang)
+            .num_gpu_blocks(2048)
+            .block_size(64)
+            .speedup_ratio(1.0)
+            .sglang(Some(SglangArgs {
+                page_size: Some(64),
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+        let mut core = SglangCore::new(args);
+        let mut now_ms = 0.0;
+        for round in 0..200u32 {
+            let prefix = round * 7 % 30;
+            let len = 17800 + round % 120;
+            core.receive(direct_request(
+                (0..len).map(|i| prefix * 1_000_000 + i).collect(),
+                8,
+            ));
+            let mut passes = 0;
+            while !core.is_empty() {
+                now_ms = core.execute_pass_internal(None, now_ms).end_ms;
+                passes += 1;
+                assert!(passes < 1000, "stalled at round {round}");
+            }
+            assert_slots_accounted(&core);
+        }
+    }
+
+    pub(crate) fn assert_slots_accounted(core: &SglangCore) {
+        let cache = core.kv_manager.cache();
+        assert_eq!(
+            cache.available_tokens() + cache.evictable_size,
+            cache.total_tokens()
+        );
+    }
+
+    /// A request retracted before its first decode must give back only its
+    /// own slots, not the tree-owned prefix it reused.
+    #[test]
+    fn test_retracting_prefix_hit_keeps_shared_slots() {
+        let mut core = SglangCore::new(test_args(4, 4, 16));
+        let mut now_ms = 0.0;
+        let prompt: Vec<u32> = (1..=12).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        drain(&mut core, &mut now_ms);
+        core.receive(direct_request(prompt.clone(), 2));
+        core.receive(direct_request(prompt, 2));
+        drain(&mut core, &mut now_ms);
+        assert_slots_accounted(&core);
+    }
+
+    #[test]
+    fn test_first_output_reports_cached_tokens() {
+        let mut core = SglangCore::new(test_args(64, 4, 8));
+        let mut now_ms = 0.0;
+        let prompt: Vec<u32> = (1..=13).collect();
+        let mut first_cached = Vec::new();
+        for _ in 0..2 {
+            core.receive(direct_request(prompt.clone(), 2));
+            while !core.is_empty() {
+                let pass = core.execute_pass_internal(None, now_ms);
+                now_ms = pass.end_ms;
+                first_cached.extend(pass.output_signals.iter().map(|s| s.cached_tokens));
+            }
+        }
+        // Each request reports once, on its first token.
+        assert_eq!(first_cached, vec![Some(0), None, Some(12), None]);
+    }
+
+    #[test]
+    fn test_cached_prefix_longer_than_chunk_is_reused() {
+        let mut core = SglangCore::new(test_args(64, 4, 8));
+        let mut now_ms = 0.0;
+        let prompt: Vec<u32> = (1..=24).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        drain(&mut core, &mut now_ms);
+
+        let mut longer = prompt;
+        longer.extend(100..104);
+        core.receive(direct_request(longer, 1));
+        let admitted = drain(&mut core, &mut now_ms);
+        assert_eq!(
+            admitted[0].0, 24,
+            "prefix beyond the 8-token chunk is reused"
+        );
+    }
+
+    /// Like SGLang, a fully cached page-aligned prompt recomputes its last
+    /// page: reuse stops before the last token.
+    #[test]
+    fn test_fully_cached_prompt_computes_its_last_page() {
+        let mut core = SglangCore::new(test_args(64, 4, 64));
+        let mut now_ms = 0.0;
+        let prompt: Vec<u32> = (1..=24).collect();
+        core.receive(direct_request(prompt.clone(), 1));
+        drain(&mut core, &mut now_ms);
+
+        core.receive(direct_request(prompt, 1));
+        let admitted = drain(&mut core, &mut now_ms);
+        assert_eq!(admitted[0].0, 20);
+        assert_slots_accounted(&core);
+    }
+}
+
 mod router_events {
     use super::*;
 
@@ -650,23 +776,33 @@ mod router_events {
         .await;
     }
 
+    fn router_hashes(tokens: &[u32]) -> Vec<dynamo_kv_router::protocols::LocalBlockHash> {
+        dynamo_kv_router::protocols::compute_block_hash_for_seq(tokens, 4, Default::default())
+    }
+
     #[tokio::test]
     async fn test_chunked_prefill_events_apply_cleanly() {
         let harness = RouterIndexerHarness::new(4, ROUTER_TEST_WORKER_ID);
         let mut core = SglangCore::new_with_kv_capture(test_args(32, 4, 4), ROUTER_TEST_WORKER_ID);
         core.receive(direct_request(vec![1, 2, 3, 4, 5, 6], 2));
 
+        // The first chunk fills one page, which is inserted and published.
         let pass1 = core.execute_pass_internal(None, 0.0);
-        let mut prompt_hashes = stored_hashes(&pass1.kv_events);
-        assert_eq!(prompt_hashes.len(), 4);
+        assert_eq!(
+            stored_hashes(&pass1.kv_events),
+            router_hashes(&[1, 2, 3, 4])
+        );
         harness.apply_events(pass1.kv_events).await;
 
         let pass2 = core.execute_pass_internal(None, pass1.end_ms);
-        prompt_hashes.extend(nth_stored_hashes(&pass2.kv_events, 0));
         harness.apply_events(pass2.kv_events).await;
 
-        assert_eq!(prompt_hashes.len(), 6);
-        assert!(harness.ok_count(METRIC_EVENT_STORED) >= 2);
+        assert_eq!(
+            harness
+                .overlap_for_hashes(router_hashes(&[1, 2, 3, 4]))
+                .await,
+            1
+        );
         harness.assert_no_event_warnings();
         harness.shutdown();
     }
@@ -677,16 +813,18 @@ mod router_events {
         let mut core = SglangCore::new_with_kv_capture(test_args(32, 4, 16), ROUTER_TEST_WORKER_ID);
         core.receive(direct_request(vec![7, 8, 9, 10], 5));
 
-        let pass1 = core.execute_pass_internal(None, 0.0);
-        let mut full_hashes = stored_hashes(&pass1.kv_events);
-        harness.apply_events(pass1.kv_events).await;
+        // 4 prompt + 5 output tokens: two full pages end up in the tree.
+        let mut full_hashes = Vec::new();
+        let mut now_ms = 0.0;
+        while !core.is_empty() {
+            let pass = core.execute_pass_internal(None, now_ms);
+            now_ms = pass.end_ms;
+            full_hashes.extend(stored_hashes(&pass.kv_events));
+            harness.apply_events(pass.kv_events).await;
+        }
 
-        let pass2 = core.execute_pass_internal(None, pass1.end_ms);
-        full_hashes.extend(stored_hashes(&pass2.kv_events));
-        harness.apply_events(pass2.kv_events).await;
-
-        assert_eq!(full_hashes.len(), 6);
-        assert!(harness.ok_count(METRIC_EVENT_STORED) >= 2);
+        assert_eq!(full_hashes.len(), 2);
+        assert_eq!(full_hashes[0], router_hashes(&[7, 8, 9, 10])[0]);
         harness.assert_no_event_warnings();
         harness.shutdown();
     }
@@ -703,6 +841,7 @@ mod router_events {
         let req1 = make_decoded_request(&mut kv_manager, &config, vec![1, 2, 3, 4], 4);
         let req1_events = buffer.drain();
         let req1_hashes = stored_hashes(&req1_events);
+        assert_eq!(req1_hashes, router_hashes(&[1, 2, 3, 4]));
         harness.apply_events(req1_events).await;
 
         let req2 = make_decoded_request(&mut kv_manager, &config, vec![9, 8, 7, 6], 4);
@@ -712,38 +851,34 @@ mod router_events {
         let retracted = decode::check_decode_mem(&mut running, &mut kv_manager, &config);
         assert_eq!(retracted.len(), 1);
 
+        // Retraction frees only request-owned slots, which were never published.
         let retract_events = buffer.drain();
-        assert!(removed_event_count(&retract_events) > 0);
+        assert_eq!(removed_event_count(&retract_events), 0);
         harness.apply_events(retract_events).await;
 
-        assert_eq!(harness.overlap_for_hashes(req1_hashes).await, 4);
-        assert!(harness.ok_count(METRIC_EVENT_REMOVED) > 0);
+        assert_eq!(harness.overlap_for_hashes(req1_hashes).await, 1);
         harness.shutdown();
     }
 
     #[tokio::test]
-    async fn test_completion_tail_free_emits_valid_removals() {
+    async fn test_completion_publishes_only_full_pages() {
         let harness = RouterIndexerHarness::new(4, ROUTER_TEST_WORKER_ID);
         let mut core = SglangCore::new_with_kv_capture(test_args(32, 4, 16), ROUTER_TEST_WORKER_ID);
         core.receive(direct_request(vec![11, 12, 13, 14], 3));
 
-        let pass1 = core.execute_pass_internal(None, 0.0);
-        let prompt_hashes = nth_stored_hashes(&pass1.kv_events, 0);
-        let mut full_hashes = stored_hashes(&pass1.kv_events);
-        harness.apply_events(pass1.kv_events).await;
+        let mut events = Vec::new();
+        let mut now_ms = 0.0;
+        while !core.is_empty() {
+            let pass = core.execute_pass_internal(None, now_ms);
+            now_ms = pass.end_ms;
+            events.extend(pass.kv_events);
+        }
 
-        let pass2 = core.execute_pass_internal(None, pass1.end_ms);
-        full_hashes.extend(stored_hashes(&pass2.kv_events));
-        harness.apply_events(pass2.kv_events).await;
-
-        let pass3 = core.execute_pass_internal(None, pass2.end_ms);
-        assert!(removed_event_count(&pass3.kv_events) > 0);
-        full_hashes.extend(stored_hashes(&pass3.kv_events));
-        harness.apply_events(pass3.kv_events).await;
-
-        assert_eq!(prompt_hashes.len(), 4);
-        assert!(full_hashes.len() >= prompt_hashes.len());
-        assert!(harness.ok_count(METRIC_EVENT_REMOVED) > 0);
+        // 7 tokens: one full page; the partial tail is freed, never published.
+        assert_eq!(stored_hashes(&events), router_hashes(&[11, 12, 13, 14]));
+        assert_eq!(removed_event_count(&events), 0);
+        harness.apply_events(events).await;
+        harness.assert_no_event_warnings();
         harness.shutdown();
     }
 

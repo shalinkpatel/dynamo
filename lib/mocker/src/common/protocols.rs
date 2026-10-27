@@ -337,6 +337,8 @@ pub struct SglangArgs {
     /// Schedule conservativeness factor (0.0–1.0). Default: 1.0.
     #[validate(range(min = 0.0, max = 1.0))]
     pub schedule_conservativeness: Option<f64>,
+    /// Baseten: SGLang HiCache host tier and G2PB peers.
+    pub hicache: Option<baseten_mocker::HiCacheArgs>,
 }
 
 /// Keeps omitted JSON fields distinct from explicit `null` so serde can replace
@@ -538,6 +540,11 @@ pub struct MockEngineArgs {
     /// Original planner profile NPZ path used to materialize `perf_model`.
     #[builder(default = "None")]
     pub planner_profile_data: Option<PathBuf>,
+
+    /// Baseten: fleet-wide G2PB peer directory injected by the live runtime.
+    #[serde(skip)]
+    #[builder(default = "None")]
+    pub peer_directory: Option<baseten_mocker::PeerDirectoryHandle>,
 
     /// Performance model for timing predictions (not serialized, loaded from planner_profile_data)
     #[serde(skip)]
@@ -760,6 +767,12 @@ fn validate_mock_engine_args(args: &MockEngineArgs) -> Result<(), ValidationErro
                 args.block_size,
             ),
         ));
+    }
+
+    if let Some(hicache) = args.sglang.as_ref().and_then(|s| s.hicache.as_ref())
+        && let Err(message) = hicache.validate(args.kv_bytes_per_token)
+    {
+        return Err(mock_engine_args_validation_error("sglang_hicache", message));
     }
 
     if let Some(chunked_prefill_size) = args

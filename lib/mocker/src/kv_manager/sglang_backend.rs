@@ -3,18 +3,15 @@
 
 //! SGLang KV manager — wraps [`RadixCache`] with request-level lifecycle
 //! operations and KV event publishing.
-
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+//!
+//! Like SGLang, KV events describe radix-tree contents: pages are stored when
+//! inserted into the tree and removed when evicted.
 
 use crate::cache::radix_cache::{NodeId, RadixCache};
 use crate::common::kv_cache_trace;
-use crate::common::protocols::KvEventPublishers;
-use dynamo_kv_router::protocols::{
-    ExternalSequenceBlockHash, KvCacheEvent, KvCacheEventData, KvCacheRemoveData, KvCacheStoreData,
-    KvCacheStoredBlockData,
-};
+use crate::common::protocols::{KvEventPublishers, MockEngineArgs};
+use baseten_mocker::{HiCache, PrefixHits};
+use dynamo_kv_router::protocols::{KvCacheEvent, KvCacheEventData, StorageTier};
 
 /// Result of `allocate_for_request`.
 pub struct AllocResult {
@@ -26,6 +23,8 @@ pub struct AllocResult {
     /// This is the prefix match point, not the new tokens — new tokens are
     /// only in kv_indices and get inserted into the tree on completion.
     pub last_node: NodeId,
+    /// Baseten HiCache: part of `prefix_len` served from host and peers.
+    pub hicache_hits: PrefixHits,
 }
 
 pub struct SglangKvManager {
@@ -33,13 +32,8 @@ pub struct SglangKvManager {
     kv_event_publishers: KvEventPublishers,
     dp_rank: u32,
     next_event_id: u64,
-    /// Maps pool_idx → block_hash assigned during Stored events,
-    /// so Removed events can use the same block_hash.
-    idx_to_block_hash: HashMap<usize, ExternalSequenceBlockHash>,
-    /// Tracks how many live pool slots currently advertise the same logical
-    /// block hash so router events reflect logical block visibility, not
-    /// transient slot ownership.
-    block_hash_refcounts: HashMap<ExternalSequenceBlockHash, usize>,
+    /// Baseten: SGLang HiCache host tier and G2PB peers.
+    hicache: Option<HiCache>,
 }
 
 impl SglangKvManager {
@@ -54,9 +48,19 @@ impl SglangKvManager {
             kv_event_publishers,
             dp_rank,
             next_event_id: 0,
-            idx_to_block_hash: HashMap::new(),
-            block_hash_refcounts: HashMap::new(),
+            hicache: None,
         }
+    }
+
+    /// Baseten: enable the HiCache host tier configured by `sglang.hicache`.
+    pub fn with_hicache(mut self, args: &MockEngineArgs) -> Self {
+        let hicache = args.sglang.as_ref().and_then(|s| s.hicache.as_ref());
+        if let (Some(hicache), Some(bytes)) = (hicache, args.kv_bytes_per_token) {
+            let page_size = self.cache.page_size();
+            let peer = args.peer_directory.as_ref();
+            self.hicache = Some(HiCache::new(hicache, page_size, bytes, peer));
+        }
+        self
     }
 
     pub fn cache(&self) -> &RadixCache {
@@ -70,32 +74,96 @@ impl SglangKvManager {
     /// Try to allocate KV cache for a new request.
     /// Returns `None` if the pool doesn't have enough token slots (OOM).
     pub fn allocate_for_request(&mut self, token_ids: &[u64]) -> Option<AllocResult> {
-        let (prefix_len, last_node) = self.cache.match_prefix(token_ids);
+        self.allocate_for_request_capped(token_ids, token_ids.len())
+    }
 
+    /// [`Self::allocate_for_request`], reusing at most `max_prefix` cached
+    /// tokens.
+    pub fn allocate_for_request_capped(
+        &mut self,
+        token_ids: &[u64],
+        max_prefix: usize,
+    ) -> Option<AllocResult> {
+        let (mut prefix_len, mut last_node) = self.cache.match_prefix(&token_ids[..max_prefix]);
+        // Host loads and new tokens all fit in this.
+        let needed = token_ids.len() - prefix_len;
+        let available = self.cache.available_tokens();
+        if available < needed {
+            self.cache.inc_lock_ref(last_node);
+            self.cache.evict(needed - available);
+            self.cache.dec_lock_ref(last_node);
+            if self.cache.available_tokens() < needed {
+                self.flush_events();
+                return None;
+            }
+        }
+        let hicache_hits =
+            self.load_hicache_hits(&token_ids[..max_prefix], &mut prefix_len, &mut last_node);
+
+        let mut kv_indices = self.collect_path_indices(last_node);
         let new_tokens = token_ids.len() - prefix_len;
-
-        let prefix_indices = self.collect_path_indices(last_node);
-
-        let new_indices = self.cache.token_pool.allocate(new_tokens)?;
-
-        let mut kv_indices = prefix_indices;
+        let new_indices = self
+            .cache
+            .token_pool
+            .allocate(new_tokens)
+            .expect("slots checked");
         kv_indices.extend_from_slice(&new_indices);
 
         self.cache.inc_lock_ref(last_node);
-
-        // Chain from prefix's last block_hash (if any)
-        let parent_hash = kv_indices
-            .get(prefix_len.wrapping_sub(1))
-            .and_then(|&idx| self.idx_to_block_hash.get(&idx).copied());
-        self.publish_stored_event(&token_ids[prefix_len..], &new_indices, parent_hash);
-
+        self.flush_events();
         self.log_trace("allocation", new_tokens);
 
         Some(AllocResult {
             prefix_len,
             kv_indices,
             last_node,
+            hicache_hits,
         })
+    }
+
+    /// Baseten: load the pages after the device prefix that HiCache serves
+    /// from host or peers into the tree, extending the prefix.
+    fn load_hicache_hits(
+        &mut self,
+        token_ids: &[u64],
+        prefix_len: &mut usize,
+        last_node: &mut NodeId,
+    ) -> PrefixHits {
+        self.flush_events();
+        let Some(hicache) = self.hicache.as_mut() else {
+            return PrefixHits::default();
+        };
+        let hits = hicache.take_prefix(token_ids, *prefix_len);
+        let loaded = hits.host_tokens + hits.peer_tokens;
+        if loaded > 0 {
+            let end = *prefix_len + loaded;
+            let mut indices = self.collect_path_indices(*last_node);
+            indices.extend(
+                self.cache
+                    .token_pool
+                    .allocate(loaded)
+                    .expect("slots checked"),
+            );
+            self.cache.insert(&token_ids[..end], &indices);
+            (*prefix_len, *last_node) = self.cache.match_prefix(&token_ids[..end]);
+        }
+        hits
+    }
+
+    /// Baseten HiCache, if enabled.
+    pub fn hicache_mut(&mut self) -> Option<&mut HiCache> {
+        self.hicache.as_mut()
+    }
+
+    /// Tokens of `token_ids` a fresh request would reuse, including Baseten
+    /// HiCache host and peer pages, or `None` while its peer read is pending.
+    pub fn peek_prefix_len(&mut self, request: u128, token_ids: &[u64]) -> Option<usize> {
+        let device = self.cache.prefix_match_len(token_ids);
+        let Some(h) = self.hicache.as_mut() else {
+            return Some(device);
+        };
+        let pending = h.prefetch_pending(request, token_ids, device);
+        (!pending).then(|| device + h.peek_prefix(token_ids, device))
     }
 
     /// Continue an in-flight request from an already materialized prefix.
@@ -117,17 +185,13 @@ impl SglangKvManager {
         kv_indices.extend_from_slice(&new_indices);
 
         self.cache.inc_lock_ref(last_node);
-
-        let parent_hash = kv_indices
-            .get(prefix_len.wrapping_sub(1))
-            .and_then(|&idx| self.idx_to_block_hash.get(&idx).copied());
-        self.publish_stored_event(&token_ids[prefix_len..], &new_indices, parent_hash);
         self.log_trace("allocation", new_tokens);
 
         Some(AllocResult {
             prefix_len,
             kv_indices,
             last_node,
+            hicache_hits: PrefixHits::default(),
         })
     }
 
@@ -141,8 +205,18 @@ impl SglangKvManager {
         kv_indices: &[usize],
         last_node: NodeId,
     ) {
+        // Like SGLang, free slots computed for tokens the tree already holds
+        // (a fully cached prompt recomputes its last page).
+        let (_, cached_node) = self.cache.match_prefix(token_ids);
+        let cached = self.collect_path_indices(cached_node);
+        let duplicates: Vec<usize> = (cached.iter().zip(kv_indices))
+            .filter(|(tree, own)| tree != own)
+            .map(|(_, &own)| own)
+            .collect();
+        self.free_indices(&duplicates);
         self.cache.insert(token_ids, kv_indices);
         self.cache.dec_lock_ref(last_node);
+        self.flush_events();
     }
 
     /// Cache a partial sequence after a chunked prefill step.
@@ -167,19 +241,16 @@ impl SglangKvManager {
         // Transfer lock: release old path, protect new path
         self.cache.dec_lock_ref(last_node);
         self.cache.inc_lock_ref(new_last_node);
+        self.flush_events();
 
         new_last_node
     }
 
-    /// Allocate a single token slot for decode output and publish a BlockStored event.
-    /// `last_idx` is the request's previous pool index for chaining block_hash.
-    pub fn allocate_decode_token(&mut self, last_idx: Option<usize>) -> Option<usize> {
+    /// Allocate a single token slot for decode output.
+    pub fn allocate_decode_token(&mut self) -> Option<usize> {
         let indices = self.cache.token_pool.allocate(1)?;
-        let idx = indices[0];
-        let parent_hash = last_idx.and_then(|i| self.idx_to_block_hash.get(&i).copied());
-        self.publish_stored_event(&[], &[idx], parent_hash);
         self.log_trace("allocation", 1);
-        Some(idx)
+        Some(indices[0])
     }
 
     /// Free a request without caching (e.g., aborted request).
@@ -189,51 +260,33 @@ impl SglangKvManager {
         self.cache.dec_lock_ref(last_node);
     }
 
-    /// Return request-owned token slots to the free pool and publish matching
-    /// removal events for any slots that were previously advertised to the router.
+    /// Return request-owned token slots (never in the tree) to the free pool.
     pub fn free_indices(&mut self, indices: &[usize]) {
         if indices.is_empty() {
             return;
         }
-
         self.cache.token_pool.free(indices);
-        self.publish_removed_event(indices);
         self.log_trace("free", indices.len());
     }
 
     /// Collect token indices from the matched prefix path by walking root→last_node.
     fn collect_path_indices(&self, last_node: NodeId) -> Vec<usize> {
-        if last_node == self.cache.root() {
-            return Vec::new();
-        }
-
-        // Walk from last_node to root, collecting node IDs
         let mut path = Vec::new();
         let mut current = last_node;
-        loop {
-            let node = self.cache.node(current);
-            if node.parent.is_none() {
-                break;
-            }
+        while let Some(parent) = self.cache.node(current).parent {
             path.push(current);
-            current = node.parent.unwrap();
+            current = parent;
         }
-        path.reverse();
-
-        // Collect token indices from each node's value
-        let mut indices = Vec::new();
-        for node_id in path {
-            indices.extend_from_slice(&self.cache.node(node_id).value);
-        }
-        indices
+        path.iter()
+            .rev()
+            .flat_map(|&id| self.cache.node(id).value.iter().copied())
+            .collect()
     }
 
     /// Evict tokens from the cache, publish BlockRemoved events, and log a trace.
     pub fn evict(&mut self, num_tokens: usize) {
-        let (evicted, evicted_indices) = self.cache.evict(num_tokens);
-        if !evicted_indices.is_empty() {
-            self.publish_removed_event(&evicted_indices);
-        }
+        let (evicted, _) = self.cache.evict(num_tokens);
+        self.flush_events();
         self.log_trace("eviction", evicted);
     }
 
@@ -250,112 +303,41 @@ impl SglangKvManager {
         });
     }
 
-    fn publish_stored_event(
-        &mut self,
-        token_ids: &[u64],
-        indices: &[usize],
-        parent_hash: Option<ExternalSequenceBlockHash>,
-    ) {
-        if indices.is_empty() {
-            return;
+    /// Publish queued tree changes, and Baseten HiCache's host-tier changes,
+    /// to the router.
+    fn flush_events(&mut self) {
+        for (data, token_ids) in std::mem::take(&mut self.cache.events) {
+            if let Some(hicache) = self.hicache.as_mut() {
+                hicache.on_device_event(&data, token_ids.as_deref());
+            }
+            self.publish(data, token_ids, StorageTier::Device);
         }
-        let mut computed_blocks = Vec::with_capacity(indices.len());
-        let mut running_hash = parent_hash.map_or(0u64, |h| h.0);
-        for (i, &idx) in indices.iter().enumerate() {
-            // tokens_hash: per-token content hash for router prefix matching
-            let token = token_ids.get(i).copied().unwrap_or(idx as u64);
-            let token_bytes = token.to_le_bytes();
-            let tokens_hash = dynamo_kv_router::protocols::compute_block_hash(&token_bytes);
-
-            // block_hash: cumulative hash (parent_hash, token_id) so it's unique
-            // per position and uniform across workers with the same token sequence.
-            let mut hasher = DefaultHasher::new();
-            running_hash.hash(&mut hasher);
-            tokens_hash.0.hash(&mut hasher);
-            running_hash = hasher.finish();
-            let block_hash = ExternalSequenceBlockHash(running_hash);
-
-            self.idx_to_block_hash.insert(idx, block_hash);
-            *self.block_hash_refcounts.entry(block_hash).or_default() += 1;
-            computed_blocks.push(KvCacheStoredBlockData {
-                block_hash,
-                tokens_hash,
-                mm_extra_info: None,
-            });
-        }
-
-        if self.kv_event_publishers.is_empty() {
-            return;
-        }
-
-        let first_new = computed_blocks.iter().position(|block| {
-            self.block_hash_refcounts
-                .get(&block.block_hash)
-                .copied()
-                .unwrap_or_default()
-                == 1
-        });
-        let Some(first_new) = first_new else {
-            return;
-        };
-
-        let parent_hash = if first_new == 0 {
-            parent_hash
-        } else {
-            Some(computed_blocks[first_new - 1].block_hash)
-        };
-        let blocks = computed_blocks.into_iter().skip(first_new).collect();
-
-        let event = KvCacheEvent {
-            event_id: self.next_event_id,
-            data: KvCacheEventData::Stored(KvCacheStoreData {
-                parent_hash,
-                start_position: None,
-                blocks,
-            }),
-            dp_rank: self.dp_rank,
-        };
-        self.next_event_id += 1;
-
-        if let Err(e) = self.kv_event_publishers.publish(event, None) {
-            tracing::warn!("Failed to publish SGLang KV event: {e}");
+        let host_events = self.hicache.as_mut().map(HiCache::drain_events);
+        for (data, token_ids) in host_events.into_iter().flatten() {
+            self.publish(data, token_ids, StorageTier::HostPinned);
         }
     }
 
-    fn publish_removed_event(&mut self, evicted_indices: &[usize]) {
+    fn publish(
+        &mut self,
+        data: KvCacheEventData,
+        token_ids: Option<Vec<Vec<u32>>>,
+        tier: StorageTier,
+    ) {
         if self.kv_event_publishers.is_empty() {
             return;
         }
-
-        let mut block_hashes = Vec::new();
-        for &idx in evicted_indices {
-            let Some(block_hash) = self.idx_to_block_hash.remove(&idx) else {
-                continue;
-            };
-            let Some(refcount) = self.block_hash_refcounts.get_mut(&block_hash) else {
-                continue;
-            };
-            if *refcount > 1 {
-                *refcount -= 1;
-                continue;
-            }
-            self.block_hash_refcounts.remove(&block_hash);
-            block_hashes.push(block_hash);
-        }
-
-        if block_hashes.is_empty() {
-            return;
-        }
-
         let event = KvCacheEvent {
             event_id: self.next_event_id,
-            data: KvCacheEventData::Removed(KvCacheRemoveData { block_hashes }),
+            data,
             dp_rank: self.dp_rank,
         };
         self.next_event_id += 1;
-
-        if let Err(e) = self.kv_event_publishers.publish(event, None) {
-            tracing::warn!("Failed to publish SGLang KV remove event: {e}");
+        if let Err(e) =
+            self.kv_event_publishers
+                .publish_with_storage_tier(event, token_ids.as_deref(), tier)
+        {
+            tracing::warn!("Failed to publish SGLang KV event: {e}");
         }
     }
 }
@@ -393,6 +375,17 @@ mod tests {
             self.events.lock().unwrap().push(event);
             Ok(())
         }
+    }
+
+    fn manager_with_sink(total: usize, page: usize) -> (SglangKvManager, Arc<MockSink>) {
+        let sink = Arc::new(MockSink::new());
+        let mgr = SglangKvManager::new(
+            total,
+            page,
+            KvEventPublishers::new(Some(sink.clone()), None),
+            0,
+        );
+        (mgr, sink)
     }
 
     #[test]
@@ -434,47 +427,61 @@ mod tests {
 
     #[test]
     fn test_event_publishing() {
-        let sink = Arc::new(MockSink::new());
-        let mut mgr =
-            SglangKvManager::new(100, 1, KvEventPublishers::new(Some(sink.clone()), None), 0);
+        let (mut mgr, sink) = manager_with_sink(100, 1);
 
+        // Like SGLang, pages are published when inserted into the tree.
         let r = mgr.allocate_for_request(&[1, 2, 3]).unwrap();
-        assert_eq!(sink.event_count(), 1); // BlockStored for 3 new pages
-
+        assert_eq!(sink.event_count(), 0);
         mgr.cache_finished_req(&[1, 2, 3], &r.kv_indices, r.last_node);
+        let events = sink.clone_events();
+        let [
+            KvCacheEvent {
+                data: KvCacheEventData::Stored(store),
+                ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one stored event, got {events:?}");
+        };
+        assert_eq!(store.blocks.len(), 3);
 
         // Second request with full cache hit → no new events
         let r2 = mgr.allocate_for_request(&[1, 2, 3]).unwrap();
         assert_eq!(r2.prefix_len, 3);
-        assert_eq!(sink.event_count(), 1); // no new event
+        assert_eq!(sink.event_count(), 1);
     }
 
     #[test]
-    fn test_duplicate_logical_blocks_publish_once_and_remove_once() {
-        let sink = Arc::new(MockSink::new());
-        let mut mgr =
-            SglangKvManager::new(100, 1, KvEventPublishers::new(Some(sink.clone()), None), 0);
-
-        let req1 = mgr.allocate_for_request(&[1, 2, 3]).unwrap();
-        let req2 = mgr.allocate_for_request(&[1, 2, 3]).unwrap();
+    fn test_page_hashes_match_router_and_removals_reuse_them() {
+        let (mut mgr, sink) = manager_with_sink(100, 4);
+        let tokens: Vec<u64> = (100..108).collect();
+        let r = mgr.allocate_for_request(&tokens).unwrap();
+        mgr.cache_finished_req(&tokens, &r.kv_indices, r.last_node);
+        mgr.evict(8);
 
         let events = sink.clone_events();
-        assert_eq!(events.len(), 1);
         let KvCacheEventData::Stored(store) = &events[0].data else {
             panic!("expected stored event");
         };
-        assert_eq!(store.blocks.len(), 3);
+        let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let router = dynamo_kv_router::protocols::compute_block_hash_for_seq(
+            &tokens_u32,
+            4,
+            Default::default(),
+        );
+        let locals: Vec<_> = store.blocks.iter().map(|b| b.tokens_hash).collect();
+        assert_eq!(locals, router);
+        let seqs: Vec<_> = store.blocks.iter().map(|b| b.block_hash.0).collect();
+        assert_eq!(
+            seqs,
+            dynamo_kv_router::protocols::compute_seq_hash_for_block(&router)
+        );
 
-        mgr.free_indices(&req1.kv_indices);
-        assert_eq!(sink.event_count(), 1);
-
-        mgr.free_indices(&req2.kv_indices);
-        let events = sink.clone_events();
-        assert_eq!(events.len(), 2);
         let KvCacheEventData::Removed(remove) = &events[1].data else {
             panic!("expected removed event");
         };
-        assert_eq!(remove.block_hashes.len(), 3);
+        let stored: Vec<_> = store.blocks.iter().map(|b| b.block_hash).collect();
+        assert_eq!(remove.block_hashes, stored);
     }
 
     #[test]
@@ -489,53 +496,31 @@ mod tests {
 
     #[test]
     fn test_chunked_prefill_parent_hash() {
-        let sink = Arc::new(MockSink::new());
-        let mut mgr =
-            SglangKvManager::new(32, 1, KvEventPublishers::new(Some(sink.clone()), None), 0);
+        let (mut mgr, sink) = manager_with_sink(32, 1);
         let tokens = [11, 22, 33, 44, 55, 66];
-        let chunk1_len = 3;
-        let chunk2_len = 6;
 
-        let alloc1 = mgr.allocate_for_request(&tokens[..chunk1_len]).unwrap();
-        let new_last =
-            mgr.cache_unfinished_req(&tokens[..chunk1_len], &alloc1.kv_indices, alloc1.last_node);
+        let alloc1 = mgr.allocate_for_request(&tokens[..3]).unwrap();
+        let last = mgr.cache_unfinished_req(&tokens[..3], &alloc1.kv_indices, alloc1.last_node);
+        let alloc2 = mgr
+            .allocate_after_prefix(&tokens, 3, &alloc1.kv_indices, last)
+            .unwrap();
+        mgr.free_request(last);
+        mgr.cache_unfinished_req(&tokens, &alloc2.kv_indices, alloc2.last_node);
 
-        let alloc2 = mgr.allocate_for_request(&tokens[..chunk2_len]).unwrap();
-        mgr.free_request(new_last);
-
-        let events = sink.events.lock().unwrap();
+        let events = sink.clone_events();
         assert_eq!(events.len(), 2, "expected two stored events");
-
         let KvCacheEventData::Stored(store1) = &events[0].data else {
             panic!("expected first event to be Stored");
         };
         let KvCacheEventData::Stored(store2) = &events[1].data else {
             panic!("expected second event to be Stored");
         };
-
-        assert!(
-            store1.parent_hash.is_none(),
-            "first chunk should start from the root"
-        );
-
-        let last_block_hash = store1
-            .blocks
-            .last()
-            .expect("first chunk should store at least one block")
-            .block_hash;
-        assert_eq!(
-            store2.parent_hash,
-            Some(last_block_hash),
-            "second chunk should chain from the last block of chunk 1"
-        );
+        assert!(store1.parent_hash.is_none());
+        assert_eq!(store2.parent_hash, Some(store1.blocks[2].block_hash));
         assert_eq!(
             store2.blocks.len(),
-            chunk2_len - chunk1_len,
+            3,
             "second chunk should only emit new blocks"
-        );
-        assert_eq!(
-            alloc2.prefix_len, chunk1_len,
-            "second chunk should reuse the cached partial prefix"
         );
     }
 }

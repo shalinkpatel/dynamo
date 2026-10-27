@@ -169,8 +169,7 @@ pub(super) fn simulate_decode_step(
         }
 
         let crossing_page_boundary = req.current_sequence_len() + 1 > req.allocated_tokens;
-        let last_idx = req.kv_indices.last().copied();
-        let Some(new_idx) = kv_manager.allocate_decode_token(last_idx) else {
+        let Some(new_idx) = kv_manager.allocate_decode_token() else {
             tracing::warn!(uuid = %req.uuid, "Failed to allocate decode token, skipping output");
             continue;
         };

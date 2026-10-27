@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "baseten-mocker"
+description = "Baseten extensions for the Dynamo mocker: SGLang HiCache host tier and G2PB peer reads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Live G2PB peer directory on the real G2Direct replica index (no NIXL).
+g2direct = ["dep:anyhow", "dep:dynamo-g2direct", "dep:dynamo-runtime", "dep:uuid"]
+
+[dependencies]
+dynamo-kv-router = { workspace = true }
+dynamo-tokens = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+anyhow = { workspace = true, optional = true }
+dynamo-g2direct = { workspace = true, features = ["index"], optional = true }
+dynamo-runtime = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

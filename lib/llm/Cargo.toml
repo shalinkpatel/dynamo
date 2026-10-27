@@ -59,6 +59,7 @@ required-features = ["agent-trace-bench"]
 [dependencies]
 baseten-configmap = { workspace = true }
 # repo
+baseten-mocker = { workspace = true, features = ["g2direct"] }
 dynamo-kv-router = { workspace = true, features = ["metrics", "runtime-protocols"] }
 dynamo-memory = { workspace = true }
 dynamo-mocker = { workspace = true }
