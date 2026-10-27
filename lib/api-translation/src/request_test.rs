@@ -120,7 +120,15 @@ fn anthropic_message(v: Value) -> AnthropicMessage {
 /// The CC messages one Anthropic message translates to, in the wire form fed back to the model.
 fn translated(message: &AnthropicMessage) -> Vec<Value> {
     let mut cc_messages = Vec::new();
-    translate_message(message, 0, &mut cc_messages, false, &mut Losses::default()).unwrap();
+    translate_message(
+        message,
+        0,
+        &mut cc_messages,
+        false,
+        &DeclaredTools::new(&[]),
+        &mut Losses::default(),
+    )
+    .unwrap();
     cc_messages
         .iter()
         .map(|m| serde_json::to_value(m).unwrap())
@@ -329,41 +337,83 @@ fn tool_result_image_block_becomes_cc_image_part() {
     );
 }
 
-/// Anthropic tool search (Claude Code ToolSearch): `tool_reference` blocks reach the chat
-/// template as typed parts, so it can expand the deferred tool's schema, instead of JSON text.
+fn tool_reference_result(references: Value) -> Value {
+    let adapted = adapt_messages_body(json!({
+        "tools": [
+            {"name": "Read", "input_schema": {"type": "object", "properties": {}}},
+            {"name": "mcp__slack__read_thread", "description": "read a <thread> & \"reply\"",
+             "input_schema": {"type": "object", "properties": {"ts": {"type": "string"}}},
+             "defer_loading": true, "strict": true},
+        ],
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": references},
+            ]},
+        ],
+    }))
+    .unwrap();
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["messages"][2]["role"], "tool");
+    cc["messages"][2]["content"].clone()
+}
+
+/// Claude Code ToolSearch answers with `tool_reference` blocks. A declared deferred tool reaches
+/// the model as its schema text in a string tool message (Kimi-K3 and gpt-oss-120b reject a CC
+/// `tool_reference` part, BT-16618), in the envelope the GLM template renders for that part:
+/// `defer_loading`/`strict` stripped, HTML-significant characters escaped.
 #[test]
-fn b10_tool_result_tool_reference_blocks_become_tool_reference_parts() {
-    let msg = anthropic_message(json!({"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": "t1", "content": [
-            {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
-            {"type": "tool_reference", "tool_name": "mcp__slack__read_channel"},
-        ]},
-    ]}));
-    let out = translated(&msg);
+fn b10_tool_result_deferred_tool_reference_renders_its_schema() {
+    let content = tool_reference_result(json!([
+        {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
+    ]));
     assert_eq!(
-        out,
-        vec![json!({"role": "tool", "tool_call_id": "t1", "content": [
-            {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
-            {"type": "tool_reference", "tool_name": "mcp__slack__read_channel"},
-        ]})]
+        content,
+        concat!(
+            "<tools>\n",
+            r#"{"name": "mcp__slack__read_thread", "#,
+            r#""description": "read a \u003cthread\u003e \u0026 \"reply\"", "#,
+            r#""parameters": {"type":"object","properties":{"ts":{"type":"string"}}}}"#,
+            "\n</tools>",
+        )
     );
 }
 
-/// References mixed with text stay coerced text: the GLM template expands references only when
-/// they lead the content, so typed parts would drop the text or the pointer.
+/// A non-deferred tool's schema is already in the prompt: its reference adds nothing.
 #[test]
-fn b10_tool_result_tool_reference_mixed_with_text_stays_text() {
-    let msg = anthropic_message(json!({"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": "t1", "content": [
-            {"type": "text", "text": "Found:"},
-            {"type": "tool_reference", "tool_name": "lookup_stock"},
-        ]},
-    ]}));
-    let out = translated(&msg);
-    assert_eq!(out.len(), 1);
-    let content = out[0]["content"].as_str().expect("flat text content");
-    assert!(content.starts_with("Found:\n"), "content: {content}");
-    assert!(content.contains("lookup_stock"), "content: {content}");
+fn b10_tool_result_non_deferred_tool_reference_renders_nothing() {
+    let content = tool_reference_result(json!([
+        {"type": "tool_reference", "tool_name": "Read"},
+    ]));
+    assert_eq!(content, "");
+}
+
+/// A reference to a tool this request no longer declares (history compaction) renders a short
+/// absence line instead of failing the turn.
+#[test]
+fn b10_tool_result_undeclared_tool_reference_renders_an_absence_line() {
+    let content = tool_reference_result(json!([
+        {"type": "tool_reference", "tool_name": "mcp__gone__tool"},
+    ]));
+    assert_eq!(content, r#"[tool "mcp__gone__tool" not available]"#);
+}
+
+/// Text keeps its place among references; a skipped reference leaves no blank line.
+#[test]
+fn b10_tool_result_tool_references_mixed_with_text_keep_their_order() {
+    let content = tool_reference_result(json!([
+        {"type": "text", "text": "Found:"},
+        {"type": "tool_reference", "tool_name": "Read"},
+        {"type": "tool_reference", "tool_name": "mcp__gone__tool"},
+        {"type": "text", "text": "done"},
+    ]));
+    assert_eq!(
+        content,
+        "Found:\n[tool \"mcp__gone__tool\" not available]\ndone"
+    );
 }
 
 /// A `tool_reference` without a string `tool_name` is not a reference: it stays coerced text.
@@ -404,9 +454,16 @@ fn tool_result_unknown_image_source_is_refused() {
         ]},
     ]}));
     let mut cc_messages = Vec::new();
-    let refusal = translate_message(&msg, 0, &mut cc_messages, false, &mut Losses::default())
-        .err()
-        .unwrap();
+    let refusal = translate_message(
+        &msg,
+        0,
+        &mut cc_messages,
+        false,
+        &DeclaredTools::new(&[]),
+        &mut Losses::default(),
+    )
+    .err()
+    .unwrap();
     assert!(
         matches!(refusal, RequestRejection::Unsupported(_)),
         "refusal: {refusal}"
@@ -840,14 +897,29 @@ fn untranslatable_user_block_is_skipped_by_default_and_refused_under_strict_hook
         {"type": "thinking", "thinking": "hm", "signature": ""},
     ]}));
     let mut lenient = Vec::new();
-    translate_message(&msg, 0, &mut lenient, false, &mut Losses::default()).unwrap();
+    translate_message(
+        &msg,
+        0,
+        &mut lenient,
+        false,
+        &DeclaredTools::new(&[]),
+        &mut Losses::default(),
+    )
+    .unwrap();
     assert_eq!(lenient.len(), 1);
     assert_eq!(
         serde_json::to_value(&lenient[0]).unwrap()["content"],
         "what is this"
     );
-    let err = translate_message(&msg, 0, &mut Vec::new(), true, &mut Losses::default())
-        .expect_err("strict: refused");
+    let err = translate_message(
+        &msg,
+        0,
+        &mut Vec::new(),
+        true,
+        &DeclaredTools::new(&[]),
+        &mut Losses::default(),
+    )
+    .expect_err("strict: refused");
     assert!(err.detail().contains("thinking"), "{err}");
 }
 
@@ -1512,6 +1584,47 @@ fn adapt_responses_function_output_without_call_id_is_refused() {
     .err()
     .unwrap();
     assert!(error.detail().contains("requires `call_id`"), "{error}");
+}
+
+/// A malformed typeless message is refused by the parser for its role: an assistant message by
+/// `MessageItem`, any other role by `EasyInputMessage`, which names the failing member.
+#[test]
+fn adapt_responses_typeless_message_errors_come_from_the_role_parser() {
+    for (message, detail) in [
+        (
+            json!({"role": "assistant", "content": [{"type": "output_text"}]}),
+            "invalid Responses request at `input[0]`: data did not match any variant of untagged enum MessageItem",
+        ),
+        (
+            json!({"role": "user", "content": 42}),
+            "invalid Responses request at `input[0].content`: data did not match any variant of untagged enum EasyInputContent",
+        ),
+    ] {
+        let error = adapt_responses_body(json!({"input": [message]}))
+            .err()
+            .unwrap();
+        assert_eq!(error.detail(), detail);
+    }
+}
+
+/// A replayed assistant message may omit `type` (it is optional in the spec) and carry an `id`.
+/// Untagged, `InputItem` reads the first as no variant and the second as an `item_reference`.
+#[test]
+fn adapt_responses_typeless_assistant_message_reaches_the_model() {
+    for message in [
+        json!({"role": "assistant", "content": [{"type": "output_text", "text": "done"}]}),
+        json!({"id": "msg_1", "role": "assistant", "content": [{"type": "output_text", "text": "done", "annotations": []}]}),
+        json!({"id": "msg_1", "role": "assistant", "content": "done"}),
+    ] {
+        let adapted = adapt_responses_body(json!({"input": [
+            {"role": "user", "content": "hi"},
+            message,
+        ]}))
+        .unwrap();
+        let cc = serde_json::to_value(&adapted.request).unwrap();
+        assert_eq!(cc["messages"][1]["role"], "assistant");
+        assert_eq!(cc["messages"][1]["content"], "done");
+    }
 }
 
 #[test]

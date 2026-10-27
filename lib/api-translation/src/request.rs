@@ -22,6 +22,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use http::HeaderMap;
@@ -34,16 +35,16 @@ use dynamo_protocols::types::anthropic::{
     DocumentSource, SearchResultBlock, ThinkingConfig, ToolResultContent, ToolResultContentBlock,
 };
 use dynamo_protocols::types::responses::{
-    AgentMessageInputContent, AgentMessageItemParam, EasyInputContent, FunctionCallOutput,
-    InputContent, InputItem, InputRole, Item, MessageItem, ReasoningItemContent, ResponseTextParam,
-    Role as ResponsesRole, ServiceTierResponses as ResponsesServiceTier, SummaryPart,
-    TextResponseFormatConfiguration, Tool as ResponsesTool, ToolChoiceFunction, ToolChoiceOptions,
-    ToolChoiceParam, UpstreamImageDetail,
+    AgentMessageInputContent, AgentMessageItemParam, EasyInputContent, EasyInputMessage,
+    FunctionCallOutput, InputContent, InputItem, InputRole, Item, MessageItem,
+    ReasoningItemContent, ResponseTextParam, Role as ResponsesRole,
+    ServiceTierResponses as ResponsesServiceTier, SummaryPart, TextResponseFormatConfiguration,
+    Tool as ResponsesTool, ToolChoiceFunction, ToolChoiceOptions, ToolChoiceParam,
+    UpstreamImageDetail,
 };
 use dynamo_protocols::types::{
     ChatCompletionNamedToolChoice, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestMessageContentPartToolReference, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
@@ -58,6 +59,7 @@ use crate::history::{AssistantMessageBuffer, tool_result_message};
 use crate::hooks::{IngressHooks, ToolDisposition};
 use crate::loss::{Loss, LossKind, Losses};
 use crate::model::{ReactCapSource, RequestRejection, ToolCall};
+use crate::tool_schema_render::{may_be_fix_tool_schema, tool_schema_text};
 use crate::{
     CcMessage, CcRequest, ClientProtocol, MCP_CALL_ID_PREFIX, SERVER_TOOL_USE_ID_PREFIX,
     strip_item_id_prefix,
@@ -740,12 +742,23 @@ fn adapt_messages(
         cc_messages.push(text_message(&AnthropicRole::System, system)?);
     }
     let strict = hooks.rejects_unsupported_messages_features();
+    let (cc_tools, claimed_names) = expand_declared_tools(
+        hooks,
+        dropped,
+        ClientProtocol::Messages,
+        messages_request.tools,
+        is_anthropic_server_tool_shaped,
+        client_function_tool,
+    )?;
+
+    let declared_tools = DeclaredTools::new(&cc_tools);
     for (message_index, message) in messages_request.messages.iter().enumerate() {
         translate_message(
             message,
             message_index,
             &mut cc_messages,
             strict,
+            &declared_tools,
             &mut dropped.losses,
         )?;
     }
@@ -765,15 +778,6 @@ fn adapt_messages(
     // Post-normalization (after `srvtoolu_` prefix stripping) so replayed server-tool pairs still
     // match; over the translated CC messages so it covers the whole transcript.
     validate_tool_results_have_tool_use(&cc_messages)?;
-
-    let (cc_tools, claimed_names) = expand_declared_tools(
-        hooks,
-        dropped,
-        ClientProtocol::Messages,
-        messages_request.tools,
-        is_anthropic_server_tool_shaped,
-        client_function_tool,
-    )?;
 
     let (tool_choice, parallel_tool_calls) = messages_request
         .tool_choice
@@ -1111,6 +1115,7 @@ fn translate_message(
     message_index: usize,
     cc_messages: &mut Vec<CcMessage>,
     strict_blocks: bool,
+    declared_tools: &DeclaredTools<'_>,
     losses: &mut Losses,
 ) -> Result<(), RequestRejection> {
     let blocks = match &message.content {
@@ -1150,6 +1155,7 @@ fn translate_message(
                         tool_use_id,
                         content.as_ref(),
                         &format!("messages[{message_index}].content[{block_index}]"),
+                        declared_tools,
                         losses,
                     )?);
                 }
@@ -1226,6 +1232,7 @@ fn translate_message(
                     tool_use_id,
                     content.as_ref(),
                     &format!("messages[{message_index}].content[{block_index}]"),
+                    declared_tools,
                     losses,
                 )?);
             }
@@ -1416,6 +1423,7 @@ fn echoed_tool_result(
     tool_use_id: &str,
     content: Option<&ToolResultContent>,
     field: &str,
+    declared_tools: &DeclaredTools<'_>,
     losses: &mut Losses,
 ) -> Result<CcMessage, RequestRejection> {
     // The vendored block type makes `tool_use_id` mandatory; empty is still a value TB must not
@@ -1428,7 +1436,7 @@ fn echoed_tool_result(
     Ok(tool_result_message(
         tool_use_id.to_string(),
         content
-            .map(|content| tool_result_content(content, field, losses))
+            .map(|content| tool_result_content(content, field, declared_tools, losses))
             .transpose()?
             .unwrap_or_default(),
     ))
@@ -1437,6 +1445,7 @@ fn echoed_tool_result(
 fn tool_result_content(
     content: &ToolResultContent,
     field: &str,
+    declared_tools: &DeclaredTools<'_>,
     losses: &mut Losses,
 ) -> Result<ChatCompletionRequestToolMessageContent, RequestRejection> {
     let blocks = match content {
@@ -1445,31 +1454,6 @@ fn tool_result_content(
         }
         ToolResultContent::Blocks(blocks) => blocks,
     };
-    // Anthropic tool search: a result made only of `tool_reference` blocks reaches the chat
-    // template as typed parts, so it expands each deferred tool's schema in place. The GLM
-    // template expands references only when they lead the content, so a mix with text stays
-    // coerced text below rather than losing the text or the pointer.
-    let references: Option<Vec<_>> = blocks
-        .iter()
-        .map(|block| match block {
-            ToolResultContentBlock::Other(value) => tool_reference_name(value),
-            _ => None,
-        })
-        .collect();
-    if let Some(names) = references.filter(|names| !names.is_empty()) {
-        return Ok(ChatCompletionRequestToolMessageContent::Array(
-            names
-                .into_iter()
-                .map(|tool_name| {
-                    ChatCompletionRequestToolMessageContentPart::ToolReference(
-                        ChatCompletionRequestMessageContentPartToolReference {
-                            tool_name: tool_name.to_string(),
-                        },
-                    )
-                })
-                .collect(),
-        ));
-    }
     let mut text_parts: Vec<String> = Vec::new();
     let mut parts: Vec<ChatCompletionRequestToolMessageContentPart> = Vec::new();
     let mut has_image = false;
@@ -1519,7 +1503,13 @@ fn tool_result_content(
                 // Fork parity: carried as coerced text, not refused — small blocks pass through
                 // as compact JSON so the model keeps the pointers, oversized ones become a
                 // one-line placeholder so base64 payloads can't balloon the prompt.
-                let block_text = coerce_unknown_block(value, field, losses);
+                let block_text = match tool_reference_name(value) {
+                    Some(tool_name) => match declared_tools.render_reference(tool_name) {
+                        Some(reference_text) => reference_text,
+                        None => continue,
+                    },
+                    None => coerce_unknown_block(value, field, losses),
+                };
                 text_parts.push(block_text.clone());
                 parts.push(ChatCompletionRequestToolMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
@@ -1545,6 +1535,43 @@ fn tool_reference_name(value: &Value) -> Option<&str> {
         return None;
     }
     value.get("tool_name").and_then(Value::as_str)
+}
+
+/// The declared tools a `tool_reference` can name. A reference reaches the model as text, never as
+/// a CC `tool_reference` part: Kimi-K3 (500) and gpt-oss-120b (400) reject that part.
+// TODO(BT-16618): send the `tool_reference` part once every backend accepts it.
+struct DeclaredTools<'a> {
+    by_name: HashMap<&'a str, &'a ChatCompletionTool>,
+}
+
+impl<'a> DeclaredTools<'a> {
+    fn new(cc_tools: &'a [ChatCompletionTool]) -> Self {
+        Self {
+            by_name: cc_tools
+                .iter()
+                .map(|tool| (tool.function.name.as_str(), tool))
+                .collect(),
+        }
+    }
+
+    /// `None` for a non-deferred tool: its schema is already in the prompt. A stale reference
+    /// (history compaction) renders a line rather than failing the turn, so the model does not
+    /// call a tool this request no longer declares.
+    fn render_reference(&self, tool_name: &str) -> Option<String> {
+        let Some(tool) = self.by_name.get(tool_name) else {
+            return Some(format!("[tool {tool_name:?} not available]"));
+        };
+        if tool.defer_loading != Some(true) {
+            return None;
+        }
+        let Value::Object(mut function) =
+            serde_json::to_value(&tool.function).expect("a FunctionObject always serializes")
+        else {
+            unreachable!("a struct serializes to a JSON object")
+        };
+        may_be_fix_tool_schema(&mut function);
+        Some(tool_schema_text(&function))
+    }
 }
 
 /// Ceiling for passing an unknown no-text block through as raw JSON. Above this the block becomes
@@ -1679,6 +1706,55 @@ enum ResponsesInput {
 impl Default for ResponsesInput {
     fn default() -> Self {
         Self::Text(String::new())
+    }
+}
+
+/// Dispatch on `type`, as the spec's `InputItem` discriminator does. Untagged, `ItemReference`
+/// comes first and needs only `id`, so it absorbs every typeless message with an `id`; and the
+/// tagged `Item` arm needs `type`, so a typeless assistant message with `output_text` parts
+/// matches no variant at all.
+fn parse_responses_input_item(
+    enclosing_member: &str,
+    item: Value,
+) -> Result<InputItem, RequestRejection> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("item_reference") => {
+            parse_client_json(ClientProtocol::Responses, enclosing_member, item)
+                .map(InputItem::ItemReference)
+        }
+        // `ItemReference.type` is optional in the spec, so a bare `id` is one too.
+        None if item.get("id").is_some()
+            && item.get("role").is_none()
+            && item.get("content").is_none() =>
+        {
+            parse_client_json(ClientProtocol::Responses, enclosing_member, item)
+                .map(InputItem::ItemReference)
+        }
+        // Both message variants answer to `message` (and to its absence), so try each.
+        Some("message") | None => {
+            let is_assistant = item.get("role").and_then(Value::as_str) == Some("assistant");
+            parse_client_json::<EasyInputMessage>(
+                ClientProtocol::Responses,
+                enclosing_member,
+                item.clone(),
+            )
+            .map(InputItem::EasyMessage)
+            .or_else(|easy_message_rejection| {
+                parse_client_json::<MessageItem>(ClientProtocol::Responses, enclosing_member, item)
+                    .map(|message| InputItem::Item(Item::Message(message)))
+                    // Only `assistant` reaches `MessageItem::Output`; the other roles are
+                    // `EasyInputMessage`'s, so its rejection is the one that names their fault.
+                    .map_err(|message_item_rejection| {
+                        if is_assistant {
+                            message_item_rejection
+                        } else {
+                            easy_message_rejection
+                        }
+                    })
+            })
+        }
+        Some(_) => parse_client_json(ClientProtocol::Responses, enclosing_member, item)
+            .map(InputItem::Item),
     }
 }
 
@@ -1823,9 +1899,7 @@ fn adapt_responses(
             let items = items
                 .into_iter()
                 .enumerate()
-                .map(|(index, item)| {
-                    parse_client_json(ClientProtocol::Responses, &format!("input[{index}]"), item)
-                })
+                .map(|(index, item)| parse_responses_input_item(&format!("input[{index}]"), item))
                 .collect::<Result<Vec<InputItem>, _>>()?;
             let additional_tools =
                 translate_input_items(&items, &mut cc_messages, &mut dropped.losses)

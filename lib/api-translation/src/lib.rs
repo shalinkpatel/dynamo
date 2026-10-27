@@ -20,6 +20,7 @@ pub mod model;
 pub mod request;
 pub mod sse_emitter;
 pub mod sse_parser;
+pub mod tool_schema_render;
 
 pub(crate) mod util;
 pub(crate) mod wire;

@@ -1478,30 +1478,18 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_tool_reference_blocks_become_tool_reference_parts() {
+    fn test_tool_result_tool_reference_blocks_become_text() {
         // Verbatim Claude Code ToolSearch result: content is entirely
-        // tool_reference blocks. They stay typed parts so the chat template
-        // can expand each deferred tool's schema in place.
-        let content = convert_tool_result_json(serde_json::json!([
+        // tool_reference blocks. They reach the model as text; none of these
+        // tools is declared here, so each renders as an absence line.
+        let text = expect_text(serde_json::json!([
             {"type": "tool_reference", "tool_name": "mcp__slack__read_thread"},
             {"type": "tool_reference", "tool_name": "mcp__slack__read_channel"},
-        ]))
-        .unwrap();
-        let ChatCompletionRequestToolMessageContent::Array(parts) = content else {
-            panic!("expected content parts, got {content:?}");
-        };
-        let names: Vec<_> = parts
-            .iter()
-            .map(|part| match part {
-                ChatCompletionRequestUserMessageContentPart::ToolReference(r) => {
-                    r.tool_name.as_str()
-                }
-                other => panic!("expected tool_reference part, got {other:?}"),
-            })
-            .collect();
+        ]));
         assert_eq!(
-            names,
-            ["mcp__slack__read_thread", "mcp__slack__read_channel"]
+            text,
+            "[tool \"mcp__slack__read_thread\" not available]\n\
+             [tool \"mcp__slack__read_channel\" not available]"
         );
     }
 

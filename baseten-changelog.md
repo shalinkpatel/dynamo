@@ -3198,6 +3198,24 @@ coding adapter's rendered call that the host hands back as a client call
 completes on the stream (Codex's client `tool_search_call` got no
 `output_item.done`). Baseten-specific.
 
+Responses input items parse by `type` again
+([#1134](https://github.com/basetenlabs/dynamo/pull/1134)): `message` or no
+`type` tries `EasyInputMessage`, then `MessageItem`; any other type parses as
+`Item`. The untagged `InputItem` refused a typeless assistant message with
+`output_text` parts (no variant matched) and read a typeless message with an
+`id` as an `item_reference`, both served before the tool-bank cutover.
+Baseten-specific.
+
+A Messages `tool_reference` block reaches the model as text in a string tool
+message ([#1134](https://github.com/basetenlabs/dynamo/pull/1134)), no longer
+as a CC `tool_reference` part: Kimi-K3 returns 500 and gpt-oss-120b 400 on that
+part (BT-16618). A declared deferred tool renders as its `<tools>`-wrapped
+schema (`tool_schema_render`, moved from tool-bank), the envelope the GLM
+template renders for the part; a non-deferred tool renders nothing (its
+schema is already in the prompt); an undeclared one renders
+`[tool "x" not available]`. Messages declared tools now expand before the
+messages translate. Baseten-specific.
+
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
 
 The Messages and Responses handlers in lib/llm canonicalize through the shared
