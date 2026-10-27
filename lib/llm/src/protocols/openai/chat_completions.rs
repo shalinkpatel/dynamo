@@ -432,7 +432,11 @@ impl ValidateRequest for NvCreateChatCompletionRequest {
         validate::validate_temperature(self.inner.temperature)?;
         validate::validate_top_p(self.inner.top_p)?;
         validate::validate_tools(&self.inner.tools.as_deref())?;
-        validate::validate_tool_choice(&self.inner.tool_choice, self.inner.tools.as_deref())?;
+        validate::validate_tool_choice(
+            &self.inner.tool_choice,
+            self.inner.tools.as_deref(),
+            &self.inner.messages,
+        )?;
         // none for parallel_tool_calls
         validate::validate_user(self.inner.user.as_deref())?;
         // none for function call
@@ -694,6 +698,84 @@ mod tests {
             err.to_string()
                 .contains("tool_choice is \"required\" but tools is empty")
         );
+    }
+
+    #[test]
+    fn test_validate_tool_choice_required_accepts_dynamic_tools() {
+        // Kimi K3 declares tools inside system messages; "required" with only
+        // such dynamic tools is a valid request (the worker validates them).
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "parameters": {"type": "object", "properties": {}}}}]},
+                {"role": "user", "content": "what is the weather in beijing?"}
+            ],
+            "tool_choice": "required"
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request).expect("dynamic tools satisfy required");
+    }
+
+    #[test]
+    fn test_validate_tool_choice_required_rejects_empty_dynamic_tools() {
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": []},
+                {"role": "user", "content": "Hello"}
+            ],
+            "tool_choice": "required"
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        let err = ValidateRequest::validate(&request).expect_err("empty dynamic tools");
+        assert!(
+            err.to_string()
+                .contains("tool_choice is \"required\" but tools is empty")
+        );
+    }
+
+    #[test]
+    fn test_validate_tool_choice_named_accepts_dynamic_tool() {
+        let request_json = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "parameters": {"type": "object", "properties": {}}}}]},
+                {"role": "user", "content": "Hello"}
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        });
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(request_json).expect("Failed to deserialize request");
+
+        ValidateRequest::validate(&request).expect("named dynamic tool is declared");
+    }
+
+    #[test]
+    fn test_validate_tools_accepts_128_char_name_and_rejects_129() {
+        for (length, accepted) in [(128usize, true), (129usize, false)] {
+            let name = format!("tool{}", "a".repeat(length - 4));
+            let request_json = json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": [{"type": "function", "function": {
+                    "name": name, "parameters": {"type": "object", "properties": {}}}}]
+            });
+            let request: NvCreateChatCompletionRequest =
+                serde_json::from_value(request_json).expect("Failed to deserialize request");
+            let result = ValidateRequest::validate(&request);
+            if accepted {
+                result.expect("128-char tool names are accepted");
+            } else {
+                let err = result.expect_err("129-char tool names are rejected");
+                assert!(err.to_string().contains("exceeds 128 character limit"));
+            }
+        }
     }
 
     #[test]

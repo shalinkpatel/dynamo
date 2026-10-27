@@ -86,8 +86,9 @@ pub const MAX_STOP_SEQUENCES: usize = 32;
 /// Maximum allowed number of tools.
 pub const MAX_TOOLS: usize = 1536;
 // Metadata validation constants removed - we are no longer restricting the metadata field char limits
-/// Maximum allowed length for function names
-pub const MAX_FUNCTION_NAME_LENGTH: usize = 96;
+/// Maximum allowed length for function names. 128 matches the Moonshot
+/// gateway (Kimi's vendor verifier sends exactly 128-character names).
+pub const MAX_FUNCTION_NAME_LENGTH: usize = 128;
 /// Minimum allowed value for `repetition_penalty`
 pub const MIN_REPETITION_PENALTY: f32 = 0.0;
 /// Maximum allowed value for `repetition_penalty`
@@ -558,14 +559,44 @@ pub fn validate_tools(
     Ok(())
 }
 
+/// Names of the dynamic tools declared inside system messages (Kimi K3's
+/// `messages[].tools`, forwarded opaquely to the worker). Declarations that
+/// are not `{"function": {"name": ...}}` objects are left for the worker to
+/// reject; here they only count as "a tool was declared".
+fn dynamic_tool_names(
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
+) -> Vec<Option<&str>> {
+    use dynamo_protocols::types::ChatCompletionRequestMessage;
+
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatCompletionRequestMessage::System(system) => system.tools.as_ref(),
+            _ => None,
+        })
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .map(|tool| {
+            tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+        })
+        .collect()
+}
+
 /// Validates that forced tool_choice requests refer to available tools.
+///
+/// Tools live either at the request level (`tools`) or, for Kimi K3, inside
+/// system messages (`messages[].tools`); both satisfy `tool_choice`.
 pub fn validate_tool_choice(
     tool_choice: &Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
     tools: Option<&[dynamo_protocols::types::ChatCompletionTool]>,
+    messages: &[dynamo_protocols::types::ChatCompletionRequestMessage],
 ) -> Result<(), anyhow::Error> {
     use dynamo_protocols::types::ChatCompletionToolChoiceOption;
 
-    let tools_empty = tools.is_none_or(|tools| tools.is_empty());
+    let dynamic_names = dynamic_tool_names(messages);
+    let tools_empty = tools.is_none_or(|tools| tools.is_empty()) && dynamic_names.is_empty();
 
     match tool_choice {
         Some(ChatCompletionToolChoiceOption::Required) if tools_empty => {
@@ -573,7 +604,11 @@ pub fn validate_tool_choice(
         }
         Some(ChatCompletionToolChoiceOption::Named(named)) => {
             let tools = tools.unwrap_or(&[]);
-            if !tools.iter().any(|t| t.function.name == named.function.name) {
+            let declared = tools.iter().any(|t| t.function.name == named.function.name)
+                || dynamic_names
+                    .iter()
+                    .any(|name| *name == Some(named.function.name.as_str()));
+            if !declared {
                 anyhow::bail!(
                     "tool named \"{}\" in tool_choice is not present in tools",
                     named.function.name
