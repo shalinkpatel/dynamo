@@ -165,6 +165,7 @@ const MIN_ROUTER_TEMPERATURE: f64 = 1e-12;
 /// Partial override structure for B10 routing config, we can't reuse the B10RoutingConfig struct because of the default values
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct B10RoutingConfigOverride {
+    virtual_taint_worker_fractions: Option<BTreeMap<String, f64>>,
     enable_eagle: Option<bool>,
     router_temperature: Option<f64>,
     #[serde(alias = "router_prefill_block_weight")]
@@ -192,6 +193,9 @@ struct B10RoutingConfigOverride {
 /// subset of Pytorch B10 routing config. Keep in sync with `B10RoutingConfig` pydantic model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct B10RoutingConfig {
+    /// Relative pool weights, normalized when parsed; empty disables virtual taints.
+    #[serde(default)]
+    pub virtual_taint_worker_fractions: BTreeMap<String, f64>,
     /// EAGLE bigram cache hashes; read at router startup, not hot-reloaded.
     #[serde(default)]
     pub enable_eagle: bool,
@@ -275,6 +279,9 @@ pub struct B10RoutingConfig {
 
 impl B10RoutingConfig {
     fn apply_override(&mut self, overrides: &B10RoutingConfigOverride) {
+        if let Some(fractions) = &overrides.virtual_taint_worker_fractions {
+            self.virtual_taint_worker_fractions = fractions.clone();
+        }
         if let Some(value) = overrides.enable_eagle {
             self.enable_eagle = value;
         }
@@ -338,6 +345,7 @@ impl B10RoutingConfig {
 impl Default for B10RoutingConfig {
     fn default() -> Self {
         Self {
+            virtual_taint_worker_fractions: BTreeMap::new(),
             enable_eagle: false,
             router_temperature: default_router_temperature(),
             router_overlap_score_weight: default_router_overlap_score_weight(),
@@ -761,6 +769,28 @@ impl UnifiedConfig {
         };
 
         root_config.b10_generation_coordinator_config.validate()?;
+        let fractions = &mut root_config
+            .b10_routing_config
+            .virtual_taint_worker_fractions;
+        for (taint, fraction) in fractions.iter() {
+            ensure!(
+                taint.starts_with("b10.virtual/")
+                    && taint.len() > "b10.virtual/".len()
+                    && !taint.chars().any(char::is_whitespace)
+                    && fraction.is_finite()
+                    && *fraction > 0.0,
+                "virtual_taint_worker_fractions requires b10.virtual/<name> keys and finite positive weights"
+            );
+        }
+        // Scale before summing so even finite weights whose sum overflows can
+        // be normalized. Empty maps keep virtual taints disabled.
+        let max_weight = fractions.values().copied().fold(0.0, f64::max);
+        if max_weight > 0.0 {
+            let scaled_total: f64 = fractions.values().map(|weight| weight / max_weight).sum();
+            for weight in fractions.values_mut() {
+                *weight = (*weight / max_weight) / scaled_total;
+            }
+        }
         let unified_config = UnifiedConfig {
             generation_coordinator: root_config.b10_generation_coordinator_config,
             logging: root_config.b10_logging_config.sanitize(),
@@ -796,6 +826,89 @@ impl UnifiedConfig {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn b10_virtual_taints_normalize_and_override_map_can_disable() {
+        let defaults = B10RoutingConfig::default();
+        assert!(
+            UnifiedConfig::parse("{}", None, &defaults)
+                .unwrap()
+                .routing
+                .virtual_taint_worker_fractions
+                .is_empty()
+        );
+        for fractions in [
+            "{'b10.virtual/fast': 0}",
+            "{'b10.virtual/fast': -1}",
+            "{'b10.virtual/fast': .nan}",
+            "{'b10.virtual/fast': .inf}",
+            "{'b10.virtual/fast': true}",
+            "{'b10.virtual/fast': '1.0'}",
+            "{'b10.virtual/': 1}",
+            "{'fast': 1}",
+            "{'b10.virtual/bad name': 1}",
+        ] {
+            assert!(
+                UnifiedConfig::parse(
+                    &format!("b10_routing_config:\n  virtual_taint_worker_fractions: {fractions}"),
+                    None,
+                    &defaults
+                )
+                .is_err(),
+                "accepted invalid fractions: {fractions}"
+            );
+        }
+        for (fractions, expected_fast) in [
+            ("{'b10.virtual/fast': 1}", 1.0),
+            ("{'b10.virtual/fast': 0.5}", 1.0),
+            ("{'b10.virtual/fast': 1.1}", 1.0),
+            ("{'b10.virtual/fast': 2, 'b10.virtual/throughput': 8}", 0.2),
+            (
+                "{'b10.virtual/fast': 0.8, 'b10.virtual/throughput': 0.4}",
+                2.0 / 3.0,
+            ),
+            (
+                "{'b10.virtual/fast': 0.5, 'b10.virtual/throughput': 0.499998}",
+                0.5 / 0.999998,
+            ),
+            (
+                "{'b10.virtual/fast': 1e308, 'b10.virtual/throughput': 1e308}",
+                0.5,
+            ),
+            (
+                "{'b10.virtual/fast': 5e-324, 'b10.virtual/throughput': 1e-323}",
+                1.0 / 3.0,
+            ),
+        ] {
+            let parsed = UnifiedConfig::parse(
+                &format!("b10_routing_config:\n  virtual_taint_worker_fractions: {fractions}"),
+                None,
+                &defaults,
+            )
+            .unwrap();
+            let normalized = parsed.routing.virtual_taint_worker_fractions;
+            assert!((normalized.values().sum::<f64>() - 1.0).abs() < 1e-12);
+            assert!(
+                (normalized["b10.virtual/fast"] - expected_fast).abs() < 1e-12,
+                "incorrect normalization for {fractions}"
+            );
+        }
+        let yaml = "b10_routing_config:\n  virtual_taint_worker_fractions: {'b10.virtual/fast': 0.2, 'b10.virtual/throughput': 0.8}\noverride_args:\n  off:\n    b10_routing_config:\n      virtual_taint_worker_fractions: {}\n";
+        assert_eq!(
+            UnifiedConfig::parse(yaml, None, &defaults)
+                .unwrap()
+                .routing
+                .virtual_taint_worker_fractions["b10.virtual/fast"],
+            0.2
+        );
+        assert!(
+            UnifiedConfig::parse(yaml, Some("off"), &defaults)
+                .unwrap()
+                .routing
+                .virtual_taint_worker_fractions
+                .is_empty()
+        );
+    }
 
     #[test]
     fn eagle_hash_mode_defaults_and_role_overrides() {

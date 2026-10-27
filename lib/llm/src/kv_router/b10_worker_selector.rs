@@ -743,6 +743,58 @@ mod tests {
     }
 
     #[test]
+    fn b10_virtual_taints_reuse_preferences_overflow_and_hard_constraints() {
+        let selector = B10WorkerSelector::new();
+        let workers = super::super::b10_virtual_taints::assign(
+            (0..64).map(|id| (id, test_worker_config(0, 1))).collect(),
+            &std::collections::BTreeMap::from([
+                ("b10.virtual/fast".into(), 0.5),
+                ("b10.virtual/throughput".into(), 0.5),
+            ]),
+        );
+        let fast = *workers
+            .iter()
+            .find(|(_, cfg)| cfg.taints.contains("b10.virtual/fast"))
+            .unwrap()
+            .0;
+        let other = *workers
+            .iter()
+            .find(|(_, cfg)| cfg.taints.contains("b10.virtual/throughput"))
+            .unwrap()
+            .0;
+        let workers: HashMap<_, _> = workers
+            .into_iter()
+            .filter(|(id, _)| *id == fast || *id == other)
+            .collect();
+        let mut request = base_request(128);
+        request.router_config_override = Some(RouterConfigOverride {
+            router_temperature: Some(0.0),
+            ..Default::default()
+        });
+        request
+            .routing_constraints
+            .preferred_taints
+            .insert("b10.virtual/fast".into(), 1.0);
+        let select = |request: &SchedulingRequest| {
+            selector
+                .select_worker(&workers, request, request.eligibility(), 64)
+                .unwrap()
+                .worker
+                .worker_id
+        };
+        assert_eq!(select(&request), fast);
+        request
+            .prefill_tokens
+            .insert(WorkerWithDpRank::new(fast, 0), 1_000_000);
+        assert_eq!(select(&request), other);
+        request
+            .routing_constraints
+            .required_taints
+            .insert("b10.virtual/fast".into());
+        assert_eq!(select(&request), fast);
+    }
+
+    #[test]
     fn preferred_taints_bias_b10_toward_matching_worker() {
         let selector = B10WorkerSelector::new();
         let workers = HashMap::from([

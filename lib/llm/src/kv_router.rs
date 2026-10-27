@@ -58,6 +58,7 @@ mod b10_bid;
 pub mod b10_draining_metrics;
 pub mod b10_metrics_helper;
 mod b10_potential_loads_cache;
+mod b10_virtual_taints;
 pub mod b10_worker_selector;
 pub mod indexer;
 pub mod metrics;
@@ -320,6 +321,11 @@ where
             metrics_component.unwrap_or(component),
         );
         let cancellation_token = component.drt().primary_token();
+        let workers_with_configs = b10_virtual_taints::watch(
+            workers_with_configs,
+            baseten_configmap::current_reader(),
+            cancellation_token.clone(),
+        );
         let min_initial_workers = min_initial_workers_from_env()?;
         let dynamic_disable_snapshots = Arc::new(AtomicBool::new(false));
 

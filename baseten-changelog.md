@@ -2422,6 +2422,9 @@ choosing a worker. Positive weights bias traffic toward matching workers and
 negative weights bias traffic away, while `required_taints` remain the hard
 eligibility filter.
 
+Router-local virtual taints ([#1115](https://github.com/basetenlabs/dynamo/pull/1115)) partition discovered workers by
+weighted rendezvous hashing and auto-normalized relative `virtual_taint_worker_fractions`, preserving surviving workers' pools during scaling; supports reloadable disable.
+
 Replay notes:
 
 Preserve this behavior while B10 remains a Baseten-specific selector. If B10 is
