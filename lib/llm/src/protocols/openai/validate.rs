@@ -605,9 +605,7 @@ pub fn validate_tool_choice(
         Some(ChatCompletionToolChoiceOption::Named(named)) => {
             let tools = tools.unwrap_or(&[]);
             let declared = tools.iter().any(|t| t.function.name == named.function.name)
-                || dynamic_names
-                    .iter()
-                    .any(|name| *name == Some(named.function.name.as_str()));
+                || dynamic_names.contains(&Some(named.function.name.as_str()));
             if !declared {
                 anyhow::bail!(
                     "tool named \"{}\" in tool_choice is not present in tools",
