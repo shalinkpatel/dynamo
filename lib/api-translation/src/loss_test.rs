@@ -55,3 +55,10 @@ fn record_bounds_client_supplied_text() {
     assert!(loss.field.contains("truncated"), "{}", loss.field);
     assert!(loss.detail.contains("truncated"), "{}", loss.detail);
 }
+
+#[test]
+fn every_kind_declares_an_outcome() {
+    for kind in LossKind::VARIANTS {
+        assert!(!kind.outcome().is_empty(), "{kind}");
+    }
+}

@@ -3238,6 +3238,12 @@ schema is already in the prompt); an undeclared one renders
 `[tool "x" not available]`. Messages declared tools now expand before the
 messages translate. Baseten-specific.
 
+`ingress.loss` WARN lines read `` `field` outcome (reason); the request
+continues `` ([#1139](https://github.com/basetenlabs/dynamo/pull/1139)): each
+`LossKind` declares its outcome once (strum `message`), call sites pass only the
+reason. The line used to carry only the detail sentence, without the field.
+Baseten-specific.
+
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
 
 The Messages and Responses handlers in lib/llm canonicalize through the shared

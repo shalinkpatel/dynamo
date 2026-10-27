@@ -192,7 +192,7 @@ impl DroppedTools {
             LossKind::ServerToolDropped,
             format!("tools[{position}]"),
             format!(
-                "dropped server-tool-shaped tool type={kind:?} name={:?}: nothing on this endpoint executes it",
+                "server-tool-shaped type {kind:?}, name {:?}: nothing on this endpoint executes it",
                 name.unwrap_or("")
             ),
         );
@@ -302,7 +302,7 @@ fn adapt_request_json_inner(
         dropped.losses.record(
             LossKind::ExtensionFieldDropped,
             format!("baseten.{key}"),
-            "`baseten` request extension member this crate does not model; dropped",
+            "`baseten` request extension member this crate does not model",
         );
     }
     let tool_settings = baseten_extension.tool_settings;
@@ -328,10 +328,7 @@ fn adapt_request_json_inner(
         dropped.losses.record(
             LossKind::ToolChoiceDegraded,
             "tool_choice",
-            format!(
-                "tool_choice named dropped server tool {:?}; degraded to auto",
-                named.function.name
-            ),
+            format!("names dropped server tool {:?}", named.function.name),
         );
         request.tool_choice = Some(ChatCompletionToolChoiceOption::Auto);
     }
@@ -667,7 +664,7 @@ fn drop_non_extension_fields(unmodeled: &mut serde_json::Map<String, Value>, los
         losses.record(
             LossKind::RequestFieldDropped,
             key.as_str(),
-            "Messages request field with no Chat Completions meaning; dropped",
+            "no Chat Completions equivalent on Messages",
         );
     }
 }
@@ -697,7 +694,7 @@ fn adapt_messages(
         dropped.losses.record(
             LossKind::RequestFieldDropped,
             field,
-            "Anthropic-hosted feature this endpoint cannot honor; dropped",
+            "Anthropic-hosted feature this endpoint cannot honor",
         );
     }
     // Anthropic ranges: temperature and top_p are 0..1 on this wire (the OpenAI surfaces allow
@@ -791,14 +788,14 @@ fn adapt_messages(
         dropped.losses.record(
             LossKind::RequestFieldDropped,
             "service_tier",
-            "Anthropic service_tier has no Chat Completions meaning; dropped",
+            "no Chat Completions equivalent on Messages",
         );
     }
     if messages_request.cache_control.is_some() {
         dropped.losses.record(
             LossKind::RequestFieldDropped,
             "cache_control",
-            "Anthropic top-level cache_control is not translated to the fork's range-based cache_control extension; dropped",
+            "not translated to the fork's range-based `cache_control` extension",
         );
     }
     let mut unmodeled = unmodeled_fields(messages_request.unmodeled, messages_request.thinking)
@@ -1184,7 +1181,7 @@ fn translate_message(
                     losses.record(
                         LossKind::ContentBlockSkipped,
                         format!("messages[{message_index}].content[{block_index}]"),
-                        "assistant redacted_thinking block skipped: encrypted, no Chat Completions representation",
+                        "encrypted assistant `redacted_thinking` block, no Chat Completions representation",
                     );
                 }
                 // Fork parity: unknown assistant-authored blocks are model output echoed back;
@@ -1197,7 +1194,7 @@ fn translate_message(
                     losses.record(
                         LossKind::ContentBlockSkipped,
                         format!("messages[{message_index}].content[{block_index}]"),
-                        format!("unknown assistant content block type={block_type:?} skipped"),
+                        format!("unknown assistant content block type {block_type:?}"),
                     );
                 }
                 unsupported => return Err(unsupported_block("assistant", unsupported)),
@@ -1265,7 +1262,7 @@ fn translate_message(
                 losses.record(
                     LossKind::ContentBlockSkipped,
                     format!("messages[{message_index}].content[{block_index}]"),
-                    "user document block dropped: no Chat Completions representation on this stack",
+                    "user `document` block, no Chat Completions representation on this stack",
                 );
             }
             unsupported if strict_blocks => {
@@ -1279,10 +1276,7 @@ fn translate_message(
                 losses.record(
                     LossKind::ContentBlockSkipped,
                     format!("messages[{message_index}].content[{block_index}]"),
-                    format!(
-                        "untranslatable user content block skipped: {}",
-                        refusal.detail()
-                    ),
+                    format!("untranslatable user content block: {}", refusal.detail()),
                 );
             }
         }
@@ -1598,7 +1592,7 @@ fn coerce_unknown_block(value: &Value, field: &str, losses: &mut Losses) -> Stri
             LossKind::ToolResultBlockOmitted,
             field,
             format!(
-                "oversized unknown tool_result block type={block_type:?} bytes={} replaced by a placeholder",
+                "oversized unknown tool_result block type {block_type:?}, {} bytes",
                 json.len()
             ),
         );
@@ -1945,11 +1939,9 @@ fn adapt_responses(
                 // Standard dynamo cannot honor a hosted-tool `tool_choice` (the tool was dropped);
                 // degrade to auto like the Messages path does. tool-bank keeps the 400.
                 Some(Err(reason)) if hooks.degrades_unsupported_tool_choice() => {
-                    dropped.losses.record(
-                        LossKind::ToolChoiceDegraded,
-                        "tool_choice",
-                        format!("tool_choice degraded to auto: {reason}"),
-                    );
+                    dropped
+                        .losses
+                        .record(LossKind::ToolChoiceDegraded, "tool_choice", reason);
                     Some(ChatCompletionToolChoiceOption::Auto)
                 }
                 Some(Err(reason)) => return Err(RequestRejection::Unsupported(reason)),
@@ -2094,7 +2086,7 @@ fn check_includes(
     losses.record(
         LossKind::IncludeIgnored,
         "include",
-        format!("`{ENCRYPTED_REASONING_INCLUDE}` ignored: no encrypted reasoning content is produced on this stack"),
+        format!("`{ENCRYPTED_REASONING_INCLUDE}`: no encrypted reasoning content is produced on this stack"),
     );
     Ok(())
 }
@@ -2227,14 +2219,14 @@ fn translate_input_items(
                     None => losses.record(
                         LossKind::AgentMessageDropped,
                         format!("input[{item_index}]"),
-                        "replayed agent message dropped on ingress (encrypted or empty)",
+                        "replayed agent message is encrypted or empty",
                     ),
                 }
             }
             InputItem::Item(Item::Compaction(_)) => losses.record(
                 LossKind::ReplayItemIgnored,
                 format!("input[{item_index}]"),
-                "replayed Responses compaction item ignored on ingress",
+                "replayed Responses compaction item",
             ),
             InputItem::ItemReference(_) => {
                 return Err(
@@ -2254,7 +2246,7 @@ fn translate_input_items(
                 losses.record(
                     LossKind::InputItemSkipped,
                     format!("input[{item_index}]"),
-                    format!("unsupported input item skipped: {item_debug}"),
+                    format!("unsupported input item: {item_debug}"),
                 );
             }
         }
@@ -2279,7 +2271,7 @@ fn dedupe_tools_by_name(
                     LossKind::DuplicateToolDropped,
                     "tools",
                     format!(
-                        "duplicate tool declaration {:?} dropped (first declaration kept)",
+                        "duplicate declaration of {:?}; the first one is kept",
                         tool.function.name
                     ),
                 );
@@ -2538,7 +2530,7 @@ fn responses_echoed_tool_call(
         losses.record(
             LossKind::NonJsonEchoedArguments,
             field,
-            format!("echoed call `{id}` has non-JSON `arguments`; replaying verbatim ({error})"),
+            format!("echoed call `{id}` has non-JSON `arguments`: {error}"),
         );
         Value::String(raw_args.to_string())
     });

@@ -21,6 +21,7 @@ use strum::VariantArray;
     Eq,
     Hash,
     serde::Serialize,
+    strum::EnumMessage,
     strum::IntoStaticStr,
     strum::VariantArray,
 )]
@@ -28,28 +29,40 @@ use strum::VariantArray;
 #[strum(serialize_all = "snake_case")]
 pub enum LossKind {
     /// A server-tool-shaped `tools[]` entry was dropped: nothing on this endpoint executes it.
+    #[strum(message = "dropped")]
     ServerToolDropped,
     /// A `tool_choice` demanding a tool that was dropped or is unsupported degraded to `auto`.
+    #[strum(message = "degraded to `auto`")]
     ToolChoiceDegraded,
     /// A request field with no Chat Completions meaning was dropped.
+    #[strum(message = "dropped")]
     RequestFieldDropped,
     /// A `baseten` extension member this crate does not model was dropped.
+    #[strum(message = "dropped")]
     ExtensionFieldDropped,
     /// A message content block with no Chat Completions translation was skipped.
+    #[strum(message = "skipped")]
     ContentBlockSkipped,
     /// An oversized unknown `tool_result` block was replaced by a placeholder.
+    #[strum(message = "replaced by a placeholder")]
     ToolResultBlockOmitted,
     /// A replayed Responses input item with no translation was skipped.
+    #[strum(message = "skipped")]
     InputItemSkipped,
     /// A replayed Responses `compaction` item was ignored.
+    #[strum(message = "ignored")]
     ReplayItemIgnored,
     /// A replayed `agent_message` had no plaintext content and was dropped.
+    #[strum(message = "dropped")]
     AgentMessageDropped,
     /// A Responses `include` this stack cannot produce was ignored.
+    #[strum(message = "ignored")]
     IncludeIgnored,
     /// A duplicate tool declaration was dropped (first declaration kept).
+    #[strum(message = "dropped")]
     DuplicateToolDropped,
     /// A replayed function_call/mcp_call with non-JSON `arguments` was carried verbatim, not parsed.
+    #[strum(message = "replayed verbatim")]
     NonJsonEchoedArguments,
 }
 
@@ -57,6 +70,11 @@ impl LossKind {
     /// snake_case label, `&'static` so it can be a metric label.
     pub fn as_label(self) -> &'static str {
         self.into()
+    }
+
+    /// What happened to the affected member, phrased to follow its name in a log line.
+    fn outcome(self) -> &'static str {
+        strum::EnumMessage::get_message(&self).expect("every LossKind declares a strum message")
     }
 }
 
@@ -73,7 +91,8 @@ pub struct Loss {
     /// JSON path of the affected member within the client's request (`tools[2]`, `cache_control`,
     /// `messages[3].content[1]`, `input[4]`). Bounded; key names only.
     pub field: String,
-    /// What happened to it, in one bounded sentence. Never message content.
+    /// Why it was not carried through, in one bounded phrase; the outcome comes from `kind`.
+    /// Never message content.
     pub detail: String,
 }
 
@@ -101,7 +120,8 @@ impl Losses {
             event_name = "ingress.loss",
             kind = kind.as_label(),
             field = %field,
-            "{detail}"
+            "`{field}` {} ({detail}); the request continues",
+            kind.outcome()
         );
         self.entries.push(Loss {
             kind,
