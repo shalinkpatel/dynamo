@@ -79,6 +79,23 @@ impl ClientEgress {
         }
     }
 
+    /// A server tool the host refuses to run, opened in the model's call order; the buffered body
+    /// carries its refusal with the iteration's results.
+    pub async fn emit_refused_server_tool(
+        &mut self,
+        iteration: u32,
+        server_call: &ServerToolCall,
+    ) -> Result<(), TranslationError> {
+        match self {
+            Self::Streaming(emitter) => {
+                emitter
+                    .emit_refused_server_tool(iteration, server_call)
+                    .await
+            }
+            Self::Buffered(_) => Ok(()),
+        }
+    }
+
     pub async fn emit_iteration_usage(
         &mut self,
         iteration: u32,

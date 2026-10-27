@@ -95,6 +95,7 @@ fn buffered_failed_server_tool_renders_as_failed() {
     );
     let mcp_call = &responses_body["output"][0];
     assert_eq!(mcp_call["type"], "mcp_call");
+    assert_eq!(mcp_call["id"], format!("mcp_b10_{}", server_call().id));
     assert_eq!(mcp_call["status"], "failed");
     assert_eq!(
         mcp_call["error"],

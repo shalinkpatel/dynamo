@@ -41,6 +41,9 @@ pub use async_openai::types::responses::*;
 // inline, so downstream consumers occasionally need to name it alongside the
 // Dynamo-owned shadow defined further down this module.
 pub use async_openai::types::responses::InputContent as UpstreamInputContent;
+// The detail enum of upstream's `InputImageContent`, which `UpstreamInputContent` carries; the
+// glob above is shadowed by the CC `ImageDetail` re-export below.
+pub use async_openai::types::responses::ImageDetail as UpstreamImageDetail;
 
 // Re-export from parent module for backward compat.
 pub use crate::types::ImageDetail;

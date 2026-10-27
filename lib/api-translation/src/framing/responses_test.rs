@@ -72,12 +72,14 @@ fn responses_stamps_a_namespaced_call_with_its_declaration() {
         Some(Box::new(NamespaceStampAdapter)),
         ResponsesParams::default(),
     );
-    let frames = framing.on_chunk(&SemanticChunk::ToolCall(crate::model::ToolCall {
+    let call = crate::model::ToolCall {
         id: "call_1".to_string(),
         name: "multi_agent_v1__spawn_agent".to_string(),
         args: json!({}),
         raw_args: "{}".to_string(),
-    }));
+    };
+    let mut frames = framing.on_chunk(&SemanticChunk::ToolCall(call.clone()));
+    frames.extend(framing.emit_client_tool_calls(&[call]));
     let added = frames
         .iter()
         .map(|frame| frame_body(frame))

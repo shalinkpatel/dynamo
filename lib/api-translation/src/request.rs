@@ -38,7 +38,7 @@ use dynamo_protocols::types::responses::{
     InputContent, InputItem, InputRole, Item, MessageItem, ReasoningItemContent, ResponseTextParam,
     Role as ResponsesRole, ServiceTierResponses as ResponsesServiceTier, SummaryPart,
     TextResponseFormatConfiguration, Tool as ResponsesTool, ToolChoiceFunction, ToolChoiceOptions,
-    ToolChoiceParam,
+    ToolChoiceParam, UpstreamImageDetail,
 };
 use dynamo_protocols::types::{
     ChatCompletionNamedToolChoice, ChatCompletionRequestMessageContentPartImage,
@@ -48,8 +48,8 @@ use dynamo_protocols::types::{
     ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionToolType, CreateChatCompletionRequest, FunctionName, FunctionObject, ImageUrl,
-    ServiceTier as CcServiceTier, Stop,
+    ChatCompletionToolType, CreateChatCompletionRequest, FunctionName, FunctionObject, ImageDetail,
+    ImageUrl, ServiceTier as CcServiceTier, Stop,
 };
 
 use crate::coding_adapter::CodingAdapter;
@@ -59,7 +59,8 @@ use crate::hooks::{IngressHooks, ToolDisposition};
 use crate::loss::{Loss, LossKind, Losses};
 use crate::model::{ReactCapSource, RequestRejection, ToolCall};
 use crate::{
-    CcMessage, CcRequest, ClientProtocol, IMAGE_SOURCE_TYPE_BASE64, SERVER_TOOL_USE_ID_PREFIX,
+    CcMessage, CcRequest, ClientProtocol, MCP_CALL_ID_PREFIX, SERVER_TOOL_USE_ID_PREFIX,
+    strip_item_id_prefix,
 };
 
 /// The reserved `baseten` request-body object — Baseten's whole extension namespace on top of the
@@ -1609,17 +1610,23 @@ fn search_result_placeholder(result: &SearchResultBlock) -> String {
 fn image_url_part(
     source: &AnthropicImageSource,
 ) -> Result<ChatCompletionRequestMessageContentPartImage, RequestRejection> {
-    if source.source_type != IMAGE_SOURCE_TYPE_BASE64 {
-        return Err(RequestRejection::Unsupported(format!(
-            "unsupported image source type {:?}; only base64 is supported",
-            source.source_type
-        )));
-    }
-    let url = url::Url::parse(&format!(
-        "data:{};base64,{}",
-        source.media_type, source.data
-    ))
-    .map_err(|e| RequestRejection::malformed(format!("invalid image data URI: {e}")))?;
+    let raw_url = match source {
+        AnthropicImageSource::Base64 { media_type, data } => {
+            format!("data:{media_type};base64,{data}")
+        }
+        AnthropicImageSource::Url { url } => url.clone(),
+        AnthropicImageSource::Other(value) => {
+            return Err(RequestRejection::Unsupported(format!(
+                "unsupported image source type {:?}; base64 and url are supported",
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(no type)")
+            )));
+        }
+    };
+    let url = url::Url::parse(&raw_url)
+        .map_err(|e| RequestRejection::malformed(format!("invalid image URL: {e}")))?;
     Ok(ChatCompletionRequestMessageContentPartImage {
         image_url: ImageUrl {
             url,
@@ -2106,8 +2113,9 @@ fn translate_input_items(
             }
             InputItem::Item(Item::McpCall(call)) => {
                 turn.close_thinking_segment();
+                let call_id = strip_item_id_prefix(MCP_CALL_ID_PREFIX, &call.id);
                 turn.tool_calls.push(responses_echoed_tool_call(
-                    &call.id,
+                    call_id,
                     &call.name,
                     &call.arguments,
                     &format!("input[{item_index}]"),
@@ -2120,7 +2128,7 @@ fn translate_input_items(
                     call.output.clone().unwrap_or_default()
                 };
                 cc_messages.push(tool_result_message(
-                    call.id.clone(),
+                    call_id.to_string(),
                     ChatCompletionRequestToolMessageContent::Text(result),
                 ));
             }
@@ -2130,9 +2138,7 @@ fn translate_input_items(
                     output.call_id.clone().ok_or_else(|| {
                         "function_call_output requires `call_id` for Chat Completions translation".to_string()
                     })?,
-                    ChatCompletionRequestToolMessageContent::Text(function_call_output_text(
-                        &output.output,
-                    )?),
+                    function_call_output_content(&output.output)?,
                 ));
             }
             InputItem::Item(Item::AgentMessage(message)) => {
@@ -2288,7 +2294,7 @@ fn user_input_content(
             InputContent::InputImage(image) => {
                 has_image = true;
                 cc_parts.push(ChatCompletionRequestUserMessageContentPart::ImageUrl(
-                    responses_image_part(image)?,
+                    responses_image_part(image.image_url.as_deref(), image.detail.clone())?,
                 ));
             }
             InputContent::InputFile(_) => return Err(unsupported_input_content_part("input_file")),
@@ -2304,9 +2310,10 @@ fn user_input_content(
 /// A Responses `input_image` -> a CC image part. `file_id` references cannot be resolved here;
 /// only a URL (https or data URI) translates.
 fn responses_image_part(
-    image: &dynamo_protocols::types::responses::InputImageContent,
+    image_url: Option<&str>,
+    detail: ImageDetail,
 ) -> Result<ChatCompletionRequestMessageContentPartImage, String> {
-    let Some(image_url) = image.image_url.as_deref() else {
+    let Some(image_url) = image_url else {
         return Err(
             "input_image without `image_url` is not supported (file_id references cannot be \
              resolved here)"
@@ -2317,7 +2324,7 @@ fn responses_image_part(
     Ok(ChatCompletionRequestMessageContentPartImage {
         image_url: ImageUrl {
             url,
-            detail: Some(image.detail.clone()),
+            detail: Some(detail),
             uuid: None,
         },
     })
@@ -2381,27 +2388,60 @@ fn flatten_input_content(parts: &[InputContent]) -> Result<String, String> {
     Ok(text)
 }
 
-/// A `function_call_output`'s output as the single text form the history append shares: a
-/// structured part list is accepted only if every part is text, and the parts join with `"\n"`
-/// like every other adjacent-text-part flatten here.
-fn function_call_output_text(output: &FunctionCallOutput) -> Result<String, String> {
+/// A `function_call_output`'s output as CC tool-message content. A text-only part list joins with
+/// `"\n"` like every other adjacent-text-part flatten here; an `input_image` part (Codex
+/// `view_image`) keeps its place as a CC image part, as the Messages `tool_result` path does. CC
+/// is the internal exchange format, so tool images ride it beyond OpenAI's text-only tool content.
+fn function_call_output_content(
+    output: &FunctionCallOutput,
+) -> Result<ChatCompletionRequestToolMessageContent, String> {
     use dynamo_protocols::types::responses::UpstreamInputContent;
-    match output {
-        FunctionCallOutput::Text(text) => Ok(text.clone()),
+    let parts = match output {
+        FunctionCallOutput::Text(text) => {
+            return Ok(ChatCompletionRequestToolMessageContent::Text(text.clone()));
+        }
         // Carries upstream's original `InputContent`, not the Dynamo-relaxed shadow — same variants.
-        FunctionCallOutput::Content(parts) => Ok(parts
-            .iter()
-            .map(|part| match part {
-                UpstreamInputContent::InputText(part) => Ok(part.text.as_str()),
-                UpstreamInputContent::InputImage(_) => {
-                    Err(unsupported_input_content_part("input_image"))
-                }
-                UpstreamInputContent::InputFile(_) => {
-                    Err(unsupported_input_content_part("input_file"))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join("\n")),
+        FunctionCallOutput::Content(parts) => parts,
+    };
+    let cc_parts = parts
+        .iter()
+        .map(|part| match part {
+            UpstreamInputContent::InputText(part) => {
+                Ok(ChatCompletionRequestToolMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText {
+                        prompt_cache_breakpoint: None,
+                        text: part.text.clone(),
+                    },
+                ))
+            }
+            UpstreamInputContent::InputImage(image) => Ok(
+                ChatCompletionRequestToolMessageContentPart::ImageUrl(responses_image_part(
+                    image.image_url.as_deref(),
+                    cc_image_detail(&image.detail),
+                )?),
+            ),
+            UpstreamInputContent::InputFile(_) => Err(unsupported_input_content_part("input_file")),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let texts: Option<Vec<&str>> = cc_parts
+        .iter()
+        .map(|part| match part {
+            ChatCompletionRequestToolMessageContentPart::Text(part) => Some(part.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    Ok(match texts {
+        Some(texts) => ChatCompletionRequestToolMessageContent::Text(texts.join("\n")),
+        None => ChatCompletionRequestToolMessageContent::Array(cc_parts),
+    })
+}
+
+fn cc_image_detail(detail: &UpstreamImageDetail) -> ImageDetail {
+    match detail {
+        UpstreamImageDetail::Auto => ImageDetail::Auto,
+        UpstreamImageDetail::Low => ImageDetail::Low,
+        UpstreamImageDetail::High => ImageDetail::High,
+        UpstreamImageDetail::Original => ImageDetail::Original,
     }
 }
 

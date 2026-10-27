@@ -49,6 +49,7 @@ use crate::model::{
 use crate::util::unix_secs;
 use crate::wire::{next_id_seq, sse_frame, to_json_string, to_json_value};
 use crate::{CcMessage, SemanticChunk};
+use crate::{FUNCTION_CALL_ID_PREFIX, MCP_CALL_ID_PREFIX, prefixed_item_id};
 
 /// Confined here: nothing outside this module renders Responses.
 type ResponsesExtension = BasetenResponseExtension<ResponseUsage>;
@@ -233,6 +234,9 @@ enum ResponsesEvent {
     OutputItemDone,
     FunctionCallArgumentsDelta,
     FunctionCallArgumentsDone,
+    McpCallInProgress,
+    McpCallArgumentsDelta,
+    McpCallArgumentsDone,
     McpCallCompleted,
     McpCallFailed,
     Completed,
@@ -255,6 +259,9 @@ impl ResponsesEvent {
             Self::OutputItemDone => "response.output_item.done",
             Self::FunctionCallArgumentsDelta => "response.function_call_arguments.delta",
             Self::FunctionCallArgumentsDone => "response.function_call_arguments.done",
+            Self::McpCallInProgress => "response.mcp_call.in_progress",
+            Self::McpCallArgumentsDelta => "response.mcp_call_arguments.delta",
+            Self::McpCallArgumentsDone => "response.mcp_call_arguments.done",
             Self::McpCallCompleted => "response.mcp_call.completed",
             Self::McpCallFailed => "response.mcp_call.failed",
             Self::Completed => "response.completed",
@@ -463,6 +470,7 @@ fn transcript_output(
                     }
                     let (name, namespace) = call_identity(coding_adapter, &call.function.name);
                     output.push(function_call_item(
+                        &prefixed_item_id(FUNCTION_CALL_ID_PREFIX, &call.id),
                         &call.id,
                         &name,
                         namespace.as_deref(),
@@ -506,7 +514,7 @@ fn transcript_output(
                         placeholder.arguments.clone(),
                     );
                     output[slot] = mcp_call_item(
-                        &tool.tool_call_id,
+                        &prefixed_item_id(MCP_CALL_ID_PREFIX, &tool.tool_call_id),
                         &name,
                         &provider,
                         &arguments,
@@ -568,7 +576,8 @@ fn call_identity(
 /// invariant `cc_tool_call` (in `cc.rs`) keeps for ChatCompletions. The namespace is the client's
 /// own declaration for the tool, restamped so a registry keyed on `(name, namespace)` resolves.
 fn function_call_item(
-    id: &str,
+    item_id: &str,
+    call_id: &str,
     name: &str,
     namespace: Option<&str>,
     raw_args: &str,
@@ -578,21 +587,25 @@ fn function_call_item(
         caller: None,
         r#async: None,
         arguments: raw_args.to_string(),
-        call_id: id.to_string(),
+        call_id: call_id.to_string(),
         namespace: namespace.map(str::to_string),
         name: name.to_string(),
-        id: Some(id.to_string()),
+        id: Some(item_id.to_string()),
         status: Some(status),
     })
 }
 
-fn item_call_id(item: &OutputItem) -> Option<&str> {
-    match item {
-        OutputItem::FunctionCall(call) => Some(&call.call_id),
-        OutputItem::McpCall(call) => Some(&call.id),
-        OutputItem::WebSearchCall(call) => Some(&call.id),
+/// A coding adapter's rendered item carries its own (possibly marked) id; lifecycle events must
+/// name that one, not the raw call id.
+fn rendered_item_id<'a>(slot: &'a OutputItem, call_id: &'a str) -> &'a str {
+    match slot {
+        OutputItem::FunctionCall(call) => call.id.as_deref(),
+        OutputItem::ToolSearchCall(call) => Some(call.id.as_str()),
+        OutputItem::McpCall(call) => Some(call.id.as_str()),
+        OutputItem::WebSearchCall(call) => Some(call.id.as_str()),
         _ => None,
     }
+    .unwrap_or(call_id)
 }
 
 fn mcp_call_item(
@@ -620,6 +633,19 @@ fn mcp_call_item(
         } else {
             MCPToolCallStatus::Completed
         }),
+    })
+}
+
+fn mcp_call_in_progress_item(id: &str, name: &str, provider: &str, raw_args: &str) -> OutputItem {
+    OutputItem::McpCall(MCPToolCall {
+        arguments: raw_args.to_string(),
+        id: id.to_string(),
+        name: name.to_string(),
+        server_label: provider.to_string(),
+        approval_request_id: None,
+        error: None,
+        output: None,
+        status: Some(MCPToolCallStatus::InProgress),
     })
 }
 
@@ -742,6 +768,14 @@ impl OpenContentKind {
     }
 }
 
+/// Where an opened call's item lives: its wire `output_index` and its slot in the recorded output.
+#[derive(Clone, Copy)]
+struct OpenCallSlot {
+    output_index: u32,
+    recorded_position: usize,
+    adapter_rendered: bool,
+}
+
 struct ResponsesFraming {
     model: String,
     response_id: String,
@@ -753,9 +787,15 @@ struct ResponsesFraming {
     /// needs the full list (a client reading only `response.completed` builds its final object
     /// from that field alone, not from the deltas it may have skipped).
     output: Vec<OutputItem>,
-    /// A function call's `output_index`, from dispatch until its iteration completes (server tool)
-    /// or the response ends (client tool, never looked up again).
-    open_calls: HashMap<String, u32>,
+    /// An opened call's `output_index` until it resolves: a server tool with its iteration, a
+    /// coding adapter's rendered client call when the host hands it back as a client call.
+    open_calls: HashMap<String, OpenCallSlot>,
+    /// A complete tool call the host has not classified yet. The host decides right after the
+    /// chunk (`emit_client_tool_calls` / `emit_dispatched_server_tool` /
+    /// `emit_refused_server_tool`), so items open in the model's order and as their final type:
+    /// openai-python rejects an item whose type changes between `output_item.added` and
+    /// `output_item.done`.
+    unclassified_calls: Vec<ToolCall>,
     pending_baseten: ResponsesExtension,
     open_iteration_scope: OpenIterationScope<ResponseUsage>,
     coding_adapter: Option<Box<dyn CodingAdapter>>,
@@ -781,6 +821,7 @@ impl ResponsesFraming {
             open_content_item: None,
             output: Vec::new(),
             open_calls: HashMap::new(),
+            unclassified_calls: Vec::new(),
             pending_baseten: ResponsesExtension::default(),
             open_iteration_scope: OpenIterationScope::default(),
             coding_adapter,
@@ -904,6 +945,153 @@ impl ResponsesFraming {
         )
     }
 
+    fn take_unclassified_call(&mut self, call_id: &str) -> Option<ToolCall> {
+        let position = self
+            .unclassified_calls
+            .iter()
+            .position(|call| call.id == call_id)?;
+        Some(self.unclassified_calls.remove(position))
+    }
+
+    /// Opens a classified server call's `mcp_call`; a coding adapter's rendered call already opened
+    /// in `on_chunk`.
+    fn open_server_call(&mut self, server_call: &ServerToolCall) -> Vec<String> {
+        let mut frames = Vec::new();
+        if let Some(call) = self.take_unclassified_call(&server_call.call.id) {
+            let open_slot = self.open_mcp_call(&mut frames, &call, &server_call.provider);
+            self.open_calls.insert(call.id, open_slot);
+        }
+        frames
+    }
+
+    /// A client tool call, complete in one go: one marked item id on every event.
+    fn emit_function_call(&mut self, frames: &mut Vec<String>, call: &ToolCall) {
+        self.close_open(frames);
+        let (name, namespace) = call_identity(self.coding_adapter.as_deref(), &call.name);
+        let item_id = prefixed_item_id(FUNCTION_CALL_ID_PREFIX, &call.id);
+        let output_index = self.open_item(
+            frames,
+            &function_call_item(
+                &item_id,
+                &call.id,
+                &name,
+                namespace.as_deref(),
+                "",
+                OutputStatus::InProgress,
+            ),
+        );
+        frames.push(self.event_frame(
+            ResponsesEvent::FunctionCallArgumentsDelta,
+            serde_json::json!({"output_index": output_index, "item_id": item_id, "delta": call.raw_args}),
+        ));
+        frames.push(self.event_frame(
+            ResponsesEvent::FunctionCallArgumentsDone,
+            serde_json::json!({"output_index": output_index, "item_id": item_id, "name": &name, "arguments": call.raw_args}),
+        ));
+        self.record_item_done(
+            frames,
+            output_index,
+            function_call_item(
+                &item_id,
+                &call.id,
+                &name,
+                namespace.as_deref(),
+                &call.raw_args,
+                OutputStatus::Completed,
+            ),
+        );
+    }
+
+    /// A server tool call opens as an `in_progress` `mcp_call`; its iteration's result closes the
+    /// same item via [`Self::replace_recorded_item_done`].
+    fn open_mcp_call(
+        &mut self,
+        frames: &mut Vec<String>,
+        call: &ToolCall,
+        provider: &str,
+    ) -> OpenCallSlot {
+        self.close_open(frames);
+        let item_id = prefixed_item_id(MCP_CALL_ID_PREFIX, &call.id);
+        let output_index = self.open_item(
+            frames,
+            &mcp_call_in_progress_item(&item_id, &call.name, provider, ""),
+        );
+        frames.push(self.event_frame(
+            ResponsesEvent::McpCallInProgress,
+            serde_json::json!({"output_index": output_index, "item_id": item_id}),
+        ));
+        frames.push(self.event_frame(
+            ResponsesEvent::McpCallArgumentsDelta,
+            serde_json::json!({"output_index": output_index, "item_id": item_id, "delta": call.raw_args}),
+        ));
+        frames.push(self.event_frame(
+            ResponsesEvent::McpCallArgumentsDone,
+            serde_json::json!({"output_index": output_index, "item_id": item_id, "arguments": call.raw_args}),
+        ));
+        let recorded_position = self.output.len();
+        self.output.push(mcp_call_in_progress_item(
+            &item_id,
+            &call.name,
+            provider,
+            &call.raw_args,
+        ));
+        OpenCallSlot {
+            output_index,
+            recorded_position,
+            adapter_rendered: false,
+        }
+    }
+
+    /// Closes a call the coding adapter opened in `on_chunk`. Its item keeps the rendered type:
+    /// switching to an `mcp_call` at the same `output_index` breaks SDK accumulators.
+    fn resolve_rendered_call(
+        &mut self,
+        frames: &mut Vec<String>,
+        call: &ToolCall,
+        open_slot: OpenCallSlot,
+        status: ToolCallStatus,
+    ) {
+        let Some((rendered, slot)) = self.rendered_call(call, status) else {
+            debug_assert!(
+                false,
+                "rendered call `{}` has no resolved rendering",
+                call.id
+            );
+            tracing::error!(
+                event_name = "responses.rendered_call_unresolved",
+                "Coding adapter rendered call `{}` in progress but not resolved",
+                call.id
+            );
+            if let Some(in_progress_item) = self.rendered_calls.get(&call.id).cloned() {
+                self.emit_item_done(frames, open_slot.output_index, &in_progress_item);
+            }
+            return;
+        };
+        self.emit_lifecycle(
+            frames,
+            open_slot.output_index,
+            rendered_item_id(&slot, &call.id),
+            &rendered.lifecycle_events,
+        );
+        self.emit_item_done(frames, open_slot.output_index, &rendered.item);
+        self.replace_recorded_item(open_slot.recorded_position, slot);
+        self.rendered_calls.insert(call.id.clone(), rendered.item);
+    }
+
+    /// The host classifies every call right after its chunk; one left over at the end still
+    /// reaches the client, as the client-shaped item it would most likely be.
+    fn flush_unclassified_calls(&mut self, frames: &mut Vec<String>) {
+        for call in std::mem::take(&mut self.unclassified_calls) {
+            debug_assert!(false, "tool call `{}` was never classified", call.id);
+            tracing::error!(
+                event_name = "responses.unclassified_call",
+                "Tool call `{}` was never classified client or server",
+                call.id
+            );
+            self.emit_function_call(frames, &call);
+        }
+    }
+
     fn emit_lifecycle(
         &mut self,
         frames: &mut Vec<String>,
@@ -933,43 +1121,45 @@ impl ResponsesFraming {
     }
 
     /// A brand-new item's `output_item.done`: emit it, then record it (feeds the terminal
-    /// envelope's `response.output`). A server tool's later resolution replaces this recorded copy
-    /// in place via [`Self::replace_recorded_item_done`] rather than appending a second one.
+    /// envelope's `response.output`).
     fn record_item_done(&mut self, frames: &mut Vec<String>, output_index: u32, item: OutputItem) {
         self.emit_item_done(frames, output_index, &item);
         self.output.push(item);
     }
 
-    /// A previously recorded item resolving to its final shape (the `function_call` placeholder
-    /// becoming an `mcp_call`): emit the new `output_item.done` a live client sees, and replace the
-    /// recorded copy so the terminal envelope's `response.output` doesn't carry both.
+    /// A recorded in-progress item resolving (an `mcp_call` getting its result): emit its one
+    /// `output_item.done`, and replace the recorded copy so the terminal envelope's
+    /// `response.output` doesn't carry both.
     fn replace_recorded_item_done(
         &mut self,
         frames: &mut Vec<String>,
-        output_index: u32,
+        open_slot: OpenCallSlot,
         item: OutputItem,
     ) {
-        self.emit_item_done(frames, output_index, &item);
-        self.replace_recorded_item(item);
+        self.emit_item_done(frames, open_slot.output_index, &item);
+        self.replace_recorded_item(open_slot.recorded_position, item);
     }
 
-    fn replace_recorded_item(&mut self, item: OutputItem) {
-        let call_id = item_call_id(&item).map(str::to_string);
-        let slot = call_id.as_deref().and_then(|call_id| {
-            self.output
-                .iter_mut()
-                .find(|recorded| item_call_id(recorded) == Some(call_id))
-        });
-        match slot {
-            Some(slot) => *slot = item,
+    /// By recorded position, not id: a call id a later iteration reuses still resolves each call to
+    /// its own item.
+    fn replace_recorded_item(&mut self, recorded_position: usize, item: OutputItem) {
+        match self.output.get_mut(recorded_position) {
+            Some(recorded) => {
+                debug_assert_eq!(
+                    rendered_item_id(recorded, ""),
+                    rendered_item_id(&item, ""),
+                    "recorded position {recorded_position} holds another item"
+                );
+                *recorded = item;
+            }
             None => {
                 debug_assert!(
                     false,
-                    "resolved item {call_id:?} has no recorded placeholder"
+                    "resolved item at position {recorded_position} has no recorded in-progress item"
                 );
                 tracing::error!(
-                    event_name = "responses.placeholder_missing",
-                    "Resolved item {call_id:?} has no recorded placeholder"
+                    event_name = "responses.in_progress_item_missing",
+                    "Resolved item at position {recorded_position} has no recorded in-progress item"
                 );
                 self.output.push(item);
             }
@@ -1060,47 +1250,23 @@ impl StreamFraming for ResponsesFraming {
                     self.emit_lifecycle(
                         &mut frames,
                         output_index,
-                        &call.id,
+                        rendered_item_id(&slot, &call.id),
                         &rendered.lifecycle_events,
                     );
+                    let recorded_position = self.output.len();
                     self.output.push(slot);
                     self.rendered_calls.insert(call.id.clone(), rendered.item);
-                    self.open_calls.insert(call.id.clone(), output_index);
+                    self.open_calls.insert(
+                        call.id.clone(),
+                        OpenCallSlot {
+                            output_index,
+                            recorded_position,
+                            adapter_rendered: true,
+                        },
+                    );
                     return frames;
                 }
-                // A server tool's result later replaces this via `emit_completed_iteration`;
-                // the item id is `call.id` on every event.
-                let (name, namespace) = call_identity(self.coding_adapter.as_deref(), &call.name);
-                let output_index = self.open_item(
-                    &mut frames,
-                    &function_call_item(
-                        &call.id,
-                        &name,
-                        namespace.as_deref(),
-                        "",
-                        OutputStatus::InProgress,
-                    ),
-                );
-                frames.push(self.event_frame(
-                    ResponsesEvent::FunctionCallArgumentsDelta,
-                    serde_json::json!({"output_index": output_index, "item_id": call.id, "delta": call.raw_args}),
-                ));
-                frames.push(self.event_frame(
-                    ResponsesEvent::FunctionCallArgumentsDone,
-                    serde_json::json!({"output_index": output_index, "item_id": call.id, "name": &name, "arguments": call.raw_args}),
-                ));
-                self.record_item_done(
-                    &mut frames,
-                    output_index,
-                    function_call_item(
-                        &call.id,
-                        &name,
-                        namespace.as_deref(),
-                        &call.raw_args,
-                        OutputStatus::Completed,
-                    ),
-                );
-                self.open_calls.insert(call.id.clone(), output_index);
+                self.unclassified_calls.push(call.clone());
             }
             // Buffered for the terminal-failure envelope only; the regular finish gets the loop's
             // cumulative usage as an argument.
@@ -1110,8 +1276,7 @@ impl StreamFraming for ResponsesFraming {
         frames
     }
 
-    /// Server-tool results only: resolves the recorded `function_call` placeholder into its
-    /// `mcp_call` at the same `output_index`.
+    /// Server-tool results only: closes each call's `mcp_call` at its `output_index`.
     fn emit_completed_iteration(&mut self, iteration: &CompletedIteration<'_>) -> Vec<String> {
         let mut frames = Vec::new();
         if iteration.invocations.is_empty() {
@@ -1125,66 +1290,84 @@ impl StreamFraming for ResponsesFraming {
         } in iteration.invocations
         {
             let call = &server_call.call;
-            let Some(output_index) = self.open_calls.remove(&call.id) else {
-                debug_assert!(false, "result for undispatched call `{}`", call.id);
-                tracing::error!(
-                    event_name = "responses.undispatched_result",
-                    "Result for undispatched call `{}`",
-                    call.id
-                );
-                continue;
+            let open_slot = match self.open_calls.remove(&call.id) {
+                Some(open_slot) => open_slot,
+                // A server call the host never announced opens and resolves here.
+                None => match self.take_unclassified_call(&call.id) {
+                    Some(call) => self.open_mcp_call(&mut frames, &call, &server_call.provider),
+                    None => {
+                        debug_assert!(false, "result for undispatched call `{}`", call.id);
+                        tracing::error!(
+                            event_name = "responses.undispatched_result",
+                            "Result for undispatched call `{}`",
+                            call.id
+                        );
+                        continue;
+                    }
+                },
             };
             let resolved = if output.is_error() {
                 ToolCallStatus::Failed
             } else {
                 ToolCallStatus::Completed
             };
-            if let Some((rendered, slot)) = self.rendered_call(call, resolved) {
-                self.emit_lifecycle(
-                    &mut frames,
-                    output_index,
-                    &call.id,
-                    &rendered.lifecycle_events,
-                );
-                self.emit_item_done(&mut frames, output_index, &rendered.item);
-                self.replace_recorded_item(slot);
-                self.rendered_calls.insert(call.id.clone(), rendered.item);
+            if open_slot.adapter_rendered {
+                self.resolve_rendered_call(&mut frames, call, open_slot, resolved);
                 continue;
             }
             let text = output.text();
+            let item_id = prefixed_item_id(MCP_CALL_ID_PREFIX, &call.id);
             frames.push(self.event_frame(
                 if output.is_error() {
                     ResponsesEvent::McpCallFailed
                 } else {
                     ResponsesEvent::McpCallCompleted
                 },
-                serde_json::json!({"output_index": output_index, "item_id": call.id}),
+                serde_json::json!({"output_index": open_slot.output_index, "item_id": item_id}),
             ));
             let item = mcp_call_item(
-                &call.id,
+                &item_id,
                 &call.name,
                 &server_call.provider,
                 &call.raw_args,
                 &text,
                 output.is_error(),
             );
-            self.replace_recorded_item_done(&mut frames, output_index, item);
+            self.replace_recorded_item_done(&mut frames, open_slot, item);
         }
         frames
     }
 
-    fn emit_client_tool_calls(&mut self, _calls: &[ToolCall]) -> Vec<String> {
-        // Already streamed as `function_call` items by `on_chunk`.
-        Vec::new()
+    fn emit_client_tool_calls(&mut self, calls: &[ToolCall]) -> Vec<String> {
+        let mut frames = Vec::new();
+        for call in calls {
+            if let Some(call) = self.take_unclassified_call(&call.id) {
+                self.emit_function_call(&mut frames, &call);
+                continue;
+            }
+            // A coding adapter's rendered client call opened in `on_chunk`; the client owns its
+            // execution, so it completes here (Codex's client `tool_search_call`).
+            if let Some(open_slot) = self.open_calls.remove(&call.id) {
+                self.resolve_rendered_call(&mut frames, call, open_slot, ToolCallStatus::Completed);
+            }
+        }
+        frames
     }
 
     fn emit_dispatched_server_tool(
         &mut self,
         _iteration: u32,
-        _server_call: &ServerToolCall,
+        server_call: &ServerToolCall,
     ) -> Vec<String> {
-        // Ditto: the native `function_call` placeholder already went out, same id and arguments.
-        Vec::new()
+        self.open_server_call(server_call)
+    }
+
+    fn emit_refused_server_tool(
+        &mut self,
+        _iteration: u32,
+        server_call: &ServerToolCall,
+    ) -> Vec<String> {
+        self.open_server_call(server_call)
     }
 
     fn stage_iteration(&mut self, staged: StagedIteration<'_>) -> Vec<String> {
@@ -1217,6 +1400,7 @@ impl StreamFraming for ResponsesFraming {
         let mut frames = Vec::new();
         self.ensure_started(&mut frames);
         self.close_open(&mut frames);
+        self.flush_unclassified_calls(&mut frames);
         self.pending_baseten.merge(ResponsesExtension {
             request: termination.request_scope(server_tool_calls),
             ..ResponsesExtension::default()
@@ -1270,6 +1454,7 @@ impl StreamFraming for ResponsesFraming {
         let mut frames = Vec::new();
         self.ensure_started(&mut frames);
         self.close_open_with(&mut frames, OutputStatus::Incomplete);
+        self.flush_unclassified_calls(&mut frames);
         let error_object = ResponseError {
             misalignment: None,
             code: if error.http_status == Some(429) {
@@ -1311,6 +1496,7 @@ impl StreamFraming for ResponsesFraming {
         let mut frames = Vec::new();
         self.ensure_started(&mut frames);
         self.close_open(&mut frames);
+        self.flush_unclassified_calls(&mut frames);
         // `error_code` is total on projected errors; "error" is a never-expected backstop.
         debug_assert!(error_code.is_some(), "projected error without error_code");
         let error_object = ResponseError {

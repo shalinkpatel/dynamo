@@ -2122,10 +2122,9 @@ mod tests {
                             cache_control: None,
                         },
                         AnthropicContentBlock::Image {
-                            source: AnthropicImageSource {
-                                source_type: "base64".into(),
+                            source: AnthropicImageSource::Base64 {
                                 media_type: "image/png".into(),
-                                data: "iVBORw0KGgo=".into(), // tiny valid-ish base64
+                                data: "iVBORw0KGgo=".into(),
                             },
                         },
                     ],
@@ -2263,8 +2262,7 @@ mod tests {
                     content: AnthropicMessageContent::Blocks {
                         content: vec![
                             AnthropicContentBlock::Image {
-                                source: AnthropicImageSource {
-                                    source_type: "base64".into(),
+                                source: AnthropicImageSource::Base64 {
                                     media_type: "image/jpeg".into(),
                                     data: "/9j/4AAQ".into(),
                                 },

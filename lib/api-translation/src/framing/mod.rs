@@ -174,6 +174,16 @@ pub trait StreamFraming: Send {
         iteration: u32,
         server_call: &ServerToolCall,
     ) -> Vec<String>;
+    /// One server tool the host refuses to run (budget, fan-out cap), at the point it decides; its
+    /// error result still arrives with the iteration. Responses opens the call's item here so it
+    /// keeps the model's order; the other protocols already streamed it or record nothing.
+    fn emit_refused_server_tool(
+        &mut self,
+        _iteration: u32,
+        _server_call: &ServerToolCall,
+    ) -> Vec<String> {
+        Vec::new()
+    }
     /// Client-executed tool calls on the terminal iteration. CC emits them natively; Messages
     /// already streamed them as `tool_use` blocks.
     fn emit_client_tool_calls(&mut self, calls: &[ToolCall]) -> Vec<String>;

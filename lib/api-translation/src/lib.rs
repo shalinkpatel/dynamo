@@ -97,9 +97,20 @@ mod tests;
 /// turn resolves to the same call id the model issued.
 pub const SERVER_TOOL_USE_ID_PREFIX: &str = "srvtoolu_";
 
-/// Anthropic's discriminator value for a base64-inline image source — the only image source kind
-/// translatable to a CC data-URI part.
-pub(crate) const IMAGE_SOURCE_TYPE_BASE64: &str = "base64";
+/// Responses item-id markers: an emitted item's `id` is `<marker><call id>`, and ingress strips the
+/// marker exactly once. OpenAI checks replayed item-id prefixes (`fc`, `mcp`, `ws`), so a session can
+/// move from a Baseten model to an OpenAI one with ids that carry `_` (Kimi's), which Codex keeps.
+pub(crate) const MCP_CALL_ID_PREFIX: &str = "mcp_b10_";
+pub(crate) const FUNCTION_CALL_ID_PREFIX: &str = "fc_b10_";
+pub const WEB_SEARCH_CALL_ID_PREFIX: &str = "ws_b10_";
+
+pub fn prefixed_item_id(prefix: &str, id: &str) -> String {
+    format!("{prefix}{id}")
+}
+
+pub fn strip_item_id_prefix<'a>(prefix: &str, id: &'a str) -> &'a str {
+    id.strip_prefix(prefix).unwrap_or(id)
+}
 
 /// Channel carrying encoded SSE frames from the loop/emitter to the HTTP egress.
 pub type SseFrameTx = tokio::sync::mpsc::Sender<String>;

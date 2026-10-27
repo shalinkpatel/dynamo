@@ -380,11 +380,27 @@ fn b10_tool_result_malformed_tool_reference_stays_text() {
     assert!(content.contains("lookup_stock"), "content: {content}");
 }
 
+/// Anthropic accepts `url` image sources; the URL reaches the model as a CC image part, in user
+/// content and in `tool_result` content alike.
 #[test]
-fn tool_result_non_base64_image_source_is_refused() {
+fn url_image_source_becomes_an_image_part() {
     let msg = anthropic_message(json!({"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "c1", "content": [
-            {"type": "image", "source": {"type": "url", "media_type": "image/png", "data": "https://x/y.png"}},
+            {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+        ]},
+        {"type": "image", "source": {"type": "url", "url": "https://x/z.png"}},
+        {"type": "text", "text": "compare"},
+    ]}));
+    let out = translated(&msg);
+    assert_eq!(out[0]["content"][0]["image_url"]["url"], "https://x/y.png");
+    assert_eq!(out[1]["content"][0]["image_url"]["url"], "https://x/z.png");
+}
+
+#[test]
+fn tool_result_unknown_image_source_is_refused() {
+    let msg = anthropic_message(json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "c1", "content": [
+            {"type": "image", "source": {"type": "file", "file_id": "file-1"}},
         ]},
     ]}));
     let mut cc_messages = Vec::new();
@@ -396,7 +412,7 @@ fn tool_result_non_base64_image_source_is_refused() {
         "refusal: {refusal}"
     );
     assert!(
-        refusal.detail().contains("image source type"),
+        refusal.detail().contains("image source type \"file\""),
         "refusal: {refusal}"
     );
 }
@@ -1384,6 +1400,65 @@ fn adapt_responses_function_call_output_splits_the_turn() {
         json!({"role": "tool", "tool_call_id": "c1", "content": "72F"})
     );
     assert_eq!(out[2]["content"], "It's 72F.");
+}
+
+/// A replayed `mcp_call` loses exactly the `mcp_b10_` marker this crate emits, so the model sees
+/// its own call id; an unmarked id passes through.
+#[test]
+fn adapt_responses_replayed_mcp_call_strips_the_item_id_marker() {
+    for (item_id, call_id) in [("mcp_b10_call_abc", "call_abc"), ("mcp_abc", "mcp_abc")] {
+        let out = responses_input(json!([{
+            "type": "mcp_call", "id": item_id, "name": "baseten__stub__search",
+            "server_label": "stub", "arguments": "{}", "output": "RESULT"
+        }]));
+        assert_eq!(out[0]["tool_calls"][0]["id"], call_id);
+        assert_eq!(out[1]["tool_call_id"], call_id);
+    }
+}
+
+/// Codex `view_image`: an image in a `function_call_output` reaches the model as a CC image part
+/// in place; a text-only part list stays one joined string.
+#[test]
+fn adapt_responses_function_call_output_keeps_images_as_tool_image_parts() {
+    let out = responses_input(json!([
+        {"type": "function_call", "call_id": "c1", "name": "view_image", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": [
+            {"type": "input_text", "text": "screenshot"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "original"}
+        ]},
+        {"type": "function_call", "call_id": "c2", "name": "read", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c2", "output": [
+            {"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}
+        ]},
+    ]));
+    assert_eq!(
+        out[1]["content"],
+        json!([
+            {"type": "text", "text": "screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "original"}}
+        ])
+    );
+    assert_eq!(out[3]["content"], "a\nb");
+}
+
+#[test]
+fn adapt_responses_function_call_output_refuses_files_and_unresolvable_images() {
+    for (part, expected) in [
+        (json!({"type": "input_file", "file_id": "f1"}), "input_file"),
+        (
+            json!({"type": "input_image", "file_id": "f1"}),
+            "file_id references cannot be resolved",
+        ),
+    ] {
+        let items: Vec<InputItem> = serde_json::from_value(json!([
+            {"type": "function_call", "call_id": "c1", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [part]},
+        ]))
+        .unwrap();
+        let err = translate_input_items(&items, &mut Vec::new(), &mut Losses::default())
+            .expect_err("unresolvable tool output part must be refused");
+        assert!(err.contains(expected), "{err}");
+    }
 }
 
 /// A server tool's `mcp_call` carries its own result — one item, already resolved — so it becomes

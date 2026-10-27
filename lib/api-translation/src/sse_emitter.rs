@@ -57,6 +57,19 @@ impl SseEmitter {
         .await
     }
 
+    pub async fn emit_refused_server_tool(
+        &mut self,
+        iteration: u32,
+        server_call: &ServerToolCall,
+    ) -> Result<(), TranslationError> {
+        Self::send_all(
+            &self.tx,
+            self.framing
+                .emit_refused_server_tool(iteration, server_call),
+        )
+        .await
+    }
+
     pub async fn emit_client_tool_calls(
         &mut self,
         calls: &[ToolCall],

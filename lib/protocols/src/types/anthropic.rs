@@ -736,13 +736,68 @@ impl<'de> Deserialize<'de> for AnthropicContentBlock {
     }
 }
 
-/// Image source for image content blocks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnthropicImageSource {
-    #[serde(rename = "type")]
-    pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+/// Image source for image content blocks: base64-inline data or a remote URL. Unknown source
+/// kinds are preserved verbatim in `Other` so the converter can refuse them by name.
+#[derive(Debug, Clone)]
+pub enum AnthropicImageSource {
+    Base64 { media_type: String, data: String },
+    Url { url: String },
+    Other(serde_json::Value),
+}
+
+impl Serialize for AnthropicImageSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Base64 { media_type, data } => serde_json::json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            })
+            .serialize(serializer),
+            Self::Url { url } => serde_json::json!({
+                "type": "url",
+                "url": url,
+            })
+            .serialize(serializer),
+            Self::Other(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AnthropicImageSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("base64") => {
+                let media_type = value
+                    .get("media_type")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| serde::de::Error::missing_field("media_type"))?
+                    .to_string();
+                let data = value
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| serde::de::Error::missing_field("data"))?
+                    .to_string();
+                Ok(Self::Base64 { media_type, data })
+            }
+            Some("url") => {
+                let url = value
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| serde::de::Error::missing_field("url"))?
+                    .to_string();
+                Ok(Self::Url { url })
+            }
+            _ => Ok(Self::Other(value)),
+        }
+    }
 }
 
 /// A tool definition.
@@ -1331,5 +1386,35 @@ mod tests {
         let block: ToolResultContentBlock = serde_json::from_value(odd.clone()).unwrap();
         assert!(matches!(block, ToolResultContentBlock::Other(_)));
         assert_eq!(serde_json::to_value(block).unwrap(), odd);
+    }
+
+    #[test]
+    fn image_source_url_variant_round_trips() {
+        let url: AnthropicImageSource = serde_json::from_value(serde_json::json!({
+            "type": "url",
+            "url": "https://x/y.png"
+        }))
+        .unwrap();
+        assert!(matches!(url, AnthropicImageSource::Url { .. }));
+        assert_eq!(
+            serde_json::to_value(&url).unwrap(),
+            serde_json::json!({"type": "url", "url": "https://x/y.png"})
+        );
+
+        let base64: AnthropicImageSource = serde_json::from_value(serde_json::json!({
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "aGVsbG8="
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&base64).unwrap(),
+            serde_json::json!({"type": "base64", "media_type": "image/png", "data": "aGVsbG8="})
+        );
+
+        let other = serde_json::json!({"type": "file", "file_id": "file-1"});
+        let parsed: AnthropicImageSource = serde_json::from_value(other.clone()).unwrap();
+        assert!(matches!(parsed, AnthropicImageSource::Other(_)));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), other);
     }
 }

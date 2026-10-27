@@ -3109,6 +3109,28 @@ dropping, not custom-tool execution support.
 Loss-kind and ReAct-cap-source labels derive from strum instead of hand-written
 match arms, labels unchanged ([#1051](https://github.com/basetenlabs/dynamo/pull/1051)).
 
+Tool-bank cutover regressions ([#1107](https://github.com/basetenlabs/dynamo/pull/1107)):
+a Responses `function_call_output` keeps `input_image` parts as CC tool image
+parts (Codex `view_image`; text-only part lists still join), and Anthropic
+image sources model `base64 | url | other` so a `url` source becomes a CC image
+part (tool-bank's former vendor patch 0002). The Responses stream opens a tool
+call only once the host classifies it (`emit_client_tool_calls` /
+`emit_dispatched_server_tool` / the new `emit_refused_server_tool`, a no-op
+outside Responses), so items keep the model's order: a server tool is one
+`mcp_call` item from
+`output_item.added` to its single `output_item.done`, where it used to open a
+`function_call` placeholder and close a second `mcp_call` at the same index
+(openai-python 3.31+ rejects the type change; BT-16590). Responses item ids
+carry a marker (`fc_b10_` / `mcp_b10_` / `ws_b10_<call id>`; `call_id` stays
+raw) on every event, the terminal envelope and the buffered body, and a
+replayed `mcp_call` loses exactly the `mcp_b10_` marker, so a Codex session can
+move from a Baseten model to an OpenAI one, which checks item-id prefixes
+(tool-bank's former baseten#34041). A resolved item replaces its recorded copy
+by position, so a call id a later iteration reuses resolves to its own item. A
+coding adapter's rendered call that the host hands back as a client call
+completes on the stream (Codex's client `tool_search_call` got no
+`output_item.done`). Baseten-specific.
+
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)
 
 The Messages and Responses handlers in lib/llm canonicalize through the shared

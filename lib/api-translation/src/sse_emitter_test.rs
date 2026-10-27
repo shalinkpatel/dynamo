@@ -632,46 +632,100 @@ async fn responses_iteration_usage_skips_dropped_events_and_rides_the_next_prese
     );
 }
 
-/// A server tool's dispatch (`function_call` placeholder) and resolution (`mcp_call`, call+result
-/// in one item) both surface as `output_item.added`/`.done` — no `baseten` needed to see either.
+/// A server tool is one `mcp_call` item from `output_item.added` to its single `output_item.done`:
+/// openai-python (3.31+) rejects an item whose type changes between the two. Holds for a
+/// dispatched call and for a refused one that only resolves with its iteration.
 #[tokio::test]
-async fn responses_without_coding_adapter_preserves_mcp_call_behavior() {
-    let call = tool_call("c1", "baseten__parallel__web_search", json!({"q": "x"}));
+async fn responses_server_tool_is_one_mcp_call_item() {
+    for dispatched in [true, false] {
+        let call = tool_call("c1", "baseten__parallel__web_search", json!({"q": "x"}));
+        let frames = drive(ClientProtocol::Responses, |mut e| async move {
+            e.push(&SemanticChunk::ToolCall(call.clone()))
+                .await
+                .unwrap();
+            if dispatched {
+                e.emit_dispatched_server_tool(0, &server_tool_call(call.clone()))
+                    .await
+                    .unwrap();
+            }
+            e.emit_completed_iteration(&CompletedIteration {
+                index: 0,
+                invocations: &[ToolInvocation {
+                    server_call: server_tool_call(call),
+                    output: ToolOutput {
+                        content: json!("RESULT"),
+                        status: ServerToolCallStatus::Succeeded,
+                        verdict: BillingVerdict::billable_unreported(),
+                    },
+                }],
+                continuation_messages: &[],
+            })
+            .await
+            .unwrap();
+            e
+        })
+        .await;
+        let item_events: Vec<_> = frames
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.data["type"].as_str(),
+                    Some("response.output_item.added" | "response.output_item.done")
+                )
+            })
+            .collect();
+        assert_eq!(item_events.len(), 2, "dispatched={dispatched}");
+        assert_eq!(item_events[0].data["item"]["type"], "mcp_call");
+        assert_eq!(item_events[0].data["item"]["status"], "in_progress");
+        assert_eq!(item_events[1].data["item"]["type"], "mcp_call");
+        assert_eq!(item_events[0].data["item"]["id"], "mcp_b10_c1");
+        assert_eq!(item_events[1].data["item"]["id"], "mcp_b10_c1");
+        assert_eq!(item_events[1].data["item"]["output"], "RESULT");
+        assert_eq!(
+            item_events[0].data["output_index"],
+            item_events[1].data["output_index"]
+        );
+        for frame in frames.iter().filter(|f| f.data.get("item_id").is_some()) {
+            assert_eq!(frame.data["item_id"], "mcp_b10_c1", "{}", frame.data);
+        }
+        // A delta-applying accumulator rebuilds the arguments exactly once.
+        assert_eq!(item_events[0].data["item"]["arguments"], "");
+        let streamed_arguments: String = frames
+            .iter()
+            .filter(|f| f.data["type"] == "response.mcp_call_arguments.delta")
+            .map(|f| f.data["delta"].as_str().unwrap())
+            .collect();
+        let arguments_done = frames
+            .iter()
+            .find(|f| f.data["type"] == "response.mcp_call_arguments.done")
+            .unwrap();
+        assert_eq!(arguments_done.data["arguments"], streamed_arguments);
+        assert_eq!(item_events[1].data["item"]["arguments"], streamed_arguments);
+    }
+}
+
+/// A client `function_call` item is `fc_b10_<call id>` on every event while `call_id` stays the
+/// model's own, so the client's `function_call_output` still pairs on it.
+#[tokio::test]
+async fn responses_client_function_call_carries_the_marked_item_id() {
+    let call = tool_call("call_xyz", "Read", json!({"path": "/x"}));
     let frames = drive(ClientProtocol::Responses, |mut e| async move {
         e.push(&SemanticChunk::ToolCall(call.clone()))
             .await
             .unwrap();
-        e.emit_completed_iteration(&CompletedIteration {
-            index: 0,
-            invocations: &[ToolInvocation {
-                server_call: server_tool_call(call),
-                output: ToolOutput {
-                    content: json!("RESULT"),
-                    status: ServerToolCallStatus::Succeeded,
-                    verdict: BillingVerdict::billable_unreported(),
-                },
-            }],
-            continuation_messages: &[],
-        })
-        .await
-        .unwrap();
+        e.emit_client_tool_calls(&[call]).await.unwrap();
         e
     })
     .await;
-    let added = frames
+    let done = frames
         .iter()
-        .find(|f| f.data["type"] == "response.output_item.added")
-        .unwrap();
-    assert_eq!(added.data["item"]["type"], "function_call");
-    let resolved = frames
-        .iter()
-        .rev()
-        .find(|f| {
-            f.data["type"] == "response.output_item.done" && f.data["item"]["type"] == "mcp_call"
-        })
-        .expect("the placeholder resolves to an mcp_call item");
-    assert_eq!(resolved.data["item"]["id"], "c1");
-    assert_eq!(resolved.data["item"]["output"], "RESULT");
+        .find(|f| f.data["type"] == "response.output_item.done")
+        .expect("the function_call closes");
+    assert_eq!(done.data["item"]["id"], "fc_b10_call_xyz");
+    assert_eq!(done.data["item"]["call_id"], "call_xyz");
+    for frame in frames.iter().filter(|f| f.data.get("item_id").is_some()) {
+        assert_eq!(frame.data["item_id"], "fc_b10_call_xyz", "{}", frame.data);
+    }
 }
 
 #[tokio::test]
@@ -1087,5 +1141,98 @@ async fn responses_react_cap_names_the_real_reason_directly() {
     assert_eq!(
         terminal.data["response"]["baseten"]["request"]["termination_reason"],
         "max_react_iterations_reached"
+    );
+}
+
+/// A coding adapter's rendered call the host hands back as a client call (Codex's client
+/// `tool_search_call`) completes on the stream: one `output_item.done`, status `completed`.
+#[tokio::test]
+async fn responses_rendered_client_call_completes_when_handed_back() {
+    let name = "tool_search";
+    let call = tool_call("call_ts", name, json!({"q": "weather"}));
+    let frames = drive_with_coding_adapter(
+        ClientProtocol::Responses,
+        Some(codex_adapter(name)),
+        |mut e| async move {
+            e.push(&SemanticChunk::ToolCall(call.clone()))
+                .await
+                .unwrap();
+            e.emit_client_tool_calls(&[call]).await.unwrap();
+            e
+        },
+    )
+    .await;
+    let done: Vec<_> = frames
+        .iter()
+        .filter(|f| f.data["type"] == "response.output_item.done")
+        .collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].data["item"]["status"], "completed");
+    assert_eq!(done[0].data["item"]["id"], "call_ts");
+}
+
+/// Items open in the model's order whatever the host decides per call: a dispatched server call,
+/// a refused one (fan-out cap), then a client call keep output indices 0, 1, 2.
+#[tokio::test]
+async fn responses_tool_calls_keep_the_model_order() {
+    let dispatched = tool_call("c_a", "baseten__parallel__web_search", json!({"q": "a"}));
+    let refused = tool_call("c_b", "baseten__parallel__web_search", json!({"q": "b"}));
+    let client = tool_call("c_c", "Read", json!({"path": "/x"}));
+    let frames = drive(ClientProtocol::Responses, |mut e| async move {
+        e.push(&SemanticChunk::ToolCall(dispatched.clone()))
+            .await
+            .unwrap();
+        e.emit_dispatched_server_tool(0, &server_tool_call(dispatched.clone()))
+            .await
+            .unwrap();
+        e.push(&SemanticChunk::ToolCall(refused.clone()))
+            .await
+            .unwrap();
+        e.emit_refused_server_tool(0, &server_tool_call(refused.clone()))
+            .await
+            .unwrap();
+        e.push(&SemanticChunk::ToolCall(client.clone()))
+            .await
+            .unwrap();
+        e.emit_client_tool_calls(&[client]).await.unwrap();
+        e.emit_completed_iteration(&CompletedIteration {
+            index: 0,
+            invocations: &[
+                ToolInvocation {
+                    server_call: server_tool_call(dispatched),
+                    output: ToolOutput {
+                        content: json!("RESULT"),
+                        status: ServerToolCallStatus::Succeeded,
+                        verdict: BillingVerdict::billable_unreported(),
+                    },
+                },
+                ToolInvocation {
+                    server_call: server_tool_call(refused),
+                    output: ToolOutput {
+                        content: json!("not executed: fan-out cap"),
+                        status: ServerToolCallStatus::Failed,
+                        verdict: BillingVerdict::billable_unreported(),
+                    },
+                },
+            ],
+            continuation_messages: &[],
+        })
+        .await
+        .unwrap();
+        e
+    })
+    .await;
+    let added: Vec<_> = frames
+        .iter()
+        .filter(|f| f.data["type"] == "response.output_item.added")
+        .map(|f| (f.data["output_index"].clone(), f.data["item"]["id"].clone()))
+        .collect();
+    assert_eq!(
+        added,
+        vec![
+            (json!(0), json!("mcp_b10_c_a")),
+            (json!(1), json!("mcp_b10_c_b")),
+            (json!(2), json!("fc_b10_c_c")),
+        ]
     );
 }
