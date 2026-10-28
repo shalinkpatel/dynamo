@@ -2285,6 +2285,14 @@ Fork PR: [#1060](https://github.com/basetenlabs/dynamo/pull/1060).
 
 Regressions cover failed/successful repair, bounded weak cleanup candidates, pinned/revived/replacement leaves, split-born dead suffixes, and released prefix capacity with preserved children. Drop when the fork advances to an upstream release containing equivalent fixes; retain the focused tests.
 
+### NATS client backports
+
+Status: `upstream-sync`
+
+Verified on Baseten's production router in kind with the baseten repo's `mp/baseten_dynamo/deploy/kind-dynamo-nats-test.sh`. Drop each when the fork advances to an upstream release containing it.
+
+- async-nats 0.45.0 → 0.49.1 from [#10759](https://github.com/ai-dynamo/dynamo/pull/10759) (`lru` and `criterion` bumps left out): `connection_timeout` covers the whole reconnect handshake (nats-io/nats.rs#1544), so a server that accepts TCP and never answers no longer wedges the client.
+
 Replay notes:
 
 Before replaying onto a newer upstream tag, search upstream history for these
