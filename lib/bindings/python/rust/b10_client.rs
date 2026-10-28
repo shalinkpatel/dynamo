@@ -354,6 +354,9 @@ impl GenerationCoordinator {
                             admission.prefill_worker_id,
                             admission.prefill_dp_rank,
                         );
+                        context.record_prefill_worker_name(
+                            coordinator.worker_pod_name(admission.prefill_worker_id),
+                        );
                     }
                     Python::with_gil(|py| {
                         DeniedGenerationRequest::new(
@@ -367,6 +370,9 @@ impl GenerationCoordinator {
                     context.record_prefill_worker(
                         generated.admission.prefill_worker_id,
                         generated.admission.prefill_dp_rank,
+                    );
+                    context.record_prefill_worker_name(
+                        coordinator.worker_pod_name(generated.admission.prefill_worker_id),
                     );
                     if let (Some(worker_id), Some(dp_rank)) = (
                         generated.admission.decode_worker_id,

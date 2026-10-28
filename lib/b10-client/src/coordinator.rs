@@ -21,6 +21,7 @@ use dynamo_kv_router::protocols::{
     RouterBackpressureReason, RouterRequest, RouterResponse as RsRouterResponse,
 };
 use dynamo_llm::discovery::{RuntimeConfigWatch, runtime_config_watch};
+use dynamo_llm::local_model::b10_pod_name::BASETEN_POD_NAME_RUNTIME_KEY;
 use dynamo_runtime::component::Endpoint;
 use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
 use dynamo_runtime::pipeline::{
@@ -225,6 +226,13 @@ impl RouterWorkerCoordinator {
 
     pub fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    /// Kubernetes pod name of the worker the router chose (`worker_id`, as in the router's
+    /// response), read from the model card that worker published. `None` until the runtime
+    /// config watch has the worker, or when the worker published no pod name.
+    pub fn worker_pod_name(&self, worker_id: u64) -> Option<String> {
+        self.worker.worker_pod_name(worker_id)
     }
 
     pub async fn route_and_worker(
@@ -517,6 +525,12 @@ pub trait RouterGuardClient: Send + Sync {
 
     fn stable_routing_id(&self, worker_id: u64) -> Option<String>;
 
+    /// See [`RouterWorkerCoordinator::worker_pod_name`]; clients without the runtime config watch
+    /// have no pod names.
+    fn worker_pod_name(&self, _worker_id: u64) -> Option<String> {
+        None
+    }
+
     async fn direct(
         &self,
         request: RsContext<rmpv::Value>,
@@ -597,6 +611,25 @@ impl RouterGuardClient for JsonRouterGuardClient {
             .get(&worker_id)?
             .stable_routing_id
             .clone()
+    }
+
+    fn worker_pod_name(&self, worker_id: u64) -> Option<String> {
+        let watch = self.runtime_configs.as_ref()?.get()?.borrow();
+        match watch
+            .get(&worker_id)?
+            .get_engine_specific::<String>(BASETEN_POD_NAME_RUNTIME_KEY)
+        {
+            Ok(pod_name) => pod_name.filter(|pod_name| !pod_name.is_empty()),
+            Err(error) => {
+                tracing::warn!(
+                    worker_id,
+                    runtime_key = BASETEN_POD_NAME_RUNTIME_KEY,
+                    %error,
+                    "worker published a pod name that is not a string"
+                );
+                None
+            }
+        }
     }
 
     async fn direct(

@@ -22,6 +22,7 @@ use crate::preprocessor::media::{MediaDecoder, MediaFetcher};
 use crate::request_template::RequestTemplate;
 
 pub mod b10_drain;
+pub mod b10_pod_name;
 pub mod runtime_config;
 
 use runtime_config::ModelRuntimeConfig;
@@ -264,6 +265,7 @@ impl LocalModelBuilder {
         // already supplied one or the env var is unset. Published in etcd so routing
         // layers can keep cache assignments stable across worker restarts.
         self.runtime_config.populate_stable_routing_id_from_env();
+        b10_pod_name::publish_pod_name_from_env(&mut self.runtime_config);
         self.runtime_config
             .validate_config()
             .map_err(anyhow::Error::msg)?;

@@ -464,6 +464,7 @@ fn register_model<'p>(
             if let Some(cfg) = runtime_config {
                 card.runtime_config = cfg.inner;
             }
+            llm_rs::local_model::b10_pod_name::publish_pod_name_from_env(&mut card.runtime_config);
             card.router_config = explicit_router_config.clone();
 
             // Register the Model Deployment Card via discovery interface

@@ -129,6 +129,11 @@ pub struct GenerationCoordinator {
 }
 
 impl GenerationCoordinator {
+    /// Kubernetes pod name of a primary-pool worker; see [`RouterWorkerCoordinator::worker_pod_name`].
+    pub fn worker_pod_name(&self, worker_id: u64) -> Option<String> {
+        self.primary.worker_pod_name(worker_id)
+    }
+
     /// Return the best eligible worker (or prefill/decode pair), without admission.
     pub async fn bid(
         &self,

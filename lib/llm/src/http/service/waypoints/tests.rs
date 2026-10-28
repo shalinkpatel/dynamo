@@ -901,10 +901,11 @@ async fn inspection_does_not_consume_live_request_routing_metadata() {
         let worker = WorkerResponseMetadata {
             prefill_worker_id: None,
             prefill_dp_rank: None,
+            prefill_worker_name: None,
             decode_worker_id: Some(42),
             decode_dp_rank: Some(0),
         };
-        publish_worker_response_metadata(context_id.clone(), worker);
+        publish_worker_response_metadata(context_id.clone(), worker.clone());
         let (status, body) = send(
             inspection,
             "/v1/waypoints",

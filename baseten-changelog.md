@@ -1324,6 +1324,19 @@ and DP rank are recorded in request-scoped `Context.metadata` according to the
 `RouterWorkerPhase` enum (or its backward-compatible exact string values);
 unknown phases fail at the binding boundary.
 
+The Python HTTP frontend returns `x-baseten-serving-pod`, the Kubernetes pod
+name of the worker that ran prefill, which beefeater already reads for
+per-replica metrics. Workers publish their pod name (from `POD_NAME`, set by the
+downward API) under the `baseten_pod_name` key of their MDC `runtime_data`
+(`local_model/b10_pod_name.rs`, called from both the `LocalModelBuilder` and the
+tensor-based `register_model` paths). The frontend's local generation
+coordinator looks the admitted prefill worker up in the existing runtime-config
+watch and records the name as `dynamo.routing.prefill_worker_name` in
+`Context.metadata`; the admission and its proto are unchanged. On
+disaggregated (prefill-first) requests the header names the prefill worker's
+pod. It is omitted when the worker published no pod name and with a remote
+generation coordinator (whose watch is in another process).
+
 The v1.2 health replay also ties readiness to runtime lifetime. The B10 router
 registers the `DistributedRuntime` primary cancellation token with B10 health,
 and `/health_file` returns unhealthy once that token is cancelled even if the

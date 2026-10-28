@@ -267,6 +267,20 @@ impl Context {
         );
     }
 
+    /// Called alongside `record_prefill_worker`; `None` clears a name recorded for an earlier
+    /// worker so the id and name always describe the same pod.
+    pub(crate) fn record_prefill_worker_name(&self, pod_name: Option<String>) {
+        let key = RoutingMetadataKey::PrefillWorkerName.as_str();
+        let mut metadata = self
+            .metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match pod_name {
+            Some(pod_name) => metadata.insert(key.to_string(), pod_name),
+            None => metadata.remove(key),
+        };
+    }
+
     pub(crate) fn record_decode_worker(&self, worker_id: u64, dp_rank: u32) {
         self.record_routed_worker(
             RoutingMetadataKey::DecodeWorkerId.as_str(),
