@@ -82,6 +82,10 @@ impl RemoteGenerationCoordinator {
         validate_remote_options(&options)?;
         let mut wire_request = encode_request(&context, request)?;
         let mut headers = forwarded_headers::take(&mut wire_request.metadata)?;
+        // Nest the remote's spans under this frontend's, not beside it under the caller's.
+        if let Some(trace) = context.trace_context() {
+            headers.insert("traceparent", trace.create_traceparent().parse()?);
+        }
         let request_context = context.inner();
         let session = wire_request
             .metadata
@@ -498,7 +502,17 @@ mod tests {
         let context = RequestContext::new(
             inner,
             Some(trace_context),
-            BTreeMap::from([("tenant".to_string(), "acme".to_string())]),
+            BTreeMap::from([
+                ("tenant".to_string(), "acme".to_string()),
+                (
+                    forwarded_headers::FORWARDED_HEADERS_METADATA_KEY.to_string(),
+                    serde_json::json!([[
+                        "traceparent",
+                        b"00-0123456789abcdef0123456789abcdef-1111111111111111-01".to_vec()
+                    ],])
+                    .to_string(),
+                ),
+            ]),
         );
         let mut worker_request = value(serde_json::json!({
             "model": "test-model",
@@ -587,6 +601,12 @@ mod tests {
         assert!(generated.stream.next().await.is_none());
 
         let (captured, headers) = captured.lock().unwrap().take().unwrap();
+        assert_eq!(
+            headers
+                .get("traceparent")
+                .map(|value| value.to_str().unwrap()),
+            Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01")
+        );
         assert_eq!(
             headers
                 .get("x-session-affinity")
