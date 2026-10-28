@@ -141,6 +141,9 @@ pub mod nats {
     /// NATS server address (e.g., "nats://localhost:4222")
     pub const NATS_SERVER: &str = "NATS_SERVER";
 
+    /// Maximum time in seconds to establish the initial NATS connection.
+    pub const NATS_STARTUP_CONNECT_TIMEOUT_SECONDS: &str = "NATS_STARTUP_CONNECT_TIMEOUT_SECONDS";
+
     /// NATS authentication environment variables (checked in priority order)
     pub mod auth {
         /// Username for NATS authentication (use with NATS_AUTH_PASSWORD)
@@ -664,6 +667,7 @@ mod tests {
             worker::DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT,
             // NATS
             nats::NATS_SERVER,
+            nats::NATS_STARTUP_CONNECT_TIMEOUT_SECONDS,
             nats::auth::NATS_AUTH_USERNAME,
             nats::auth::NATS_AUTH_PASSWORD,
             nats::auth::NATS_AUTH_TOKEN,
