@@ -2398,6 +2398,9 @@ multi-arch). Build-infra only; no runtime behavior changes.
   thereby gain the sccache-verification step, S3 sccache fallback, job
   timeout, lfs skip, and image-tag artifact that previously existed only on
   the dispatched path.
+- wheel_builder touches `lib/**/*.rs` before each maturin build so the
+  persistent cargo target caches never reuse a path crate compiled from
+  another commit's source.
 
 Replay notes:
 
@@ -2958,6 +2961,18 @@ When upstream reworks the SGLang mocker KV manager, keep the `HiCache` calls
 in `SglangKvManager` (event flush, admission, prefill time) and re-port the
 vendored fixes above if upstream lacks them. `node_relay` builds under the
 `index` feature because `peer_index` depends on it.
+
+## PATCH-026: KV-router endpoint-replacement recovery test determinism
+
+`test_query_endpoint_replacement_resets_rank_and_restores_new_target`
+(upstream PR #9505, via #9881) flakes on the loaded 64-core depot runner: the
+first recovery only enqueues its block onto the `KvIndexer` event channel, so
+the replacement's `remove_worker_dp_rank` can drain before the block is
+applied to the trie and the block is re-applied afterward. Added a
+`kv_indexer.flush().await` between the first recovery and the endpoint
+replacement so the old block is in the trie when the removal runs. Test-only;
+no runtime change. Upstream has not fixed this flake; re-apply on rebase, or
+drop it if a future upstream recovery rework makes the test deterministic.
 
 ## GWP Control Plane (global-routing)
 

@@ -523,6 +523,10 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     fi && \
     mkdir -p ${CARGO_TARGET_DIR} && \
     echo "cargo target cache: $(find ${CARGO_TARGET_DIR} -name '*.rlib' -o -name '*.rmeta' 2>/dev/null | wc -l) artifacts" && \
+    # Cargo trusts path-crate artifacts in the persistent target cache by mtime; make the copied
+    # sources newer so a crate built from another commit's source is never reused (sccache still
+    # serves unchanged compilations by content hash).
+    find /opt/dynamo/lib -name '*.rs' -exec touch {} + && \
     source ${VIRTUAL_ENV}/bin/activate && \
     cd /opt/dynamo && \
     uv build --wheel --out-dir /opt/dynamo/dist && \
@@ -692,6 +696,10 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
     fi && \
     mkdir -p ${CARGO_TARGET_DIR} && \
     echo "cargo target cache: $(find ${CARGO_TARGET_DIR} -name '*.rlib' -o -name '*.rmeta' 2>/dev/null | wc -l) artifacts" && \
+    # Cargo trusts path-crate artifacts in the persistent target cache by mtime; make the copied
+    # sources newer so a crate built from another commit's source is never reused (sccache still
+    # serves unchanged compilations by content hash).
+    find /opt/dynamo/lib -name '*.rs' -exec touch {} + && \
     source ${VIRTUAL_ENV}/bin/activate && \
     BINDING_PACKAGES="g2direct" && \
     if [ "$ENABLE_KVBM" = "true" ]; then BINDING_PACKAGES="$BINDING_PACKAGES kvbm"; fi && \

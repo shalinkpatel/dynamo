@@ -1523,6 +1523,13 @@ mod tests {
             })
         })
         .await;
+        // The first recovery only enqueues block 90 onto the indexer's event
+        // channel; the background task may not have applied it to the trie
+        // yet. Flush here so block 90 is actually present before we replace the
+        // endpoint. Otherwise the replacement's remove_worker_dp_rank drains
+        // first (a no-op on an empty trie) and block 90 is re-applied after it,
+        // leaving stale data that the replacement is meant to clear.
+        kv_indexer.flush().await;
 
         client
             .handle_discovered_query_endpoint(DiscoveredQueryEndpoint {
