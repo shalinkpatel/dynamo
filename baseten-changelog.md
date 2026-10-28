@@ -1862,6 +1862,15 @@ endpoints reload without restarting the client. Replay config validation and
 request-local scoring together, retaining exact integer score, overflow, and
 config validation regression tests.
 
+Remote coordinator error status:
+
+A non-2xx `/v1/coordinate` response is returned as a typed
+`RemoteStatusError { status, detail }` and raised to Python as
+`dynamo._core.CoordinatorHttpError` with `status_code`, so the global frontend
+returns the upstream status (e.g. Alyx's 529 load shed) instead of a 500
+([#1135](https://github.com/basetenlabs/dynamo/pull/1135)). Keep the error type
+and the binding mapping together when replaying.
+
 Remote coordinator header forwarding:
 
 The HTTP service captures each request's incoming headers as JSON in the

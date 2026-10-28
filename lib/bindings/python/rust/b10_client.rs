@@ -38,6 +38,30 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+pyo3::create_exception!(
+    dynamo._core,
+    CoordinatorHttpError,
+    pyo3::exceptions::PyRuntimeError
+);
+
+/// Raise a remote coordinator's non-success status as `CoordinatorHttpError`
+/// with `status_code`, so the frontend can return it instead of a 500.
+fn coordinator_error(error: anyhow::Error) -> PyErr {
+    let Some(status) = error
+        .downcast_ref::<dynamo_b10_client::RemoteStatusError>()
+        .map(|error| error.status.as_u16())
+    else {
+        return to_pyerr(error);
+    };
+    Python::with_gil(|py| {
+        let exception = CoordinatorHttpError::new_err(error.to_string());
+        match exception.value(py).setattr("status_code", status) {
+            Ok(()) => exception,
+            Err(error) => error,
+        }
+    })
+}
 use std::time::Duration;
 
 pub(crate) use dynamo_b10_client::DROP_THIS_MESSAGE_KEY;
@@ -322,7 +346,7 @@ impl GenerationCoordinator {
                     GenerationOptions::default(),
                 )
                 .await
-                .map_err(to_pyerr)?;
+                .map_err(coordinator_error)?;
             match outcome {
                 CoreGenerationOutcome::Denied(denied) => {
                     if let Some(admission) = denied.admission {

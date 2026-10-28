@@ -31,7 +31,7 @@ pub use generation::{
     GenerationRequest, PrefillMarkTiming, WorkerLoad, WorkerMode,
 };
 pub use guard::RouterRequestGuard;
-pub use remote::RemoteGenerationCoordinator;
+pub use remote::{RemoteGenerationCoordinator, RemoteStatusError};
 pub use runtime::{CoordinatorClient, GenerationCoordinatorRuntime, LocalCoordinatorOptions};
 pub use service::{GenerationCoordinatorService, RunningGenerationCoordinatorService};
 pub use types::{

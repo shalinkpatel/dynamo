@@ -35,6 +35,26 @@ enum RemoteEndpoints {
 
 type FramedResponse = Pin<Box<dyn Stream<Item = Result<GenerationResponseFrameV1>> + Send>>;
 
+/// Non-success HTTP status from the remote generation service, kept typed so
+/// the frontend can return the upstream status (e.g. 529) instead of a 500.
+#[derive(Debug)]
+pub struct RemoteStatusError {
+    pub status: reqwest::StatusCode,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RemoteStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "generation service returned HTTP {}: {}",
+            self.status, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RemoteStatusError {}
+
 /// Native protobuf HTTP client with optional load- and session-aware remote selection.
 pub struct RemoteGenerationCoordinator {
     endpoints: RemoteEndpoints,
@@ -147,7 +167,7 @@ impl RemoteGenerationCoordinator {
                 .text()
                 .await
                 .unwrap_or_else(|_| "response body unavailable".to_string());
-            bail!("generation service returned HTTP {status}: {detail}");
+            return Err(RemoteStatusError { status, detail }.into());
         }
 
         let mut reader = response_frames(response);

@@ -201,6 +201,10 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "EncoderHttpError",
         m.py().get_type::<b10_encoder::EncoderHttpError>(),
     )?;
+    m.add(
+        "CoordinatorHttpError",
+        m.py().get_type::<b10_client::CoordinatorHttpError>(),
+    )?;
     m.add_class::<b10_client::AdmittedRequest>()?;
     m.add_class::<b10_client::GeneratedRequest>()?;
     m.add_class::<b10_client::DeniedGenerationRequest>()?;

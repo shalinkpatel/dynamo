@@ -450,4 +450,54 @@ mod tests {
         );
         running.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn remote_client_keeps_upstream_error_status() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            COORDINATE_PATH,
+            axum::routing::post(|| async {
+                (
+                    StatusCode::from_u16(529).unwrap(),
+                    r#"{"error":"no available capacity for model"}"#,
+                )
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let remote =
+            RemoteGenerationCoordinator::new(format!("http://{address}{COORDINATE_PATH}")).unwrap();
+        let inner: Arc<dyn AsyncEngineContext> =
+            Arc::new(Controller::new("request-service-529".to_string()));
+        let error = remote
+            .generate(
+                RequestContext::new(inner, None, BTreeMap::new()),
+                GenerationRequest {
+                    routing_request: RouterRequestNew {
+                        tokens: vec![1, 2, 3],
+                        ..Default::default()
+                    },
+                    primary_worker_request: serde_json::from_value(
+                        serde_json::json!({"model": "m", "sampling_params": {}}),
+                    )
+                    .unwrap(),
+                    decode_worker_request: None,
+                },
+                GenerationOptions::default(),
+            )
+            .await
+            .expect_err("a 529 from the remote coordinator must fail the request");
+        let status = error
+            .downcast_ref::<crate::RemoteStatusError>()
+            .expect("upstream status must stay typed")
+            .status;
+        assert_eq!(status.as_u16(), 529);
+        assert!(
+            error
+                .to_string()
+                .contains("no available capacity for model")
+        );
+        server.abort();
+    }
 }

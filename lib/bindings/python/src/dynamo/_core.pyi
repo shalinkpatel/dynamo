@@ -95,6 +95,11 @@ class UnifiedParserStream:
 class EncoderHttpError(RuntimeError):
     status_code: int
 
+class CoordinatorHttpError(RuntimeError):
+    """Non-success HTTP status from a remote generation coordinator."""
+
+    status_code: int
+
 class MediaEmbedding:
     """Encoder mm_kwargs bytes held in Rust; they move into the worker request without a copy."""
 
