@@ -452,6 +452,16 @@ When the interval plus acknowledgment timeout reaches the 30 s primary lease
 TTL, startup logs a warning because detecting a hung connection may take too
 long to recover that lease. For example, 15 s + 10 s stays below the TTL.
 
+Keepalive detects a dark member, but reconnecting through a headless Service
+name can dial it again: the name keeps returning it (`publishNotReadyAddresses`),
+address sorting can put it first on every lookup, and an unbounded connect waits
+~2 min on SYN retries, past the 30 s primary lease (INC-9765, 2026-10-19).
+`DYN_ETCD_CONNECT_TIMEOUT_SECS` bounds each connect (hyper splits it across the
+name's resolved addresses), so a dial to the dead member fails in seconds and the
+reconnect retry reaches a live one before the lease expires. Defaults to 5 s;
+set to 0 to disable. Reconnect backoff is jittered (50-100%)
+(basetenlabs/dynamo#1078).
+
 The frontend HTTP service now registers with the graceful-shutdown tracker for
 the lifetime of its serve+drain future (`HttpService::run` holds a
 `GracefulTaskGuard`, basetenlabs/dynamo#461). Before this, only worker

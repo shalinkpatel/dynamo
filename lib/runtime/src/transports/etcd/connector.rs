@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use etcd_client::ConnectOptions;
 use parking_lot::RwLock;
+use rand::Rng;
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::sleep};
 
@@ -152,6 +153,8 @@ impl BackoffState {
             let backoff = std::cmp::min(backoff, self.max_backoff);
             let backoff = std::cmp::max(backoff, self.min_backoff);
             self.current_backoff = backoff * 2;
+            // Clients that lost the same member reconnect together; jitter spreads them out.
+            let backoff = backoff.mul_f64(rand::rng().random_range(0.5..=1.0));
 
             tracing::debug!(
                 "Applying backoff of {:?} (remaining time: {:?})",

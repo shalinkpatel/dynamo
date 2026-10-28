@@ -177,6 +177,9 @@ pub mod etcd {
     /// Seconds to wait for a keepalive ping ack before the ETCD channel is closed (default 10)
     pub const DYN_ETCD_KEEPALIVE_TIMEOUT_SECS: &str = "DYN_ETCD_KEEPALIVE_TIMEOUT_SECS";
 
+    /// Seconds bounding each ETCD TCP connect, split across a name's resolved addresses (default 5)
+    pub const DYN_ETCD_CONNECT_TIMEOUT_SECS: &str = "DYN_ETCD_CONNECT_TIMEOUT_SECS";
+
     /// ETCD authentication environment variables
     pub mod auth {
         /// Username for ETCD authentication
@@ -671,6 +674,7 @@ mod tests {
             etcd::ETCD_ENDPOINTS,
             etcd::DYN_ETCD_KEEPALIVE_INTERVAL_SECS,
             etcd::DYN_ETCD_KEEPALIVE_TIMEOUT_SECS,
+            etcd::DYN_ETCD_CONNECT_TIMEOUT_SECS,
             etcd::auth::ETCD_AUTH_USERNAME,
             etcd::auth::ETCD_AUTH_PASSWORD,
             etcd::auth::ETCD_AUTH_CA,

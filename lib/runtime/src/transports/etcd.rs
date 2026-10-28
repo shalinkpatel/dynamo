@@ -858,6 +858,16 @@ impl Default for ClientOptions {
             );
         }
 
+        // A member that went dark drops SYNs silently, so an unbounded connect waits on kernel SYN
+        // retries (~2 min) before trying the name's next address, outliving the primary lease.
+        if let Some(timeout) = connect_timeout_from_env() {
+            connect_options = Some(
+                connect_options
+                    .unwrap_or_default()
+                    .with_connect_timeout(timeout),
+            );
+        }
+
         ClientOptions {
             etcd_url: default_servers(),
             etcd_connect_options: connect_options,
@@ -897,6 +907,14 @@ fn keep_alive_from_env() -> Option<(Duration, Duration)> {
         );
     }
     Some((Duration::from_secs(interval), Duration::from_secs(timeout)))
+}
+
+fn connect_timeout_from_env() -> Option<Duration> {
+    let secs = std::env::var(env_etcd::DYN_ETCD_CONNECT_TIMEOUT_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5);
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 fn default_servers() -> Vec<String> {
