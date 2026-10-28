@@ -123,7 +123,7 @@ mod tests {
 
     struct B10TestPublisher;
     impl SequencePublisher for B10TestPublisher {
-        async fn publish_event(&self, _: &ActiveSequenceEvent) -> anyhow::Result<()> {
+        fn enqueue_event(&self, _: ActiveSequenceEvent) -> anyhow::Result<()> {
             Ok(())
         }
         fn publish_load(&self, _: ActiveLoad) {}

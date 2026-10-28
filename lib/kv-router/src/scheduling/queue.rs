@@ -1458,11 +1458,8 @@ mod tests {
     }
 
     impl SequencePublisher for DropResponseOnLoadPublisher {
-        fn publish_event(
-            &self,
-            _event: &ActiveSequenceEvent,
-        ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-            std::future::ready(Ok(()))
+        fn enqueue_event(&self, _event: ActiveSequenceEvent) -> anyhow::Result<()> {
+            Ok(())
         }
 
         fn publish_load(&self, _load: ActiveLoad) {

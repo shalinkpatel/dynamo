@@ -2311,6 +2311,7 @@ Status: `upstream-sync`
 Verified on Baseten's production router in kind with the baseten repo's `mp/baseten_dynamo/deploy/kind-dynamo-nats-test.sh`. Drop each when the fork advances to an upstream release containing it.
 
 - async-nats 0.45.0 → 0.49.1 from [#10759](https://github.com/ai-dynamo/dynamo/pull/10759) (`lru` and `criterion` bumps left out): `connection_timeout` covers the whole reconnect handshake (nats-io/nats.rs#1544), so a server that accepts TCP and never answers no longer wedges the client.
+- Serialized active-sequence publishing from [#11992](https://github.com/ai-dynamo/dynamo/pull/11992): `SequencePublisher::enqueue_event` feeds one bounded (100,000) queue drained by a single NATS publisher task, dropping the newest event when full, instead of one spawned task per event. Ported onto the fork's NATS-only constructor; upstream's ZMQ batch path, standalone replica-sync queue (`services/common/replica_sync.rs`) and slot-tracker changes are left out.
 
 Replay notes:
 

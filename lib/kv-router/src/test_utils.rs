@@ -4,7 +4,6 @@
 //! Shared test utilities for radix tree tests.
 
 use std::collections::HashSet;
-use std::future;
 
 use crate::indexer::KvIndexerInterface;
 use crate::protocols::{
@@ -352,11 +351,8 @@ pub async fn assert_exact_scores(
 pub struct NoopSequencePublisher;
 
 impl SequencePublisher for NoopSequencePublisher {
-    fn publish_event(
-        &self,
-        _event: &ActiveSequenceEvent,
-    ) -> impl future::Future<Output = anyhow::Result<()>> + Send {
-        future::ready(Ok(()))
+    fn enqueue_event(&self, _event: ActiveSequenceEvent) -> anyhow::Result<()> {
+        Ok(())
     }
 
     fn publish_load(&self, _load: ActiveLoad) {}
