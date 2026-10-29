@@ -192,8 +192,15 @@ impl View {
         config: &McmRedisConfig,
         now: DateTime<Utc>,
     ) -> anyhow::Result<HashMap<u64, ModelRuntimeConfig>> {
-        let Some(raw) = &records.routes else {
+        // From the tracked index, Alyx's semantics: a plane is a member while it relays samples.
+        if config.tracked_index.is_none() && !self.route_member(endpoint, records)? {
             return Ok(HashMap::new());
+        }
+        self.workers_from_samples(id, endpoint, records, config, now)
+    }
+    fn route_member(&mut self, endpoint: &McmEndpoint, records: &Records) -> anyhow::Result<bool> {
+        let Some(raw) = &records.routes else {
+            return Ok(false);
         };
         let route: RouteTable = serde_json::from_str(raw)?;
         anyhow::ensure!(
@@ -231,9 +238,16 @@ impl View {
                 .any(|w| w.workload_plane_name == endpoint.workload_plane),
             _ => anyhow::bail!("route must contain one supported rule set"),
         };
-        if !member {
-            return Ok(HashMap::new());
-        }
+        Ok(member)
+    }
+    fn workers_from_samples(
+        &mut self,
+        id: &EndpointId,
+        endpoint: &McmEndpoint,
+        records: &Records,
+        config: &McmRedisConfig,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<HashMap<u64, ModelRuntimeConfig>> {
         let parse_sample = |raw: &String| match serde_json::from_str::<Sample>(raw) {
             Ok(sample)
                 if sample.model_deployment_id == endpoint.model_deployment_id
@@ -438,6 +452,45 @@ fn discovered_endpoints(routes: &[RouteTable]) -> BTreeMap<EndpointId, McmEndpoi
 }
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Alyx refreshes the tracked index every 10s; a deployment none listed for this
+/// long is no longer tracked.
+const INDEX_MAX_AGE_SECS: i64 = 60;
+
+/// One endpoint per plane field of each listed deployment's relayed LSM hash, as
+/// Alyx's dedicated feed reads them. Over the cap, whole deployments are skipped: a
+/// deployment missing some planes would offer only part of its workers.
+fn indexed_endpoints(records: &BTreeMap<String, Records>) -> BTreeMap<EndpointId, McmEndpoint> {
+    let mut endpoints = BTreeMap::new();
+    let mut skipped = 0usize;
+    for (version, records) in records {
+        let planes: Vec<&String> = records
+            .relayed
+            .keys()
+            .filter(|p| !p.trim().is_empty())
+            .collect();
+        if endpoints.len() + planes.len() > MAX_DISCOVERED_ENDPOINTS {
+            skipped += 1;
+            continue;
+        }
+        for plane in planes {
+            endpoints.insert(
+                EndpointId(format!("{version}/{plane}")),
+                McmEndpoint {
+                    model_deployment_id: version.clone(),
+                    workload_plane: plane.clone(),
+                    namespace: None,
+                },
+            );
+        }
+    }
+    if skipped > 0 {
+        tracing::error!(
+            skipped,
+            "MCM tracked-index discovery exceeds {MAX_DISCOVERED_ENDPOINTS} endpoints; skipping deployments"
+        );
+    }
+    endpoints
+}
 /// Bounds the deployments polled each interval, like alyx-lb's dedicated feed.
 const MAX_DISCOVERED_ENDPOINTS: usize = 1000;
 
@@ -484,23 +537,44 @@ impl McmDiscovery {
     }
     async fn read(&mut self) -> anyhow::Result<BTreeMap<String, Records>> {
         // Redis rejects an empty pipeline; nothing tracked is not a failure.
-        if self.config.endpoints.is_empty() {
+        if self.config.endpoints.is_empty() && self.config.tracked_index.is_none() {
             return Ok(BTreeMap::new());
         }
         if self.connection.is_none() {
             self.connection = Some(self.client.get_multiplexed_async_connection().await?);
         }
-        let versions: std::collections::BTreeSet<_> = self
-            .config
-            .endpoints
-            .values()
-            .map(|e| e.model_deployment_id.clone())
-            .collect();
+        let versions: std::collections::BTreeSet<String> = match &self.config.tracked_index {
+            Some(index) => {
+                let listed: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+                    .arg(index)
+                    .arg(Utc::now().timestamp() - INDEX_MAX_AGE_SECS)
+                    .arg("+inf")
+                    .query_async(self.connection.as_mut().expect("connected"))
+                    .await?;
+                // ':' or '/' would make `<version>/<plane>` endpoint ids ambiguous.
+                listed
+                    .into_iter()
+                    .filter(|v| !v.is_empty() && !v.contains([':', '/']))
+                    .collect()
+            }
+            None => self
+                .config
+                .endpoints
+                .values()
+                .map(|e| e.model_deployment_id.clone())
+                .collect(),
+        };
+        if versions.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let routes = self.config.tracked_index.is_none();
         // One bad key (e.g. WRONGTYPE) fails only its own deployment.
         let mut pipeline = redis::pipe();
         pipeline.ignore_errors();
         for version in &versions {
-            pipeline.cmd("GET").arg(format!("rt:{version}"));
+            if routes {
+                pipeline.cmd("GET").arg(format!("rt:{version}"));
+            }
             pipeline
                 .cmd("HGETALL")
                 .arg(format!("bis:{version}:v1:metrics"));
@@ -516,9 +590,13 @@ impl McmDiscovery {
         let mut values = values.into_iter();
         let mut records = BTreeMap::new();
         for version in versions {
-            let route = values
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing route pipeline result"))?;
+            let route = if routes {
+                values
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing route pipeline result"))?
+            } else {
+                redis::Value::Nil
+            };
             let relayed = values
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing metrics pipeline result"))?;
@@ -675,6 +753,9 @@ impl McmDiscovery {
             tokio::time::timeout(Duration::from_millis(self.config.timeout_ms), self.read()).await;
         match result {
             Ok(Ok(records)) => {
+                if self.config.tracked_index.is_some() {
+                    self.config.endpoints = indexed_endpoints(&records);
+                }
                 self.view.refresh(&self.config, &records, Utc::now());
                 self.metrics.record_discovery("ok", self.view.allowed.len());
             }
@@ -728,12 +809,13 @@ impl McmDiscovery {
                     endpoints: self.config.endpoints.clone(),
                     workers: self.view.workers.clone(),
                 };
-                let update = if self.config.namespace.is_some() {
-                    self.view
-                        .topology(&with_discovered(&config, &self.config.endpoints))
-                } else {
-                    self.view.topology(&config)
-                };
+                let update =
+                    if self.config.namespace.is_some() || self.config.tracked_index.is_some() {
+                        self.view
+                            .topology(&with_discovered(&config, &self.config.endpoints))
+                    } else {
+                        self.view.topology(&config)
+                    };
                 let update = match update {
                     Ok(update) => update,
                     Err(error) => {

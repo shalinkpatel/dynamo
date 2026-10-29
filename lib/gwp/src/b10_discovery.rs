@@ -30,6 +30,12 @@ pub struct McmRedisConfig {
     pub endpoints: BTreeMap<EndpointId, McmEndpoint>,
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Redis sorted set of deployment IDs scored by the unix time they were last
+    /// listed (alyx-lb's `alyx:dedicated:tracked`): every deployment listed within a
+    /// minute is tracked, one endpoint per plane its LSM samples report. No route
+    /// tables, no scan.
+    #[serde(default)]
+    pub tracked_index: Option<String>,
     #[serde(default = "default_rescan_secs")]
     pub rescan_interval_secs: u64,
     #[serde(default = "default_poll_ms")]
@@ -65,7 +71,7 @@ fn default_sample_age_secs() -> u64 {
 
 impl DiscoveryConfig {
     pub(crate) fn discovers_endpoints(&self) -> bool {
-        matches!(self, Self::McmRedis(mcm) if mcm.namespace.is_some())
+        matches!(self, Self::McmRedis(mcm) if mcm.namespace.is_some() || mcm.tracked_index.is_some())
     }
 
     pub(crate) fn validate(&self, config: &GwpConfig) -> anyhow::Result<()> {
@@ -80,6 +86,20 @@ impl DiscoveryConfig {
             mcm.poll_interval_ms > 0 && mcm.timeout_ms > 0 && mcm.max_sample_age_secs > 0,
             "discovery intervals must be positive"
         );
+        if let Some(index) = &mcm.tracked_index {
+            anyhow::ensure!(
+                !index.is_empty(),
+                "discovery.tracked_index must be nonempty"
+            );
+            anyhow::ensure!(
+                mcm.namespace.is_none()
+                    && mcm.endpoints.is_empty()
+                    && config.endpoints.is_empty()
+                    && config.routes.is_empty(),
+                "tracked-index discovery derives endpoints and routes; do not configure them or a namespace"
+            );
+            return Ok(());
+        }
         if let Some(namespace) = &mcm.namespace {
             anyhow::ensure!(
                 !namespace.is_empty(),

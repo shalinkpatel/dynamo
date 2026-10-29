@@ -18,6 +18,7 @@ fn b10_config(version: &str) -> McmRedisConfig {
             },
         )]),
         namespace: None,
+        tracked_index: None,
         rescan_interval_secs: 30,
         poll_interval_ms: 10,
         timeout_ms: 1000,
@@ -988,4 +989,179 @@ async fn b10_real_redis_one_bad_deployment_does_not_withdraw_others() {
         .query_async(&mut connection)
         .await
         .unwrap();
+}
+
+fn b10_indexed_config() -> McmRedisConfig {
+    McmRedisConfig {
+        endpoints: BTreeMap::new(),
+        tracked_index: Some("alyx:dedicated:tracked".into()),
+        ..b10_config("unused")
+    }
+}
+
+fn b10_indexed_gwp_config() -> GwpConfig {
+    GwpConfig {
+        discovery: DiscoveryConfig::McmRedis(b10_indexed_config()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn b10_tracked_index_config_rejects_namespace_and_endpoints() {
+    let gwp = b10_indexed_gwp_config();
+    gwp.discovery.validate(&gwp).unwrap();
+    assert!(gwp.discovery.discovers_endpoints());
+    let mut with_namespace = b10_indexed_config();
+    with_namespace.namespace = Some("tenant".into());
+    let bad = GwpConfig {
+        discovery: DiscoveryConfig::McmRedis(with_namespace),
+        ..Default::default()
+    };
+    assert!(bad.discovery.validate(&bad).is_err());
+    let mut with_endpoints = b10_gwp_config("ov");
+    if let DiscoveryConfig::McmRedis(mcm) = &mut with_endpoints.discovery {
+        mcm.tracked_index = Some("alyx:dedicated:tracked".into());
+    }
+    assert!(with_endpoints.discovery.validate(&with_endpoints).is_err());
+}
+
+#[test]
+fn b10_tracked_index_routes_on_samples_without_route_tables() {
+    // Prod's beefeater Redis holds relayed samples for deployments whose route
+    // tables live on other planes: listed deployments are placed from samples.
+    let now = Utc::now();
+    let other = json!({"modelDeploymentId": "ov", "workloadPlaneName": "us-west", "timestamp": now.to_rfc3339(), "llmServiceMetricsV1": {"capacity": 4.0, "consumption": 1.0, "workerIds": ["2"]}}).to_string();
+    let records = BTreeMap::from([(
+        "ov".to_string(),
+        Records {
+            routes: None,
+            relayed: HashMap::from([
+                ("us-east".into(), b10_sample("ov", now, 10.0)),
+                ("us-west".into(), other),
+                (" ".into(), b10_sample("ov", now, 10.0)),
+            ]),
+            observed: HashMap::new(),
+        },
+    )]);
+    let mut config = b10_indexed_config();
+    config.endpoints = indexed_endpoints(&records);
+    assert_eq!(
+        config
+            .endpoints
+            .keys()
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>(),
+        ["ov/us-east", "ov/us-west"]
+    );
+    let mut view = View::default();
+    view.refresh(&config, &records, now);
+    let gwp = with_discovered(&b10_indexed_gwp_config(), &config.endpoints);
+    let update = view.topology(&gwp).unwrap();
+    update.snapshot.validate().unwrap();
+    assert_eq!(
+        update.snapshot.workers[&1].endpoint,
+        EndpointId("ov/us-east".into())
+    );
+    assert_eq!(
+        update.snapshot.workers[&2].endpoint,
+        EndpointId("ov/us-west".into())
+    );
+    assert_eq!(update.snapshot.models["ov"].endpoints.len(), 2);
+    // Samples age out like any relayed sample: no fresh sample, no workers.
+    view.refresh(&config, &records, now + chrono::Duration::seconds(11));
+    assert!(view.topology(&gwp).unwrap().snapshot.workers.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires an isolated Redis at DYN_GWP_TEST_REDIS"]
+async fn b10_real_redis_tracked_index_drives_discovery() {
+    use crate::router::GwpRouterRegistry;
+    let url = std::env::var("DYN_GWP_TEST_REDIS").expect("DYN_GWP_TEST_REDIS");
+    let mut connection = redis::Client::open(url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let index = format!("gwp-test-index-{}", uuid::Uuid::new_v4());
+    let id = || format!("gwp-indexed-{}", uuid::Uuid::new_v4());
+    let (listed, stale, unlisted) = (id(), id(), id());
+    let west = json!({"modelDeploymentId": listed, "workloadPlaneName": "us-west", "timestamp": Utc::now().to_rfc3339(),
+        "llmServiceMetricsV1": {"capacity": 4.0, "consumption": 1.0, "workerIds": ["7"]}})
+    .to_string();
+    let now = Utc::now().timestamp();
+    // No route tables anywhere, as on production's control cluster.
+    let _: () = redis::pipe()
+        .cmd("ZADD")
+        .arg(&index)
+        .arg(now)
+        .arg(&listed)
+        .arg(now - 120)
+        .arg(&stale)
+        .ignore()
+        .cmd("HSET")
+        .arg(format!("bis:{listed}:v1:metrics"))
+        .arg("us-east")
+        .arg(b10_sample(&listed, Utc::now(), 10.0))
+        .arg("us-west")
+        .arg(west)
+        .ignore()
+        .cmd("HSET")
+        .arg(format!("bis:{stale}:v1:metrics"))
+        .arg("us-east")
+        .arg(b10_sample(&stale, Utc::now(), 10.0))
+        .ignore()
+        .cmd("HSET")
+        .arg(format!("bis:{unlisted}:v1:metrics"))
+        .arg("us-east")
+        .arg(b10_sample(&unlisted, Utc::now(), 10.0))
+        .ignore()
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+
+    let registry = GwpRouterRegistry::new_process_local(4, 120).await.unwrap();
+    let mut config = b10_indexed_config();
+    config.tracked_index = Some(index.clone());
+    let mut source = McmDiscovery::new(config, registry.metrics().clone()).unwrap();
+    source.refresh().await;
+    assert_eq!(
+        source
+            .config
+            .endpoints
+            .keys()
+            .map(|id| id.0.clone())
+            .collect::<Vec<_>>(),
+        [format!("{listed}/us-east"), format!("{listed}/us-west")],
+        "only deployments listed within a minute; one endpoint per relayed plane"
+    );
+    assert_eq!(
+        source.view.workers.len(),
+        2,
+        "workers from samples, no route table"
+    );
+
+    // Alyx refreshing a deployment's score brings it in on the next poll.
+    let _: () = redis::cmd("ZADD")
+        .arg(&index)
+        .arg(Utc::now().timestamp())
+        .arg(&stale)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    source.refresh().await;
+    assert_eq!(source.config.endpoints.len(), 3);
+
+    let _: () = redis::cmd("DEL")
+        .arg(&index)
+        .arg(format!("bis:{listed}:v1:metrics"))
+        .arg(format!("bis:{stale}:v1:metrics"))
+        .arg(format!("bis:{unlisted}:v1:metrics"))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    source.refresh().await;
+    assert!(
+        source.config.endpoints.is_empty(),
+        "an empty index tracks nothing"
+    );
 }
