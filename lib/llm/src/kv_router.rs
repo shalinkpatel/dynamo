@@ -56,6 +56,7 @@ pub use dynamo_kv_router::selector;
 
 mod b10_bid;
 pub mod b10_draining_metrics;
+mod b10_load_publisher;
 pub mod b10_metrics_helper;
 mod b10_potential_loads_cache;
 mod b10_virtual_taints;

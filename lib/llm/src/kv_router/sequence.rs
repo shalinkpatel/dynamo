@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::b10_load_publisher::B10LoadPublisher;
 use super::metrics::{ROUTER_SEQUENCE_METRICS, WORKER_LOAD_METRICS};
 use crate::kv_router::{ACTIVE_SEQUENCES_SUBJECT, KV_METRICS_SUBJECT};
 use crate::local_model::runtime_config::ModelRuntimeConfig;
@@ -86,7 +87,7 @@ fn active_sequence_event_channel(
 /// Concrete [`SequencePublisher`] backed by NATS [`EventPublisher`] and Prometheus gauges.
 pub struct RuntimeSequencePublisher {
     event_sender: Option<ActiveSequenceEventSender>,
-    metrics_publisher: Arc<EventPublisher>,
+    load_publisher: B10LoadPublisher,
 }
 
 impl SequencePublisher for RuntimeSequencePublisher {
@@ -98,16 +99,7 @@ impl SequencePublisher for RuntimeSequencePublisher {
     }
 
     fn publish_load(&self, load: ActiveLoad) {
-        let publisher = self.metrics_publisher.clone();
-        tokio::spawn(async move {
-            if let Err(e) = publisher.publish(&load).await {
-                tracing::trace!(
-                    "Failed to publish ActiveLoad to NATS for worker (id={}, dp_rank={}): {e:?}",
-                    load.worker_id,
-                    load.dp_rank
-                );
-            }
-        });
+        self.load_publisher.publish(load);
     }
 
     fn observe_load(
@@ -218,12 +210,14 @@ pub async fn create_multi_worker_sequences(
     } else {
         None
     };
-    let metrics_publisher =
-        Arc::new(EventPublisher::for_namespace(component.namespace(), KV_METRICS_SUBJECT).await?);
+    let load_publisher = B10LoadPublisher::spawn(
+        EventPublisher::for_namespace(component.namespace(), KV_METRICS_SUBJECT).await?,
+        publisher_cancellation_token.child_token(),
+    );
 
     let publisher = RuntimeSequencePublisher {
         event_sender,
-        metrics_publisher,
+        load_publisher,
     };
 
     let dp_range: HashMap<u64, (u32, u32)> = workers_with_configs
