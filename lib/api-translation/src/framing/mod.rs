@@ -112,22 +112,44 @@ impl<Usage: serde::Serialize> Default for OpenIterationScope<Usage> {
     }
 }
 
+/// Panics in debug so a test trips on the violation; in release logs it and leaves the caller to
+/// recover. These invariants guard `iterations[]` metadata only, and failing a live customer stream
+/// over a metadata defect is the worse trade. CI runs the debug profile, so each release recovery
+/// is covered by a `cfg(not(debug_assertions))` test instead.
+fn report_iteration_invariant(violation: std::fmt::Arguments<'_>) {
+    if cfg!(debug_assertions) {
+        panic!("{violation}");
+    }
+    tracing::error!(
+        event_name = "framing.iteration_invariant_violated",
+        "{violation}"
+    );
+}
+
 impl<Usage: serde::Serialize> OpenIterationScope<Usage> {
     /// Merges into the open scope on a matching index; a new index closes the open scope and
     /// returns it, complete and ready to flush.
     pub(crate) fn stage(&mut self, scope: IterationScope<Usage>) -> Option<IterationScope<Usage>> {
-        debug_assert!(
-            self.released.is_none_or(|released| scope.index > released),
-            "iteration {} staged after its scope was released",
-            scope.index
-        );
+        if self
+            .released
+            .is_some_and(|released| scope.index <= released)
+        {
+            report_iteration_invariant(format_args!(
+                "iteration {} staged after its scope was released",
+                scope.index
+            ));
+            // Dropped: the released entry already shipped, so merging can no longer reach it and
+            // replacing would build a second entry at one index.
+            return None;
+        }
         match &mut self.open {
             Some(open) if open.index == scope.index => {
-                debug_assert!(
-                    open.usage.is_none() || scope.usage.is_none(),
-                    "two usage stagings for iteration {}",
-                    scope.index
-                );
+                if open.usage.is_some() && scope.usage.is_some() {
+                    report_iteration_invariant(format_args!(
+                        "two usage stagings for iteration {}",
+                        scope.index
+                    ));
+                }
                 if open.usage.is_none() {
                     open.usage = scope.usage;
                 }
@@ -138,15 +160,25 @@ impl<Usage: serde::Serialize> OpenIterationScope<Usage> {
                 None
             }
             _ => {
-                if let Some(open) = &self.open {
-                    debug_assert!(
-                        open.index < scope.index,
+                if let Some(open) = &self.open
+                    && open.index > scope.index
+                {
+                    report_iteration_invariant(format_args!(
                         "iteration scopes staged out of order: {} after {}",
-                        scope.index,
-                        open.index
-                    );
+                        scope.index, open.index
+                    ));
+                    // Dropped rather than shipped on its own: the open scope has the higher index
+                    // and more may still stage into it, and `released` tracks one watermark, so
+                    // shipping this would leave its index unguarded against a second staging.
+                    return None;
                 }
-                self.open.replace(scope)
+                // The displaced scope reaches the client here exactly as `close` ships one, so the
+                // watermark has to move with it or a later staging at its index would ship twice.
+                let displaced = self.open.replace(scope);
+                if let Some(displaced) = &displaced {
+                    self.released = Some(displaced.index);
+                }
+                displaced
             }
         }
     }

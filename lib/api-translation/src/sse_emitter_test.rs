@@ -5,7 +5,7 @@ use crate::coding_adapter::CodingAdapter;
 use crate::framing::CompletedIteration;
 use crate::history::tool_result_message;
 use crate::model::{BillingVerdict, ServerToolCallStatus, ToolOutput};
-use crate::model::{Termination, ToolInvocation};
+use crate::model::{Termination, ToolCallDelta, ToolInvocation};
 use crate::test_utils::{
     FakeMessagesSearchAdapter, FakeResponsesSearchAdapter, drive, drive_with_coding_adapter,
     event_names, server_tool_call, tool_call,
@@ -73,35 +73,124 @@ async fn cc_tool_call_is_hidden() {
 }
 
 #[tokio::test]
-async fn cc_client_tool_calls_are_native() {
+async fn cc_client_tool_call_streams_arg_deltas() {
     let frames = drive(ClientProtocol::ChatCompletions, |mut e| async move {
-        e.emit_client_tool_calls(&[tool_call("c1", "ws", json!({"q": "x"}))])
+        e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+            id: "c1".into(),
+            name: "ws".into(),
+            args_delta: r#"{"q":"#.into(),
+        }))
+        .await
+        .unwrap();
+        e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+            id: "c1".into(),
+            name: "ws".into(),
+            args_delta: r#" "x"}"#.into(),
+        }))
+        .await
+        .unwrap();
+        // The complete call adds no frame: the deltas already carried the args.
+        e.push(&SemanticChunk::ToolCall(tool_call(
+            "c1",
+            "ws",
+            json!({"q": "x"}),
+        )))
+        .await
+        .unwrap();
+        e
+    })
+    .await;
+    assert_eq!(frames.len(), 2);
+    let opener = &frames[0].data["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(opener["index"], 0);
+    assert_eq!(opener["id"], "c1");
+    assert_eq!(opener["function"]["name"], "ws");
+    assert_eq!(opener["function"]["arguments"], r#"{"q":"#);
+    let continuation = &frames[1].data["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(continuation["index"], 0);
+    assert!(continuation.get("id").is_none());
+    assert_eq!(continuation["function"]["arguments"], r#" "x"}"#);
+}
+
+/// A zero-arg call's opener still streams (carrying id/name promptly), but with an empty
+/// `args_delta`. `finalize`'s empty-args -> `"{}"` substitution only reaches the client if
+/// `emit_client_tool_calls` corrects it — without that, the client's accumulated `arguments`
+/// stays `""` forever and fails to parse.
+#[tokio::test]
+async fn cc_streamed_call_with_no_args_gets_its_empty_args_corrected_to_an_object() {
+    let frames = drive(ClientProtocol::ChatCompletions, |mut e| async move {
+        e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+            id: "c1".into(),
+            name: "list_files".into(),
+            args_delta: String::new(),
+        }))
+        .await
+        .unwrap();
+        e.emit_client_tool_calls(&[tool_call("c1", "list_files", json!({}))])
             .await
             .unwrap();
         e
     })
     .await;
-    let call = &frames[0].data["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(call["index"], 0);
-    assert_eq!(call["id"], "c1");
-    assert_eq!(call["function"]["name"], "ws");
-    assert_eq!(call["function"]["arguments"], r#"{"q":"x"}"#);
+    assert_eq!(frames.len(), 2);
+    let correction = &frames[1].data["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(correction["index"], 0);
+    assert!(correction.get("id").is_none());
+    assert_eq!(correction["function"]["arguments"], "{}");
+}
+
+#[tokio::test]
+async fn cc_streamed_call_retires_its_index_so_a_reused_id_starts_a_new_call() {
+    let frames = drive(ClientProtocol::ChatCompletions, |mut e| async move {
+        for iteration_args in [r#"{"n":1}"#, r#"{"n":2}"#] {
+            e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+                id: "call_0".into(),
+                name: "calc".into(),
+                args_delta: iteration_args.into(),
+            }))
+            .await
+            .unwrap();
+            e.emit_client_tool_calls(&[tool_call("call_0", "calc", json!({}))])
+                .await
+                .unwrap();
+        }
+        e
+    })
+    .await;
+    assert_eq!(frames.len(), 2);
+    for (frame, index) in frames.iter().zip([0, 1]) {
+        let call = &frame.data["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], index);
+        assert_eq!(call["id"], "call_0");
+        assert_eq!(call["function"]["name"], "calc");
+    }
 }
 
 #[tokio::test]
 async fn cc_client_tools_stream_inline_with_running_index() {
-    // The loop emits each client tool as it completes (one call apiece); indices stay monotonic
-    // across the separate emits so the SDK accumulates them into distinct tool_calls.
+    // Each call's opener gets the next `tool_calls[].index`, so the SDK accumulates the two
+    // streams into distinct tool_calls.
     let frames = drive(ClientProtocol::ChatCompletions, |mut e| async move {
-        e.emit_client_tool_calls(&[tool_call("c1", "ws", json!({"q": "x"}))])
+        for (id, name, args) in [("c1", "ws", r#"{"q":"x"}"#), ("c2", "calc", r#"{"n":2}"#)] {
+            e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+                id: id.into(),
+                name: name.into(),
+                args_delta: args.into(),
+            }))
             .await
             .unwrap();
-        e.emit_client_tool_calls(&[tool_call("c2", "calc", json!({"n": 2}))])
+            e.push(&SemanticChunk::ToolCall(tool_call(
+                id,
+                name,
+                serde_json::from_str(args).unwrap(),
+            )))
             .await
             .unwrap();
+        }
         e
     })
     .await;
+    assert_eq!(frames.len(), 2);
     assert_eq!(
         frames[0].data["choices"][0]["delta"]["tool_calls"][0]["index"],
         0
@@ -345,6 +434,56 @@ async fn messages_thinking_text_tool_block_ordering() {
     assert_eq!(frames[8].data["content_block"]["id"], "c1");
     assert_eq!(frames[9].data["delta"]["partial_json"], r#"{"p":"/x"}"#);
     assert_eq!(frames[11].data["delta"]["stop_reason"], "tool_use");
+}
+
+/// A client tool call whose args stream as deltas: one `tool_use` block, one `input_json_delta`
+/// per fragment, and the complete call only stops the block (no args re-render).
+#[tokio::test]
+async fn messages_client_tool_call_streams_input_json_deltas() {
+    let usage = serde_json::from_value(
+        json!({"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}),
+    )
+    .unwrap();
+    let delta = |id: &str, args: &str| {
+        SemanticChunk::ToolCallDelta(ToolCallDelta {
+            id: id.into(),
+            name: "Read".into(),
+            args_delta: args.into(),
+        })
+    };
+    let frames = drive(ClientProtocol::Messages, |mut e| async move {
+        e.push(&delta("c1", r#"{"p":"#)).await.unwrap();
+        e.push(&delta("c1", r#" "/x"}"#)).await.unwrap();
+        e.push(&SemanticChunk::ToolCall(tool_call(
+            "c1",
+            "Read",
+            json!({"p": "/x"}),
+        )))
+        .await
+        .unwrap();
+        e.finish(Termination::Model(FinishReason::ToolCalls), &usage)
+            .await
+            .unwrap();
+        e
+    })
+    .await;
+    assert_eq!(
+        event_names(&frames),
+        vec![
+            "message_start",
+            "content_block_start", // tool_use idx0, input {}
+            "content_block_delta", // input_json_delta: first fragment
+            "content_block_delta", // input_json_delta: second fragment
+            "content_block_stop",  // the complete ToolCall stops the block
+            "message_delta",
+            "message_stop",
+        ],
+    );
+    assert_eq!(frames[1].data["content_block"]["type"], "tool_use");
+    assert_eq!(frames[1].data["content_block"]["id"], "c1");
+    assert_eq!(frames[1].data["content_block"]["input"], json!({}));
+    assert_eq!(frames[2].data["delta"]["partial_json"], r#"{"p":"#);
+    assert_eq!(frames[3].data["delta"]["partial_json"], r#" "/x"}"#);
 }
 
 /// It must ride `message_delta`, the same frame as `stop_reason`: the SDK drops extras on
@@ -885,6 +1024,80 @@ async fn messages_coding_adapter_streams_native_web_search_with_stable_indices()
     }));
 }
 
+/// A coding adapter reshapes fields the raw args don't have (`search_queries` -> `query`), which it
+/// can only do from the complete args — a delta arriving before the complete call must not render a
+/// generic `tool_use` block from the partial fragment.
+#[tokio::test]
+async fn messages_coding_adapter_ignores_a_delta_and_still_renders_its_own_block() {
+    let name = "baseten__provider__search";
+    let call = tool_call("call_1", name, json!({"search_queries": ["rust"]}));
+    let frames = drive_with_coding_adapter(
+        ClientProtocol::Messages,
+        Some(claude_code_adapter(name)),
+        |mut e| async move {
+            e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+                id: "call_1".into(),
+                name: name.into(),
+                args_delta: r#"{"search_queries":"#.into(),
+            }))
+            .await
+            .unwrap();
+            e.push(&SemanticChunk::ToolCall(call)).await.unwrap();
+            e
+        },
+    )
+    .await;
+    let call_start = frames
+        .iter()
+        .find(|frame| frame.data["content_block"]["type"] == "server_tool_use")
+        .unwrap();
+    assert_eq!(call_start.data["content_block"]["name"], "web_search");
+    let call_index = call_start.data["index"].as_u64().unwrap();
+    let call_delta = frames
+        .iter()
+        .find(|frame| {
+            frame.event.as_deref() == Some("content_block_delta")
+                && frame.data["index"] == call_index
+        })
+        .unwrap();
+    assert_eq!(
+        call_delta.data["delta"]["partial_json"], "{\"query\":\"rust\"}",
+        "must be the adapter's reshaped args, not the raw partial fragment"
+    );
+}
+
+/// `coding_adapter` is request-scoped, but an ordinary client tool (e.g. Edit) the adapter does not
+/// reshape must still stream live — the adapter only holds the calls it actually reshapes.
+#[tokio::test]
+async fn messages_coding_adapter_still_streams_a_call_it_does_not_reshape() {
+    let search_name = "baseten__provider__search";
+    let frames = drive_with_coding_adapter(
+        ClientProtocol::Messages,
+        Some(claude_code_adapter(search_name)),
+        |mut e| async move {
+            e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+                id: "call_1".into(),
+                name: "Edit".into(),
+                args_delta: r#"{"path":"#.into(),
+            }))
+            .await
+            .unwrap();
+            e
+        },
+    )
+    .await;
+    let call_delta = frames
+        .iter()
+        .find(|frame| frame.event.as_deref() == Some("content_block_delta"))
+        .unwrap();
+    assert_eq!(
+        call_delta.data["delta"]["partial_json"],
+        "{\"path\":",
+        "an unreshaped call must stream its raw fragment live: {:?}",
+        frames.iter().map(|f| &f.event).collect::<Vec<_>>()
+    );
+}
+
 /// The streamed failure path: a provider error renders the error result block rather than an empty
 /// citation list, which is the only thing distinguishing "search failed" from "search found nothing".
 #[tokio::test]
@@ -927,6 +1140,49 @@ async fn messages_coding_adapter_streams_the_error_result_block_for_a_failed_cal
     assert_eq!(
         result_start.data["content_block"]["content"],
         json!({"type": "web_search_tool_result_error", "error_code": "unavailable"})
+    );
+}
+
+/// Same bypass as the Messages test above: a delta arriving before the complete call must not
+/// render a generic `function_call` item from the adapter-bound tool's partial fragment.
+#[tokio::test]
+async fn responses_coding_adapter_ignores_a_delta_and_still_renders_its_own_item() {
+    let name = "baseten__parallel__web_search";
+    let call = tool_call(
+        "ws_1",
+        name,
+        json!({"objective": "find Rust release", "search_queries": ["latest Rust stable"]}),
+    );
+    let adapter = codex_adapter(name);
+    let frames = drive_with_coding_adapter(
+        ClientProtocol::Responses,
+        Some(adapter),
+        |mut e| async move {
+            e.push(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+                id: "ws_1".into(),
+                name: name.into(),
+                args_delta: r#"{"objective":"#.into(),
+            }))
+            .await
+            .unwrap();
+            e.push(&SemanticChunk::ToolCall(call)).await.unwrap();
+            e
+        },
+    )
+    .await;
+    let types = frames
+        .iter()
+        .map(|frame| frame.data["type"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(
+        types.contains(&"response.web_search_call.in_progress"),
+        "must render the adapter's own item type, not a generic function_call: {types:?}"
+    );
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.data["item"]["type"] == "function_call"),
+        "must never fall back to a generic function_call item: {types:?}"
     );
 }
 

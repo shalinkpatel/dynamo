@@ -10,9 +10,11 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0.
 //!
-//! Text and thinking surface as deltas immediately. A tool call is held until its accumulated args
-//! parse as a complete JSON value, then surfaces once as a complete [`ToolCall`] (eager, so the
-//! loop can start executing before stream end); an unfinished call is finalized at stream close.
+//! Text and thinking surface as deltas immediately. A tool call's arg fragments surface as they
+//! arrive ([`SemanticChunk::ToolCallDelta`]), while the call itself is still held until its
+//! accumulated args parse as a complete
+//! JSON value, then surfaces once as a complete [`ToolCall`] (eager, so the loop can start
+//! executing before stream end); an unfinished call is finalized at stream close.
 //! The model's tool id is preserved verbatim (cache-coherent replay), never minted.
 
 use std::collections::HashMap;
@@ -24,7 +26,7 @@ use dynamo_protocols::types::{
 };
 use serde_json::Value;
 
-use crate::model::{ToolCall, TranslationError};
+use crate::model::{ToolCall, ToolCallDelta, TranslationError};
 use crate::util::truncate;
 use crate::{ContentKind, SemanticChunk};
 
@@ -58,6 +60,18 @@ fn mid_stream_error_frame(error_frame: &Value, message: &str) -> TranslationErro
     }
 }
 
+fn malformed_tool_call() -> TranslationError {
+    model_unavailable(
+        "malformed_tool_call",
+        "model produced a tool call with no id/name".into(),
+    )
+}
+
+/// The model sent more content for a tool call it had already completed.
+fn resumed_tool_call(detail: String) -> TranslationError {
+    model_unavailable("resumed_tool_call", detail)
+}
+
 /// Every stream-decode failure is upstream (model) degradation with no status to mirror.
 fn model_unavailable(error_code: &'static str, detail: String) -> TranslationError {
     TranslationError::UpstreamUnavailable { detail, error_code }
@@ -71,8 +85,8 @@ pub(crate) type ChunkResult = Result<SemanticChunk, TranslationError>;
 pub struct SseDataYield {
     pub chunks: Vec<ChunkResult>,
     /// Content kinds the raw delta carried, in the delta's field order (thinking, text, tool
-    /// calls). A tool-call delta reports its kind here while its chunk surfaces only once the args
-    /// complete, so phase timing must key off kinds, not chunks.
+    /// calls). The complete `ToolCall` chunk lands after its first arg delta, so phase timing keys
+    /// off kinds, not chunks.
     pub delta_content_kinds: Vec<ContentKind>,
 }
 
@@ -87,6 +101,11 @@ impl SseDataYield {
 
 /// One parser per model turn: tool indexing is the model's per-response CC index, which restarts
 /// each model call.
+///
+/// Tool calls must arrive linearly: one call's arguments complete before the next call's first
+/// fragment, and a completed call never resumes. Every streaming tool-call detector in the serving
+/// stack emits that way (one `current_tool_id`, advanced only once the current call closes); the CC
+/// spec is silent on it, so a stream that breaks the invariant is refused, not reordered.
 #[derive(Default)]
 pub struct SseParser {
     tools: Vec<ToolCallAccumulator>,
@@ -104,6 +123,11 @@ struct ToolCallAccumulator {
     args: String,
     args_depth: JsonContainerDepth,
     emitted: bool,
+    /// Args bytes already shipped as `ToolCallDelta`s. Always a char boundary: it only ever
+    /// advances past whole pushed fragments.
+    streamed_args_len: usize,
+    /// Whether the first delta (which carries the merged identity) went out.
+    opener_streamed: bool,
 }
 
 /// Container depth of the args accumulated so far, string- and escape-aware. The cheap per-chunk
@@ -233,56 +257,88 @@ impl SseParser {
         call: ChatCompletionMessageToolCallChunk,
         out: &mut Vec<ChunkResult>,
     ) {
-        // Safety net beside the JSON-parse trigger: a new tool index means any earlier call's args
-        // are done — flush the complete ones now (`try_complete` only emits parseable calls, never
-        // fabricates an incomplete one).
-        if !self.pos_by_index.contains_key(&call.index) {
-            for pos in 0..self.tools.len() {
-                if let Some(complete) = self.try_complete(pos) {
-                    out.push(complete);
-                }
-            }
+        if !self.pos_by_index.contains_key(&call.index)
+            && let Err(violation) = self.close_preceding_tool_calls(out)
+        {
+            out.push(Err(violation));
+            return;
         }
         let pos = *self.pos_by_index.entry(call.index).or_insert_with(|| {
             self.tools.push(ToolCallAccumulator::default());
             self.tools.len() - 1
         });
+        let (name, args) = call
+            .function
+            .map(|f| (f.name, f.arguments))
+            .unwrap_or((None, None));
         if self.tools[pos].emitted {
-            // Args frozen at dispatch: drop late chunks so echoed history == what ran. A
-            // non-whitespace late chunk is spurious model output past a complete value; meter it.
-            let (name, args) = call
-                .function
-                .map(|f| (f.name, f.arguments))
-                .unwrap_or((None, None));
-            let spurious = call.id.is_some()
+            // A trailing entry carrying no content is framing, not a resumed call.
+            if call.id.is_some()
                 || name.is_some()
-                || args.as_deref().is_some_and(|a| !a.trim().is_empty());
-            if spurious {
-                // Per-chunk on a dribbling model, so debug; callers wanting a drop metric wrap
-                // the parser (tool-bank counts these in its own observability layer).
-                tracing::debug!(
-                    event_name = "parser.post_dispatch_drop",
-                    "dropping tool-call content for `{}` after eager dispatch (spurious past a complete value)",
+                || args.as_deref().is_some_and(|a| !a.trim().is_empty())
+            {
+                out.push(Err(resumed_tool_call(format!(
+                    "model sent more content for tool call `{}` after its arguments completed",
                     self.tools[pos].id,
-                );
+                ))));
             }
             return;
         }
         if let Some(id) = call.id.filter(|s| !s.is_empty()) {
             self.tools[pos].id = id;
         }
-        if let Some(func) = call.function {
-            if let Some(name) = func.name.filter(|s| !s.is_empty()) {
-                self.tools[pos].name = name;
-            }
-            if let Some(args) = func.arguments {
-                self.tools[pos].args_depth.feed(&args);
-                self.tools[pos].args.push_str(&args);
-            }
+        if let Some(name) = name.filter(|s| !s.is_empty()) {
+            self.tools[pos].name = name;
         }
+        if let Some(args) = args {
+            self.tools[pos].args_depth.feed(&args);
+            self.tools[pos].args.push_str(&args);
+        }
+        self.stream_tool_call_delta(pos, out);
         if let Some(complete) = self.try_complete(pos) {
             out.push(complete);
         }
+    }
+
+    /// A new tool index means the model finished every earlier call, so those emit here.
+    /// `finalize` reads empty arguments as `{}`, so an unfinished one means arguments that never
+    /// parsed — indistinguishable on the wire from the model abandoning the call, so its own
+    /// `truncated_tool_call` stands rather than a guess at which happened.
+    fn close_preceding_tool_calls(
+        &mut self,
+        out: &mut Vec<ChunkResult>,
+    ) -> Result<(), TranslationError> {
+        for pos in 0..self.tools.len() {
+            if self.tools[pos].emitted {
+                continue;
+            }
+            if self.tools[pos].id.is_empty() || self.tools[pos].name.is_empty() {
+                return Err(malformed_tool_call());
+            }
+            out.push(Ok(self.finalize(pos)?));
+        }
+        Ok(())
+    }
+
+    /// Ship the args accumulated since the last delta (and the merged identity on the first) as a
+    /// client-egress-only [`SemanticChunk::ToolCallDelta`]. Waits for the opener's id+name — the
+    /// model may split them across chunks (Kimi/MAPI), and a delta without both is unattributable.
+    fn stream_tool_call_delta(&mut self, pos: usize, out: &mut Vec<ChunkResult>) {
+        let tool = &mut self.tools[pos];
+        if tool.id.is_empty() || tool.name.is_empty() {
+            return;
+        }
+        let args_delta = tool.args[tool.streamed_args_len..].to_string();
+        if tool.opener_streamed && args_delta.is_empty() {
+            return;
+        }
+        tool.opener_streamed = true;
+        tool.streamed_args_len = tool.args.len();
+        out.push(Ok(SemanticChunk::ToolCallDelta(ToolCallDelta {
+            id: tool.id.clone(),
+            name: tool.name.clone(),
+            args_delta,
+        })));
     }
 
     /// Only containers (`{…}`/`[…]`) dispatch eagerly: a bare scalar parses while still growing
@@ -308,7 +364,7 @@ impl SseParser {
     /// worse), with a clean message, not raw serde text.
     fn finalize(&mut self, pos: usize) -> ChunkResult {
         self.tools[pos].emitted = true;
-        // Args are frozen at dispatch (late chunks are dropped), so hollowing the buffer is safe.
+        // A dispatched call refuses further content, so hollowing the buffer is safe.
         let accumulated_args = std::mem::take(&mut self.tools[pos].args);
         let tool = &self.tools[pos];
         let raw_args = if accumulated_args.trim().is_empty() {
@@ -342,14 +398,11 @@ impl SseParser {
             if self.tools[pos].emitted {
                 continue;
             }
-            // A tool accumulator that never got an id+name "opener" (reordered/corrupt tool stream)
-            // can't be dispatched; fail loud rather than surface a nameless ToolCall downstream.
+            // A tool accumulator that never got an id+name "opener" (corrupt tool stream) can't be
+            // dispatched; fail loud rather than surface a nameless ToolCall downstream.
             if self.tools[pos].id.is_empty() || self.tools[pos].name.is_empty() {
                 self.tools[pos].emitted = true;
-                out.push(Err(model_unavailable(
-                    "malformed_tool_call",
-                    "model produced a tool call with no id/name".into(),
-                )));
+                out.push(Err(malformed_tool_call()));
                 continue;
             }
             out.push(self.finalize(pos));

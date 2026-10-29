@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::ToolCallDelta;
 
 #[test]
 fn react_cap_completes_rather_than_incomplete() {
@@ -49,6 +50,9 @@ fn frame_body(frame: &str) -> serde_json::Value {
 /// passes through as itself (default `resolve_tool_identity`).
 struct NamespaceStampAdapter;
 impl CodingAdapter for NamespaceStampAdapter {
+    fn handles_tool_call(&self, _tool_name: &str) -> bool {
+        false
+    }
     fn render_tool_call(&self, _call: &ToolCallToRender<'_>) -> Option<RenderedToolCall> {
         None
     }
@@ -409,4 +413,95 @@ mod graft_tests {
         );
         assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
     }
+}
+
+#[test]
+fn buffered_tool_search_uses_the_same_native_shape() {
+    let mut body = serde_json::json!({"tools":[{"type":"tool_search","execution":"client"}]});
+    let adapter = crate::deferred_tools::rewrite_responses(&mut body)
+        .unwrap()
+        .wrap(None);
+    let envelope = ResponsesEnvelope::new(adapter, ResponsesParams::default());
+    let transcript: Vec<CcMessage> = serde_json::from_value(serde_json::json!([
+        {"role":"assistant","tool_calls":[{"id":"c1","type":"function",
+            "function":{"name":"tool_search","arguments":"{\"query\":\"weather\"}"}}]}
+    ]))
+    .unwrap();
+    let response = BufferedResponse {
+        model: "m",
+        transcript: &transcript,
+        client_tool_calls: &[],
+        iterations: &[],
+        request_server_tool_calls: &[],
+        termination: Termination::Model(FinishReason::ToolCalls),
+        usage: &CompletionUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        },
+    };
+    let output: Value = serde_json::from_str(&envelope.buffered_body(&response)).unwrap();
+    assert_eq!(output["output"][0]["type"], "tool_search_call");
+    assert_eq!(output["output"][0]["call_id"], "c1");
+    assert_eq!(output["output"][0]["arguments"]["query"], "weather");
+}
+
+#[test]
+fn client_tool_search_stream_closes_in_its_native_shape() {
+    let mut body = serde_json::json!({"tools":[{"type":"tool_search","execution":"client"}]});
+    let adapter = crate::deferred_tools::rewrite_responses(&mut body)
+        .unwrap()
+        .wrap(None);
+    let mut framing = ResponsesFraming::new("m".into(), adapter, ResponsesParams::default());
+    let call = crate::model::ToolCall {
+        id: "search1".into(),
+        name: "tool_search".into(),
+        args: serde_json::json!({"query":"weather"}),
+        raw_args: r#"{"query":"weather"}"#.into(),
+    };
+    assert!(
+        framing
+            .on_chunk(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+                id: "search1".into(),
+                name: "tool_search".into(),
+                args_delta: "{\"query\":".into(),
+            }))
+            .is_empty()
+    );
+    let mut frames = framing.on_chunk(&SemanticChunk::ToolCall(call.clone()));
+    frames.extend(framing.emit_client_tool_calls(std::slice::from_ref(&call)));
+    let bodies: Vec<_> = frames.iter().map(|frame| frame_body(frame)).collect();
+    let added = bodies
+        .iter()
+        .find(|body| body["type"] == "response.output_item.added")
+        .unwrap();
+    let done = bodies
+        .iter()
+        .find(|body| body["type"] == "response.output_item.done")
+        .unwrap();
+    for body in [added, done] {
+        assert_eq!(body["item"]["type"], "tool_search_call");
+        assert_eq!(body["item"]["call_id"], "search1");
+        assert_eq!(body["item"]["arguments"]["query"], "weather");
+    }
+    assert_eq!(done["item"]["status"], "completed");
+    assert!(!frames.concat().contains("response.function_call_arguments"));
+    let terminal = framing.finish(
+        Termination::Model(FinishReason::ToolCalls),
+        &CompletionUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        },
+        &[],
+    );
+    let completed = frame_body(terminal.last().unwrap());
+    assert_eq!(
+        completed["response"]["output"][0]["type"],
+        "tool_search_call"
+    );
 }

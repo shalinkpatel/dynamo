@@ -651,10 +651,15 @@ impl<'de> Deserialize<'de> for AnthropicContentBlock {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| serde::de::Error::missing_field("tool_use_id"))?
                     .to_string();
+                // An absent or null `content` is legal; a present-but-malformed one is the
+                // caller's error. Swallowing it hands the model an empty tool result under a 200.
                 let content: Option<ToolResultContent> = value
                     .get("content")
+                    .filter(|content| !content.is_null())
                     .cloned()
-                    .and_then(|v| serde_json::from_value(v).ok());
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(serde::de::Error::custom)?;
                 let is_error = value.get("is_error").and_then(|v| v.as_bool());
                 let cache_control: Option<CacheControl> = value
                     .get("cache_control")

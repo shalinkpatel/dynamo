@@ -60,6 +60,10 @@ impl IngressHooks for StubHooks {
         true
     }
 
+    fn translates_client_tool_search(&self) -> bool {
+        true
+    }
+
     fn on_server_tool(&mut self, _protocol: ClientProtocol, entry: &Value) -> ToolDisposition {
         let kind = entry
             .get("type")
@@ -226,6 +230,31 @@ fn user_text_before_tool_result_preserves_order() {
 fn tool_result_without_tool_use_id_fails_loud() {
     let msg = json!({"role": "user", "content": [{"type": "tool_result", "content": "R"}]});
     assert!(serde_json::from_value::<AnthropicMessage>(msg).is_err());
+}
+
+/// Deserializing a malformed `tool_result.content` to `None` hands the model an empty tool
+/// result under a 200 instead of refusing the body.
+#[test]
+fn tool_result_with_a_malformed_content_block_fails_loud() {
+    let msg = json!({"role": "user", "content": [{
+        "type": "tool_result",
+        "tool_use_id": "c1",
+        // A base64 image source needs `data`; without it the block cannot be rendered.
+        "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png"}}],
+    }]});
+    assert!(serde_json::from_value::<AnthropicMessage>(msg).is_err());
+}
+
+#[test]
+fn tool_result_without_content_still_parses() {
+    let msg = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1"}]});
+    assert!(serde_json::from_value::<AnthropicMessage>(msg).is_ok());
+}
+
+#[test]
+fn tool_result_with_a_null_content_still_parses() {
+    let msg = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": null}]});
+    assert!(serde_json::from_value::<AnthropicMessage>(msg).is_ok());
 }
 
 /// Both are a 400, but only `Unsupported` is a gap in our adapter — a misclassification blames the
@@ -1077,8 +1106,19 @@ fn tool_choice_disable_parallel_maps_to_cc_parallel_tool_calls() {
 
 // --- OpenAI Responses ---------------------------------------------------------
 
+/// Parses each item the way ingress does, so these tests see the dispatch production runs.
+fn responses_input_items(items: Value) -> Result<Vec<InputItem>, RequestRejection> {
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(index, item)| parse_responses_input_item(&format!("input[{index}]"), item.clone()))
+        .collect()
+}
+
 fn responses_input(items: Value) -> Vec<Value> {
-    let items: Vec<InputItem> = serde_json::from_value(items).unwrap();
+    let items = responses_input_items(items).unwrap();
     let mut cc_messages = Vec::new();
     translate_input_items(&items, &mut cc_messages, &mut Losses::default()).unwrap();
     cc_messages
@@ -1636,6 +1676,58 @@ fn adapt_responses_item_reference_is_refused() {
     assert!(err.contains("item_reference"), "{err}");
 }
 
+/// `ItemReference.type` is optional in the spec, so OpenAI may send a bare `id` — that must still
+/// be refused as the unsupported item reference it is, not as a message missing `role`.
+#[test]
+fn adapt_responses_typeless_item_reference_is_refused_as_one() {
+    let items = responses_input_items(json!([{"id": "resp_123_item_0"}])).unwrap();
+    let err = translate_input_items(&items, &mut Vec::new(), &mut Losses::default())
+        .err()
+        .unwrap();
+    assert!(err.contains("item_reference"), "{err}");
+}
+
+/// `ItemReference` needs only `id`, so a typeless message carrying one is the shape it absorbs.
+#[test]
+fn adapt_responses_typeless_id_bearing_items_are_not_item_references() {
+    let assistant_turn = responses_input(json!([{
+        "id": "msg_previous",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "xyz"}],
+    }]));
+    assert_eq!(
+        assistant_turn,
+        vec![json!({"role": "assistant", "content": "xyz"})]
+    );
+
+    let user_turn = responses_input(json!([{
+        "id": "msg_user",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hi"}],
+    }]));
+    assert_eq!(user_turn, vec![json!({"role": "user", "content": "hi"})]);
+}
+
+#[test]
+fn adapt_responses_unknown_item_type_is_named_in_the_refusal() {
+    let err = responses_input_items(json!([{"type": "nonesuch", "id": "x"}]))
+        .err()
+        .unwrap();
+    assert!(err.detail().contains("nonesuch"), "{err}");
+    assert!(!err.detail().contains("item_reference"), "{err}");
+}
+
+#[test]
+fn adapt_responses_typed_item_rejection_names_its_index() {
+    let err = responses_input_items(json!([
+        {"role": "user", "content": "hi"},
+        {"type": "function_call", "call_id": "c"},
+    ]))
+    .err()
+    .unwrap();
+    assert!(err.detail().contains("input[1]"), "{err}");
+}
+
 #[test]
 fn adapt_responses_stateful_fields_are_refused() {
     // `store` is accepted and carried onto the CC body (OpenAI SDKs default it to true).
@@ -1861,6 +1953,9 @@ fn messages_web_search_request(max_uses: u32) -> Vec<u8> {
 struct NoopAdapter;
 
 impl CodingAdapter for NoopAdapter {
+    fn handles_tool_call(&self, _tool_name: &str) -> bool {
+        false
+    }
     fn render_tool_call(&self, _call: &ToolCallToRender<'_>) -> Option<RenderedToolCall> {
         None
     }
@@ -3103,6 +3198,446 @@ fn messages_output_config_carries_a_non_string_effort_like_the_other_surfaces() 
             "responses"
         );
     }
+}
+
+#[test]
+fn tool_search_replay_reaches_model_as_functions_with_deferred_markers() {
+    let adapted = adapt_responses_body(json!({
+        "model":"glm-5.3", "tools":[{"type":"tool_search", "execution":"client"}],
+        "input":[
+            {"type":"tool_search_call", "call_id":"c1", "arguments":{}},
+            {"type":"tool_search_output", "call_id":"c1", "tools":[
+                {"type":"function", "name":"weather", "parameters":{}}
+            ]}
+        ]
+    }))
+    .unwrap();
+    let cc = serde_json::to_value(adapted.request).unwrap();
+    assert_eq!(cc["tools"][0]["function"]["name"], "tool_search");
+    assert_eq!(cc["tools"][1]["function"]["name"], "weather");
+    assert_eq!(cc["tools"][1]["defer_loading"], true);
+    assert_eq!(cc["messages"][1]["tool_call_id"], "c1");
+    assert!(
+        cc["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<tools>")
+    );
+}
+
+// --- deferred tool loading (tool-bank #30339) ---------------------------------
+
+fn adapt_messages_body_with_model(
+    extra: Value,
+    model: &str,
+) -> Result<AdaptedRequest, RequestRejection> {
+    let mut extra = extra;
+    extra["model"] = json!(model);
+    adapt_messages_body(extra)
+}
+
+/// Standard dynamo (`DropServerTools`) on the Messages door.
+fn adapt_messages_body_dynamo(extra: Value) -> Result<AdaptedRequest, RequestRejection> {
+    let mut body = json!({
+        "model": "m",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    adapt_request(
+        &serde_json::to_vec(&body).unwrap(),
+        ClientProtocol::Messages,
+        &HeaderMap::new(),
+        &mut DropServerTools,
+    )
+    .map(|ingress| ingress.request)
+}
+
+fn deferred_tools_body() -> Value {
+    json!({"tools": [
+        {"name": "weather", "input_schema": {"type": "object"}},
+        {"name": "search", "defer_loading": true,
+         "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}},
+    ]})
+}
+
+fn tool_reference_turns(reference: Value) -> Value {
+    json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "c1", "name": "search", "input": {}}
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "c1", "content": [
+                reference,
+                {"type": "text", "text": "Tool loaded."}
+            ]}
+        ]},
+    ]})
+}
+
+fn adapted_tool_text(adapted: &AdaptedRequest) -> &str {
+    let tool_message = adapted
+        .request
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            CcMessage::Tool(tool) => Some(tool),
+            _ => None,
+        })
+        .expect("a tool message");
+    match &tool_message.content {
+        ChatCompletionRequestToolMessageContent::Text(text) => text,
+        other => panic!("expected flat text tool content, got {other:?}"),
+    }
+}
+
+#[test]
+fn messages_defer_loading_markers_carry_for_any_target() {
+    for model in ["GLM-5.3", "m"] {
+        let adapted = adapt_messages_body_with_model(deferred_tools_body(), model)
+            .expect("deferred markers carry onto the CC tools");
+        let tools = adapted.request.tools.as_deref().unwrap();
+        assert_eq!(tools[0].defer_loading, None);
+        assert_eq!(tools[1].defer_loading, Some(true));
+        let wire = serde_json::to_string(tools).unwrap();
+        assert!(wire.contains(r#""defer_loading":true"#), "{wire}");
+    }
+}
+
+#[test]
+fn messages_tool_reference_expands_in_place_with_glm_schema_text() {
+    let mut extra = deferred_tools_body();
+    extra.as_object_mut().unwrap().extend(
+        tool_reference_turns(json!({"type": "tool_reference", "tool_name": "search"}))
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let adapted = adapt_messages_body_with_model(extra, "GLM-5.3")
+        .expect("a reference to a declared tool expands");
+    assert_eq!(
+        adapted_tool_text(&adapted),
+        "<tools>\n{\"name\": \"search\", \"description\": \"\", \"parameters\": {\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}\n</tools>\nTool loaded."
+    );
+}
+
+/// The assistant arm of `translate_message` threads the same expansion (TB presents a server-tool
+/// loop as one assistant turn with inline tool_results).
+#[test]
+fn messages_tool_reference_expands_in_the_assistant_turn_too() {
+    let mut extra = deferred_tools_body();
+    extra.as_object_mut().unwrap().extend(
+        json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "search", "input": {}},
+                {"type": "tool_result", "tool_use_id": "c1", "content": [
+                    {"type": "tool_reference", "tool_name": "search"},
+                    {"type": "text", "text": "Tool loaded."}
+                ]}
+            ]}
+        ]})
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let adapted =
+        adapt_messages_body_with_model(extra, "GLM-5.3").expect("assistant-arm reference expands");
+    let text = adapted_tool_text(&adapted);
+    assert!(text.starts_with("<tools>\n{\"name\": \"search\""), "{text}");
+    assert!(text.ends_with("</tools>\nTool loaded."), "{text}");
+}
+
+#[test]
+fn messages_tool_reference_schema_text_escapes_html_significant_chars() {
+    let mut extra = json!({"tools": [
+        {"name": "esc", "description": "a<b>&'c", "defer_loading": true,
+         "input_schema": {"type": "object"}},
+        {"name": "eager", "input_schema": {"type": "object"}},
+    ]});
+    extra.as_object_mut().unwrap().extend(
+        tool_reference_turns(json!({"type": "tool_reference", "tool_name": "esc"}))
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let adapted =
+        adapt_messages_body_with_model(extra, "GLM-5.3").expect("a declared tool expands");
+    assert_eq!(
+        adapted_tool_text(&adapted),
+        "<tools>\n{\"name\": \"esc\", \"description\": \"a\\u003cb\\u003e\\u0026\\u0027c\", \"parameters\": {\"type\":\"object\",\"properties\":{}}}\n</tools>\nTool loaded."
+    );
+}
+
+/// Parity with dynamo's `may_be_fix_tool_schema`: an object `parameters` gains a missing
+/// `"type": "object"` and/or `"properties": {}` (a non-object `parameters` is untouched).
+#[test]
+fn reference_schema_normalizes_parameters() {
+    for (input_schema, expected_parameters) in [
+        (json!({}), r#"{"type":"object","properties":{}}"#),
+        (
+            json!({"type": "object"}),
+            r#"{"type":"object","properties":{}}"#,
+        ),
+        (
+            json!({"properties": {"q": {"type": "string"}}}),
+            r#"{"properties":{"q":{"type":"string"}},"type":"object"}"#,
+        ),
+    ] {
+        let cc_tool = client_function_tool(
+            json!({"name": "t", "defer_loading": true, "input_schema": input_schema}),
+        )
+        .unwrap()
+        .remove(0);
+        let text = DeclaredTools::new(std::slice::from_ref(&cc_tool))
+            .render_reference("t")
+            .unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "<tools>\n{{\"name\": \"t\", \"description\": \"\", \"parameters\": {expected_parameters}}}\n</tools>"
+            ),
+            "input_schema: {input_schema}"
+        );
+    }
+}
+
+/// The Messages (`tool_reference`) and Responses (`tool_search_output`) paths render one function
+/// through the one shared renderer: byte-identical, or one of them drifted.
+#[test]
+fn messages_and_responses_render_a_function_byte_identically() {
+    let cc_tool = client_function_tool(json!({
+        "name": "weather",
+        "description": "w<>&'eather",
+        "defer_loading": true,
+        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+    }))
+    .unwrap()
+    .remove(0);
+    let messages_text = DeclaredTools::new(std::slice::from_ref(&cc_tool))
+        .render_reference("weather")
+        .unwrap();
+
+    let mut body = json!({"input": [
+        {"type": "tool_search_call", "call_id": "s", "arguments": {}},
+        {"type": "tool_search_output", "call_id": "s", "tools": [
+            {"type": "function", "name": "weather",
+             "description": "w<>&'eather",
+             "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}
+        ]},
+    ]});
+    crate::deferred_tools::rewrite_responses(&mut body).unwrap();
+    let responses_text = body["input"][1]["output"].as_str().unwrap();
+
+    assert_eq!(messages_text, responses_text);
+}
+
+#[test]
+fn messages_tool_reference_with_empty_tool_name_coerces_not_refuses() {
+    for reference in [
+        json!({"type": "tool_reference"}),
+        json!({"type": "tool_reference", "tool_name": ""}),
+    ] {
+        let mut extra = deferred_tools_body();
+        extra.as_object_mut().unwrap().extend(
+            tool_reference_turns(reference.clone())
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let adapted = adapt_messages_body_with_model(extra, "GLM-5.3")
+            .expect("a nameless reference coerces instead of failing the replay");
+        assert_eq!(
+            adapted_tool_text(&adapted),
+            format!("{}\nTool loaded.", reference)
+        );
+    }
+}
+
+#[test]
+fn messages_tool_reference_expands_for_any_model_name() {
+    let mut extra = deferred_tools_body();
+    extra.as_object_mut().unwrap().extend(
+        tool_reference_turns(json!({"type": "tool_reference", "tool_name": "search"}))
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let adapted = adapt_messages_body(extra).expect("any model name expands");
+    assert_eq!(
+        adapted_tool_text(&adapted),
+        "<tools>\n{\"name\": \"search\", \"description\": \"\", \"parameters\": {\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}}\n</tools>\nTool loaded."
+    );
+}
+
+/// Anthropic's tool-search declarations translate to the synthetic `tool_search` function the
+/// Responses path synthesizes, carrying the entry's `defer_loading` marker. An entry-provided
+/// `description`/`input_schema` wins over the synthetic defaults.
+#[test]
+fn anthropic_tool_search_entry_translates_to_the_synthetic_function() {
+    let translate = |mut entry: Value| {
+        crate::deferred_tools::messages_tool_search_as_client_tool(&mut entry);
+        client_function_tool(entry).unwrap().remove(0)
+    };
+    for tool_type in [
+        "tool_search_tool_regex_20251119",
+        "tool_search_tool_bm25_20251119",
+        "tool_search_tool_regex",
+        "tool_search_tool_bm25",
+    ] {
+        let tool = translate(json!({"type": tool_type, "name": tool_type, "defer_loading": true}));
+        assert_eq!(tool.function.name, "tool_search", "{tool_type}");
+        assert_eq!(tool.defer_loading, Some(true), "{tool_type}");
+    }
+    let tool = translate(json!({
+        "type": "tool_search_tool_regex_20251119",
+        "name": "tool_search_tool_regex",
+        "description": "search the toolbox",
+        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+    }));
+    assert_eq!(tool.function.name, "tool_search");
+    assert_eq!(
+        tool.function.description.as_deref(),
+        Some("search the toolbox")
+    );
+    assert_eq!(
+        tool.function.parameters.unwrap(),
+        json!({"type": "object", "properties": {"q": {"type": "string"}}})
+    );
+}
+
+/// Standard dynamo cannot render a native tool-search call back (its Responses egress is not this
+/// crate's), so the declaration stays server-shaped and drops with a recorded loss.
+#[test]
+fn dynamo_drops_anthropic_tool_search_entry() {
+    let adapted = adapt_messages_body_dynamo(json!({"tools": [
+        {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+        {"name": "f", "input_schema": {"type": "object"}},
+    ]}))
+    .unwrap();
+    let names: Vec<_> = adapted
+        .request
+        .tools
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect();
+    assert_eq!(names, ["f"]);
+    assert!(
+        adapted
+            .losses
+            .iter()
+            .any(|loss| loss.kind == LossKind::ServerToolDropped),
+        "{:?}",
+        adapted.losses
+    );
+}
+
+/// Anthropic 400s `defer_loading` combined with `cache_control` on one tool; the edge refuses the
+/// pair too. `cache_control` without `defer_loading` is not translated, same as before.
+#[test]
+fn defer_loading_with_cache_control_is_refused() {
+    let err = client_function_tool(json!({
+        "name": "f",
+        "defer_loading": true,
+        "cache_control": {"type": "ephemeral"},
+        "input_schema": {"type": "object"},
+    }))
+    .err()
+    .unwrap();
+    assert!(matches!(err, RequestRejection::Malformed(_)), "{err}");
+    assert!(err.detail().contains("cache_control"), "{err}");
+    assert_eq!(
+        client_function_tool(json!({
+            "name": "f",
+            "cache_control": {"type": "ephemeral"},
+            "input_schema": {"type": "object"},
+        }))
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+/// A nested `function.defer_loading` normalizes to tool level at intake, a tool-level marker wins
+/// when both are present, and the nested key never reaches the typed request.
+#[test]
+fn cc_nested_defer_loading_marker_normalizes_to_tool_level() {
+    let adapt_cc_tools = |tools: Value| {
+        let body =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "tools": tools});
+        let adapted = request_only(
+            &serde_json::to_vec(&body).unwrap(),
+            ClientProtocol::ChatCompletions,
+            &HeaderMap::new(),
+        )
+        .unwrap();
+        serde_json::to_value(&adapted.request).unwrap()
+    };
+    let cc = adapt_cc_tools(json!([
+        {"type": "function",
+         "function": {"name": "f", "parameters": {"type": "object"}, "defer_loading": true}},
+    ]));
+    assert_eq!(cc["tools"][0]["defer_loading"], true);
+    assert!(cc["tools"][0]["function"].get("defer_loading").is_none());
+
+    let cc = adapt_cc_tools(json!([
+        {"type": "function", "defer_loading": false,
+         "function": {"name": "f", "parameters": {"type": "object"}, "defer_loading": true}},
+    ]));
+    assert_eq!(cc["tools"][0]["defer_loading"], false);
+    assert!(cc["tools"][0]["function"].get("defer_loading").is_none());
+}
+
+/// Anthropic 400s an all-deferred declaration: with every tool elided there is nothing to call.
+/// Dropped server-only entries are not tools, so an all-server-tools request still passes, and a
+/// mixed declaration passes.
+#[test]
+fn messages_all_tools_deferred_is_refused() {
+    let err = adapt_messages_body(json!({"tools": [
+        {"name": "a", "defer_loading": true, "input_schema": {"type": "object"}},
+        {"name": "b", "defer_loading": true, "input_schema": {"type": "object"}},
+    ]}))
+    .expect_err("an all-deferred tool declaration must be refused");
+    assert!(
+        err.detail().contains(
+            "At least one tool must have defer_loading=false. All tools cannot be deferred."
+        ),
+        "{err}"
+    );
+
+    adapt_messages_body(json!({"tools": [
+        {"name": "a", "defer_loading": true, "input_schema": {"type": "object"}},
+        {"name": "b", "input_schema": {"type": "object"}},
+    ]}))
+    .expect("mixed deferred and eager tools pass");
+
+    let adapted = adapt_messages_body_dynamo(json!({"tools": [
+        {"type": "web_search_20250305", "name": "web_search"},
+    ]}))
+    .expect("an all-server-tools request forwards `tools: None`, no error");
+    assert!(adapted.request.tools.is_none());
+}
+
+/// The Responses door carries `defer_loading` too, tool-level or function-nested.
+#[test]
+fn responses_defer_loading_marker_carries() {
+    for tool in [
+        json!({"type": "function", "name": "f", "parameters": {"type": "object"}, "defer_loading": true}),
+        json!({"type": "function", "name": "f", "parameters": {"type": "object"},
+               "function": {"defer_loading": true}}),
+    ] {
+        let tools = responses_client_function_tool(tool.clone()).unwrap();
+        assert_eq!(tools[0].defer_loading, Some(true), "{tool}");
+    }
+    let tools = responses_client_function_tool(
+        json!({"type": "function", "name": "f", "parameters": {"type": "object"}}),
+    )
+    .unwrap();
+    assert_eq!(tools[0].defer_loading, None);
 }
 
 /// `error_code` is a telemetry label: renaming a variant must not change it silently.

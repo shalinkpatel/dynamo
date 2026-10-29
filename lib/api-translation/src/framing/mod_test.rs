@@ -244,6 +244,7 @@ fn a_closed_iteration_scope_rides_the_next_frame_not_the_terminal_one() {
 /// The released-index guard: with the open slot empty, `stage` can no longer see that an index
 /// already shipped, so without it a late staging silently builds a second entry at one index.
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "iteration 0 staged after its scope was released")]
 fn staging_into_a_released_iteration_trips() {
     let usage = usage();
@@ -254,6 +255,101 @@ fn staging_into_a_released_iteration_trips() {
     framing.emit_iteration_usage(0, &usage);
     framing.close_iteration();
     framing.emit_iteration_debug_msg(0, "too late");
+}
+
+/// The same guard's release behaviour, which the panic above replaces in a debug build: the
+/// late staging is dropped, so no second entry appears at an index that already shipped.
+#[test]
+#[cfg(not(debug_assertions))]
+fn staging_into_a_released_iteration_is_dropped() {
+    let usage = usage();
+    let mut framing = ClientProtocol::Messages
+        .envelope(None, None)
+        .stream_framing("m".to_string());
+    framing.on_chunk(&SemanticChunk::TextDelta("hi".into()));
+    framing.emit_iteration_usage(0, &usage);
+    framing.close_iteration();
+    framing.on_chunk(&SemanticChunk::TextDelta("two".into()));
+    framing.emit_iteration_debug_msg(0, "too late");
+
+    let frames = framing.finish(Termination::Model(FinishReason::Stop), &usage, &[]);
+    let repeated = frames
+        .iter()
+        .map(|frame| frame_json(frame))
+        .any(|body| body["baseten"]["iterations"][0]["index"] == json!(0));
+    assert!(!repeated, "iteration 0 must not ship twice: {frames:?}");
+}
+
+/// The out-of-order guard in a debug build.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "iteration scopes staged out of order: 0 after 1")]
+fn out_of_order_staging_trips() {
+    let mut open_scope: OpenIterationScope<u32> = OpenIterationScope::default();
+    open_scope.stage(IterationScope::at(1));
+    open_scope.stage(IterationScope::at(0));
+}
+
+/// The same guard's release behaviour: the stray lower index is dropped and the open scope
+/// keeps its slot, since more can still stage into the higher index.
+#[test]
+#[cfg(not(debug_assertions))]
+fn out_of_order_staging_drops_the_stray_scope() {
+    let mut open_scope: OpenIterationScope<u32> = OpenIterationScope::default();
+    assert!(open_scope.stage(IterationScope::at(1)).is_none());
+    assert!(open_scope.stage(IterationScope::at(0)).is_none());
+    assert_eq!(
+        open_scope.close().expect("the open scope survives").index,
+        1
+    );
+}
+
+/// A displaced scope ships to the client just as a closed one does, so the released watermark
+/// has to move with it: without that, restaging its index would ship a second entry.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "iteration 0 staged after its scope was released")]
+fn restaging_a_displaced_iteration_trips() {
+    let mut open_scope: OpenIterationScope<u32> = OpenIterationScope::default();
+    open_scope.stage(IterationScope::at(0));
+    open_scope
+        .stage(IterationScope::at(1))
+        .expect("index 0 is displaced and ships");
+    open_scope.stage(IterationScope::at(0));
+}
+
+/// The duplicate-usage guard in a debug build. One iteration reports usage once; a second
+/// staging means the caller emitted it twice and one of the two numbers is wrong.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "two usage stagings for iteration 0")]
+fn two_usage_stagings_for_one_iteration_trips() {
+    let mut open_scope: OpenIterationScope<u32> = OpenIterationScope::default();
+    open_scope.stage(IterationScope {
+        usage: Some(1),
+        ..IterationScope::at(0)
+    });
+    open_scope.stage(IterationScope {
+        usage: Some(2),
+        ..IterationScope::at(0)
+    });
+}
+
+/// The same guard's release behaviour: the first usage stands, since a later one cannot be
+/// known to be the more correct of the two.
+#[test]
+#[cfg(not(debug_assertions))]
+fn two_usage_stagings_keep_the_first() {
+    let mut open_scope: OpenIterationScope<u32> = OpenIterationScope::default();
+    open_scope.stage(IterationScope {
+        usage: Some(1),
+        ..IterationScope::at(0)
+    });
+    open_scope.stage(IterationScope {
+        usage: Some(2),
+        ..IterationScope::at(0)
+    });
+    assert_eq!(open_scope.close().expect("one open scope").usage, Some(1));
 }
 
 /// SEG keeps the MAX of each frame's top-level `usage` and never sums (`applyCumulative` ->

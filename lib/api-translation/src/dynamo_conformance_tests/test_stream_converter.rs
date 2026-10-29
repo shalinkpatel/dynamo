@@ -15,9 +15,9 @@ use dynamo_protocols::types::FinishReason;
 
 /// upstream: stream_converter.rs::test_minimax_m2_claude_code_session_replay
 /// ADAPT (parser side): the full on-the-wire MiniMax-M2.5 session — thinking, text, then a tool
-/// call whose args dribble across four chunks. The parser holds the call until its args parse, then
-/// surfaces ONE complete `ToolCall`. (Dynamo's converter streams N `input_json_delta` events; our
-/// emitter renders the one complete call as a single delta — see `framing/messages.rs` header + `sse_emitter_test.rs`.)
+/// call whose args dribble across four chunks. The parser streams each fragment as a
+/// `ToolCallDelta` and still surfaces ONE complete `ToolCall` when the args parse (dynamo's
+/// converter likewise streams N `input_json_delta` events).
 #[test]
 fn minimax_m2_session_replay() {
     let mut parser = SseParser::default();
@@ -52,7 +52,17 @@ fn minimax_m2_session_replay() {
     );
     assert_eq!(
         kinds(&out),
-        vec!["thinking", "thinking", "text", "tool_call", "stop"]
+        vec![
+            "thinking",
+            "thinking",
+            "text",
+            "tool_call_delta",
+            "tool_call_delta",
+            "tool_call_delta",
+            "tool_call_delta",
+            "tool_call",
+            "stop"
+        ]
     );
     let tool_calls = tools(&out);
     assert_eq!(tool_calls.len(), 1);

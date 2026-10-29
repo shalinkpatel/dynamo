@@ -45,6 +45,9 @@ pub struct ToolIdentity {
 }
 
 pub trait CodingAdapter: Send + Sync {
+    /// Whether [`Self::render_tool_call`] would reshape this call, answered from the name alone so
+    /// a streaming framing can hold the call's args for whole-call rendering before they arrive.
+    fn handles_tool_call(&self, tool_name: &str) -> bool;
     /// `None` for a call this adapter did not expand: it renders the protocol's usual way.
     fn render_tool_call(&self, call: &ToolCallToRender<'_>) -> Option<RenderedToolCall>;
     /// The client's own object for a resolved call's result, for a protocol that surfaces one

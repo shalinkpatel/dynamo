@@ -19,6 +19,17 @@ pub struct ToolCall {
     pub raw_args: String,
 }
 
+/// One wire fragment of a tool call still accumulating. `id`/`name` are the parser's merged
+/// identity (the model may split the opener across chunks), so every delta is attributable;
+/// `args_delta` is only the bytes since the previous delta. Purely a client-egress concern:
+/// dispatch and history key off the complete [`ToolCall`].
+#[derive(Debug, Clone)]
+pub struct ToolCallDelta {
+    pub id: String,
+    pub name: String,
+    pub args_delta: String,
+}
+
 /// A model tool call the caller resolved to a server tool it executes itself. The crate only
 /// renders these (extension records, `mcp_call` items); dispatching them is the caller's.
 #[derive(Debug, Clone)]

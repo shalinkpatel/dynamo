@@ -12,6 +12,7 @@
 pub mod baseten_response_extension;
 pub mod client_egress;
 pub mod coding_adapter;
+pub(crate) mod deferred_tools;
 pub mod framing;
 pub mod history;
 pub mod hooks;
@@ -30,7 +31,7 @@ mod dynamo_conformance_tests;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-use crate::model::ToolCall;
+use crate::model::{ToolCall, ToolCallDelta};
 
 /// What adaptation did not carry through, and the closed set of kinds a counter can be labeled by.
 pub use crate::loss::{Loss, LossKind};
@@ -135,12 +136,16 @@ pub enum ContentKind {
 }
 
 /// One finished semantic unit off the model's ChatCompletions stream, drawn once at the single
-/// boundary source ([`sse_parser::SseParser`]). Text and thinking stream through as deltas; a tool
-/// call is held until its args parse and surfaces once, complete.
+/// boundary source ([`sse_parser::SseParser`]). Text and thinking stream through as deltas; a tool call
+/// still surfaces once its args parse (dispatch and history key off that), while its arg fragments
+/// also stream through as [`ToolCallDelta`]s for the client to render live.
 #[derive(Debug, Clone)]
 pub enum SemanticChunk {
     TextDelta(String),
     ThinkingDelta(String),
+    /// One args fragment of a tool call in flight. The loop drops a server call's fragments: its
+    /// wire shape renders complete at dispatch.
+    ToolCallDelta(ToolCallDelta),
     /// A complete tool call: valid-JSON args, assembled by the parser.
     ToolCall(ToolCall),
     /// One model call's usage (we request `stream_options.include_usage`).

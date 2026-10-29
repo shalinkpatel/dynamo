@@ -3303,6 +3303,33 @@ messages translate. Baseten-specific.
 continues `` ([#1139](https://github.com/basetenlabs/dynamo/pull/1139)): each
 `LossKind` declares its outcome once (strum `message`), call sites pass only the
 reason. The line used to carry only the detail sentence, without the field.
+
+tool-bank merge, part 1 (replay of tool-bank's api_translation commits since
+the port base baseten `a63c05ca16`): ingress refuses a malformed Anthropic
+`tool_result.content` (`lib/protocols`, was silently `None`; tool-bank vendor
+patch 0005); iteration-scope invariants hold in release builds (drop + log, not
+a second `iterations[]` entry); CC and Messages egress stream client tool-call
+arguments as they arrive (`SemanticChunk::ToolCallDelta`,
+`CodingAdapter::handles_tool_call`), while Responses still opens a call's item
+only once the host classifies it (#1107) and sends its arguments whole; egress
+refuses content resumed for an already-completed call (`resumed_tool_call`,
+tool-bank's behavior; the serializing parser makes dropping it unsafe). Egress
+items are tool-bank-only (dynamo frontends call only `adapt_request_json`).
+Deferred tool discovery (tool-bank #30339) is a separate follow-up.
+Baseten-specific.
+
+tool-bank merge, part 2 (deferred tool loading, tool-bank #30339): client
+`defer_loading` carries onto CC tools from Messages and Responses (tool-level
+or function-nested, normalized to tool level; also on CC), Messages refuses
+`defer_loading` + `cache_control` on one tool and an all-deferred declaration
+(Anthropic's 400s), and a `tool_reference` with an empty `tool_name` stays
+coerced JSON text like a missing one (`tool_reference` rendering itself is
+#1134's).
+Client-executed tool search (Responses `tool_search` with `execution: client`,
+replayed `tool_search_call`/`tool_search_output`, Anthropic
+`tool_search_tool_*`) translates only when `IngressHooks::translates_client_tool_search`
+is on (tool-bank); standard dynamo keeps dropping the declaration because its
+Responses egress cannot render native `tool_search_call` items.
 Baseten-specific.
 
 ## CC pivot: frontends on `b10-dynamo-api-translation` (ingress)

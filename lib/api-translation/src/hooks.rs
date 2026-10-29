@@ -119,6 +119,17 @@ pub trait IngressHooks {
         false
     }
 
+    /// Whether client-executed tool search translates: a Responses `tool_search` declared with
+    /// `execution: "client"` (and Anthropic's `tool_search_tool_*` declaration) becomes a synthetic
+    /// `tool_search` function, and replayed `tool_search_call` / `tool_search_output` items become a
+    /// function-call pair whose delivered tools join the request as deferred functions. Off by
+    /// default: rendering the model's call back as a native `tool_search_call` item takes the
+    /// crate's own Responses framing, which dynamo's frontends do not use, so standard dynamo keeps
+    /// dropping the declaration. tool-bank turns it on.
+    fn translates_client_tool_search(&self) -> bool {
+        false
+    }
+
     /// One [`Loss`] the request survived — something adaptation dropped, skipped, degraded, or
     /// folded. Every loss is also on [`crate::request::AdaptedRequest::losses`] and logged at WARN
     /// by the crate; this hook is for the consumer's counter (tool-bank labels one metric by

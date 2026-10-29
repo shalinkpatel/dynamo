@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::ToolCallDelta;
 
 #[test]
 fn buffered_web_search_uses_anthropic_blocks_and_drops_page_text() {
@@ -214,6 +215,34 @@ fn event_name_matches_the_serialized_type_for_every_variant() {
         let body: serde_json::Value = serde_json::from_str(&to_json_string(&event)).unwrap();
         assert_eq!(body["type"], event_name(&event), "body: {body}");
     }
+}
+
+/// A `tool_use` block still taking `input_json_delta`s when the stream errors (the model's args
+/// cut off by `max_tokens`) has no `ToolCall` left to close it. An SDK that waits for
+/// `content_block_stop` hangs on the block, so the error frame must close it first.
+#[test]
+fn error_sse_frame_closes_a_still_streaming_tool_use_block() {
+    let mut framing = MessagesFraming::new("m".to_string(), None);
+    framing.on_chunk(&SemanticChunk::ToolCallDelta(ToolCallDelta {
+        id: "call-1".into(),
+        name: "write_file".into(),
+        args_delta: r#"{"path":"#.into(),
+    }));
+    let error_payload = framing.error_sse_frame(
+        ErrorClass::Internal,
+        Some("model_truncated_tool_call"),
+        "model truncated tool call",
+    );
+    let event_lines: Vec<&str> = error_payload
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .map(|frame| frame.lines().next().unwrap())
+        .collect();
+    assert_eq!(
+        event_lines,
+        ["event: content_block_stop", "event: error"],
+        "{error_payload}"
+    );
 }
 
 use dynamo_protocols::types::PromptTokensDetails;

@@ -1241,6 +1241,9 @@ impl StreamFraming for ResponsesFraming {
             SemanticChunk::TextDelta(delta) => {
                 self.content_delta(OpenContentKind::Text, delta, &mut frames);
             }
+            // A Responses item opens only once the host classifies the call (see
+            // `unclassified_calls`); a delta arrives before that, so the args go out whole.
+            SemanticChunk::ToolCallDelta(_) => {}
             SemanticChunk::ToolCall(call) => {
                 self.ensure_started(&mut frames);
                 self.close_open(&mut frames);

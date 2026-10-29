@@ -21,7 +21,10 @@ fn text_then_complete_tool_call() {
             chunk(json!({}), Some("tool_calls")),
         ],
     );
-    assert_eq!(kinds(&out), vec!["text", "tool_call", "stop"]);
+    assert_eq!(
+        kinds(&out),
+        vec!["text", "tool_call_delta", "tool_call", "stop"]
+    );
     assert_eq!(tool(&out).id, "call-1");
     assert_eq!(tool(&out).args, json!({"path": "/x"}));
 }
@@ -36,7 +39,7 @@ fn tool_only_complete_in_one_chunk() {
             Some("tool_calls"),
         )],
     );
-    assert_eq!(kinds(&out), vec!["tool_call", "stop"]);
+    assert_eq!(kinds(&out), vec!["tool_call_delta", "tool_call", "stop"]);
 }
 
 #[test]
@@ -60,7 +63,10 @@ fn thinking_text_then_tool() {
             ),
         ],
     );
-    assert_eq!(kinds(&out), vec!["thinking", "text", "tool_call", "stop"]);
+    assert_eq!(
+        kinds(&out),
+        vec!["thinking", "text", "tool_call_delta", "tool_call", "stop"]
+    );
 }
 
 /// The MiniMax regression at the parser layer: a tool call whose args dribble across chunks must
@@ -76,7 +82,11 @@ fn streamed_args_surface_once_when_json_completes() {
         ))
         .chunks,
     );
-    assert!(out.is_empty(), "no tool_call before args parse");
+    assert!(
+        out.iter()
+            .all(|r| !matches!(r.as_ref().unwrap(), SemanticChunk::ToolCall(_))),
+        "no complete tool_call before args parse"
+    );
     out.extend(
         p.push_and_yield(&chunk(
             tool_delta(0, None, None, Some(r#"{"file_path":"w.txt""#)),
@@ -159,7 +169,14 @@ fn tool_arg_deltas_report_their_content_kind_before_the_chunk() {
         tool_delta(0, Some("call-1"), Some("Write"), Some(r#"{"file_path""#)),
         None,
     ));
-    assert!(opener.chunks.is_empty(), "no tool_call before args parse");
+    assert!(
+        matches!(
+            opener.chunks.as_slice(),
+            [Ok(SemanticChunk::ToolCallDelta(_))]
+        ),
+        "the opener streams as a delta, not a complete call: {:?}",
+        opener.chunks
+    );
     assert_eq!(opener.delta_content_kinds, vec![ContentKind::ToolCall]);
     let closer = p.push_and_yield(&chunk(
         tool_delta(0, None, None, Some(r#":"w.txt"}"#)),
@@ -167,8 +184,15 @@ fn tool_arg_deltas_report_their_content_kind_before_the_chunk() {
     ));
     assert_eq!(closer.delta_content_kinds, vec![ContentKind::ToolCall]);
     assert!(
-        matches!(closer.chunks.as_slice(), [Ok(SemanticChunk::ToolCall(_))]),
-        "complete args yield the ToolCall"
+        matches!(
+            closer.chunks.as_slice(),
+            [
+                Ok(SemanticChunk::ToolCallDelta(_)),
+                Ok(SemanticChunk::ToolCall(_))
+            ]
+        ),
+        "the closing fragment streams, then complete args yield the ToolCall: {:?}",
+        closer.chunks
     );
 }
 
@@ -270,7 +294,16 @@ fn multiple_tool_calls_each_complete() {
             ),
         ],
     );
-    assert_eq!(kinds(&out), vec!["tool_call", "tool_call", "stop"]);
+    assert_eq!(
+        kinds(&out),
+        vec![
+            "tool_call_delta",
+            "tool_call",
+            "tool_call_delta",
+            "tool_call",
+            "stop"
+        ]
+    );
 }
 
 /// Truncated tool args (never parse) at stream end -> hard error (the call is genuinely broken).
@@ -290,6 +323,36 @@ fn incomplete_args_at_finish_errors() {
         fin.iter()
             .any(|r| matches!(r, Err(TranslationError::UpstreamUnavailable { .. }))),
         "truncated args must error at finish (model cut-off = upstream)"
+    );
+}
+
+/// Opening a second call while the first one's arguments are still incomplete breaks the linear
+/// emission the parser requires. Whether the model abandoned the first call or simply emitted
+/// arguments that never parsed is not visible on the wire, so the refusal names the arguments.
+#[test]
+fn a_second_call_opening_before_the_first_completes_is_refused() {
+    let mut p = SseParser::default();
+    p.push_and_yield(&chunk(
+        tool_delta(0, Some("a"), Some("R"), Some(r#"{"p":"#)),
+        None,
+    ));
+    let pushed = p.push_and_yield(&chunk(
+        tool_delta(1, Some("b"), Some("W"), Some(r#"{"q":2}"#)),
+        None,
+    ));
+    let error_codes: Vec<&str> = pushed
+        .chunks
+        .iter()
+        .filter_map(|r| match r {
+            Err(TranslationError::UpstreamUnavailable { error_code, .. }) => Some(*error_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        error_codes,
+        vec!["truncated_tool_call"],
+        "{:?}",
+        pushed.chunks
     );
 }
 
@@ -461,4 +524,180 @@ fn uncoded_error_chunk_is_unavailable_without_its_message() {
         }
         other => panic!("expected Upstream error, got {other:?}"),
     }
+}
+
+/// A call still awaiting its name has not completed, so a second call opening behind it is the
+/// same invariant violation — the missing name, not the arguments, is what makes it incomplete.
+#[test]
+fn a_second_call_opening_behind_an_unnamed_call_is_refused() {
+    let mut p = SseParser::default();
+    p.push_and_yield(&chunk(
+        tool_delta(0, Some("a"), None, Some(r#"{"p":1}"#)),
+        None,
+    ));
+    let pushed = p.push_and_yield(&chunk(
+        tool_delta(1, Some("b"), Some("W"), Some(r#"{"q":2}"#)),
+        None,
+    ));
+    let error_codes: Vec<&str> = pushed
+        .chunks
+        .iter()
+        .filter_map(|r| match r {
+            Err(TranslationError::UpstreamUnavailable { error_code, .. }) => Some(*error_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        error_codes,
+        vec!["malformed_tool_call"],
+        "{:?}",
+        pushed.chunks
+    );
+}
+
+/// Content for a call the parser already dispatched cannot be folded in — its arguments are frozen
+/// and it may already be running — so the stream is refused rather than silently dropping it.
+#[test]
+fn content_for_an_already_dispatched_call_is_refused() {
+    let mut p = SseParser::default();
+    p.push_and_yield(&chunk(
+        tool_delta(0, Some("a"), Some("R"), Some(r#"{"p":1}"#)),
+        None,
+    ));
+    let pushed = p.push_and_yield(&chunk(tool_delta(0, None, None, Some(r#"{"q":2}"#)), None));
+    let error_codes: Vec<&str> = pushed
+        .chunks
+        .iter()
+        .filter_map(|r| match r {
+            Err(TranslationError::UpstreamUnavailable { error_code, .. }) => Some(*error_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        error_codes,
+        vec!["resumed_tool_call"],
+        "{:?}",
+        pushed.chunks
+    );
+}
+
+/// A zero-argument call is complete the moment the next call opens: `finalize` reads empty
+/// arguments as `{}`, so this is linear emission and not a violation.
+#[test]
+fn a_zero_argument_call_completes_when_the_next_call_opens() {
+    let mut p = SseParser::default();
+    let out = collect(
+        &mut p,
+        &[
+            chunk(tool_delta(0, Some("a"), Some("Ping"), None), None),
+            chunk(
+                tool_delta(1, Some("b"), Some("W"), Some(r#"{"q":2}"#)),
+                Some("tool_calls"),
+            ),
+        ],
+    );
+    let completed: Vec<(&str, &str)> = out
+        .iter()
+        .filter_map(|c| match c {
+            SemanticChunk::ToolCall(call) => Some((call.id.as_str(), call.raw_args.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completed, vec![("a", "{}"), ("b", r#"{"q":2}"#)], "{out:?}");
+}
+
+/// A trailing entry for a dispatched call that carries no content is framing, not a resumed call.
+#[test]
+fn an_empty_trailing_entry_for_a_dispatched_call_is_ignored() {
+    let mut p = SseParser::default();
+    p.push_and_yield(&chunk(
+        tool_delta(0, Some("a"), Some("R"), Some(r#"{"p":1}"#)),
+        None,
+    ));
+    let pushed = p.push_and_yield(&chunk(tool_delta(0, None, None, Some("")), None));
+    assert!(pushed.chunks.is_empty(), "{:?}", pushed.chunks);
+}
+
+/// Server tools stream deltas like any call at this layer; the loop drops them, keyed by the same
+/// selection the complete call dispatches on.
+#[test]
+fn server_tool_call_streams_deltas_like_any_call() {
+    let mut p = SseParser::default();
+    let out = collect(
+        &mut p,
+        &[
+            chunk(
+                tool_delta(
+                    0,
+                    Some("c1"),
+                    Some("baseten__parallel__web_search"),
+                    Some(r#"{"q":"#),
+                ),
+                None,
+            ),
+            chunk(
+                tool_delta(0, None, None, Some(r#""x"}"#)),
+                Some("tool_calls"),
+            ),
+        ],
+    );
+    assert_eq!(
+        kinds(&out),
+        vec!["tool_call_delta", "tool_call_delta", "tool_call", "stop"]
+    );
+}
+
+/// The model may split id/name/args across chunks (Kimi/MAPI): the first delta goes out once the
+/// identity is complete and carries everything accumulated so far, so no fragment is lost.
+#[test]
+fn split_opener_first_delta_carries_the_backlog() {
+    let mut p = SseParser::default();
+    let mut out = Vec::new();
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, Some("c1"), None, Some(r#"{"q":"#)),
+            None,
+        ))
+        .chunks,
+    );
+    out.extend(
+        p.push_and_yield(&chunk(
+            tool_delta(0, None, Some("Search"), Some(r#""x""#)),
+            None,
+        ))
+        .chunks,
+    );
+    assert_eq!(
+        out.len(),
+        1,
+        "no attributable delta before the name: {out:?}"
+    );
+    let Ok(SemanticChunk::ToolCallDelta(delta)) = &out[0] else {
+        panic!("expected a ToolCallDelta: {:?}", out[0])
+    };
+    assert_eq!(delta.id, "c1");
+    assert_eq!(delta.name, "Search");
+    assert_eq!(delta.args_delta, r#"{"q":"x""#);
+}
+
+/// Args are frozen at dispatch: content past a complete value reaches neither the call nor the
+/// client's delta stream.
+#[test]
+fn post_dispatch_chunks_stream_no_delta() {
+    let mut p = SseParser::default();
+    let out = collect(
+        &mut p,
+        &[
+            chunk(
+                tool_delta(0, Some("c1"), Some("S"), Some(r#"{"q":"x"}"#)),
+                None,
+            ),
+            chunk(tool_delta(0, None, None, Some("  ")), Some("tool_calls")),
+        ],
+    );
+    assert_eq!(
+        kinds(&out),
+        vec!["tool_call_delta", "tool_call", "stop"],
+        "whitespace past the complete value streams nothing: {out:?}"
+    );
 }

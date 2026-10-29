@@ -312,6 +312,15 @@ fn adapt_request_json_inner(
     )?;
     // The one place a protocol picks its coding client; everything that client needs — the body
     // rewrite here, the rendering later — rides what it returns.
+    let discovery =
+        if protocol == ClientProtocol::Responses && hooks.translates_client_tool_search() {
+            Some(
+                crate::deferred_tools::rewrite_responses(&mut body_json)
+                    .map_err(RequestRejection::malformed)?,
+            )
+        } else {
+            None
+        };
     let ingress_rewrite = hooks.rewrite_ingress(protocol, headers, &mut body_json)?;
     let responses_params = matches!(protocol, ClientProtocol::Responses)
         .then(|| ResponsesParams::from_body(&body_json));
@@ -429,7 +438,13 @@ fn adapt_request_json_inner(
             should_stream,
             losses,
         },
-        coding_adapter: ingress_rewrite.map(|ingress_rewrite| ingress_rewrite.adapter),
+        coding_adapter: {
+            let inner = ingress_rewrite.map(|ingress_rewrite| ingress_rewrite.adapter);
+            match discovery {
+                Some(discovery) => discovery.wrap(inner),
+                None => inner,
+            }
+        },
         responses_params,
     })
 }
@@ -476,7 +491,7 @@ fn adapt_cc(
     let mut claimed_names = Vec::new();
     if let Some(entries) = cc_body.get_mut("tools").and_then(Value::as_array_mut) {
         let mut cc_tools = Vec::with_capacity(entries.len());
-        for tool_entry in std::mem::take(entries) {
+        for mut tool_entry in std::mem::take(entries) {
             let tool_entry_head = CcToolEntryHead::deserialize(&tool_entry)
                 .map_err(|e| RequestRejection::malformed(format!("invalid tool entry: {e}")))?;
             // Shape-only routing: a CC tool entry whose `type` is not `function` is a hosted
@@ -499,6 +514,7 @@ fn adapt_cc(
                     ToolDisposition::Reject(rejection) => return Err(rejection),
                 }
             } else {
+                normalize_nested_defer_loading(&mut tool_entry);
                 cc_tools.push(tool_entry);
             }
         }
@@ -579,8 +595,9 @@ fn parse_client_body<T: serde::de::DeserializeOwned>(
 /// - `unmodeled` catch-all: TB is a proxy, so an Anthropic field it does not translate must still
 ///   reach the model server. The vendored type has no catch-all, so a re-sync that models a new
 ///   field would silently start dropping it.
-/// - `tools` stays `Vec<Value>`: a `baseten__*` selection entry carries no `name`, which the
-///   vendored `AnthropicTool` requires. Client entries are typed as `AnthropicTool` per entry below.
+/// - `tools` stays `Vec<Value>`: entries are dispatched by shape (`baseten__*` selection,
+///   Anthropic-native server tool, client tool) before any typed parse. Client entries are
+///   typed as `AnthropicTool` per entry below.
 #[derive(Deserialize)]
 struct MessagesRequest {
     model: String,
@@ -727,6 +744,28 @@ fn adapt_messages(
         )));
     }
 
+    let mut tool_entries = messages_request.tools;
+    if hooks.translates_client_tool_search() {
+        tool_entries
+            .iter_mut()
+            .for_each(crate::deferred_tools::messages_tool_search_as_client_tool);
+    }
+    let (cc_tools, claimed_names) = expand_declared_tools(
+        hooks,
+        dropped,
+        ClientProtocol::Messages,
+        tool_entries,
+        is_anthropic_server_tool_shaped,
+        client_function_tool,
+    )?;
+    // Anthropic 400s an all-deferred declaration. Dropped server-only entries are not tools, so
+    // an all-server-tools request still forwards `tools: None` rather than erroring.
+    if cc_tools.iter().any(is_deferred_tool) && cc_tools.iter().all(is_deferred_tool) {
+        return Err(RequestRejection::malformed(
+            "At least one tool must have defer_loading=false. All tools cannot be deferred.",
+        ));
+    }
+
     let mut cc_messages: Vec<CcMessage> = Vec::new();
     // An empty or null `system` carries no instruction; a `{"role":"system","content":""}` in the
     // replayed prefix would be TB adding a message the caller did not send.
@@ -739,15 +778,6 @@ fn adapt_messages(
         cc_messages.push(text_message(&AnthropicRole::System, system)?);
     }
     let strict = hooks.rejects_unsupported_messages_features();
-    let (cc_tools, claimed_names) = expand_declared_tools(
-        hooks,
-        dropped,
-        ClientProtocol::Messages,
-        messages_request.tools,
-        is_anthropic_server_tool_shaped,
-        client_function_tool,
-    )?;
-
     let declared_tools = DeclaredTools::new(&cc_tools);
     for (message_index, message) in messages_request.messages.iter().enumerate() {
         translate_message(
@@ -1027,6 +1057,11 @@ fn messages_response_format(
 fn client_function_tool(tool_entry: Value) -> Result<Vec<ChatCompletionTool>, RequestRejection> {
     let client_tool: AnthropicTool = serde_json::from_value(tool_entry)
         .map_err(|e| RequestRejection::malformed(format!("invalid tool definition: {e}")))?;
+    if client_tool.defer_loading == Some(true) && client_tool.cache_control.is_some() {
+        return Err(RequestRejection::malformed(
+            "`defer_loading` cannot be combined with `cache_control` on a tool: Anthropic rejects the pair",
+        ));
+    }
     if let Some(tool_type) = client_tool.tool_type.as_deref().filter(|t| *t != "custom") {
         // Malformed, not Unsupported: only Anthropic can execute these, so it is the caller
         // pointing an Anthropic-hosted tool at a non-Anthropic endpoint, not a TB gap to close.
@@ -1528,7 +1563,11 @@ fn tool_reference_name(value: &Value) -> Option<&str> {
     if value.get("type").and_then(Value::as_str) != Some("tool_reference") {
         return None;
     }
-    value.get("tool_name").and_then(Value::as_str)
+    // An empty name points at nothing; it stays coerced JSON text like a missing one.
+    value
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
 }
 
 /// The declared tools a `tool_reference` can name. A reference reaches the model as text, never as
@@ -2575,9 +2614,10 @@ fn flatten_responses_namespaces(entries: Vec<Value>) -> Result<Vec<Value>, Reque
 /// (`Tool::Mcp`, `Tool::WebSearch`, …) is refused: only the platform that natively runs it can, and
 /// TB has no execution path for OpenAI's own built-in/remote tools.
 fn responses_client_function_tool(
-    tool_entry: Value,
+    mut tool_entry: Value,
 ) -> Result<Vec<ChatCompletionTool>, RequestRejection> {
-    // The vendored Responses function tool does not model `defer_loading`; read it off the wire.
+    normalize_nested_defer_loading(&mut tool_entry);
+    // Read off the raw entry: the vendored Responses function tool does not model the marker.
     let defer_loading = tool_entry.get("defer_loading").and_then(Value::as_bool);
     let tool: ResponsesTool = serde_json::from_value(tool_entry)
         .map_err(|e| RequestRejection::malformed(format!("invalid tool definition: {e}")))?;
@@ -2719,6 +2759,28 @@ fn function_tool(name: &str, description: &str, parameters: Value) -> ChatComple
         },
         defer_loading: None,
     }
+}
+
+/// Tool-level is the only wire envelope for the `defer_loading` marker (a nested
+/// `function.defer_loading` is normalized at intake on the CC/Responses paths).
+fn is_deferred_tool(tool: &ChatCompletionTool) -> bool {
+    tool.defer_loading == Some(true)
+}
+
+/// A nested `function.defer_loading` normalizes to tool level — the only wire envelope — with a
+/// tool-level marker winning when both are present. The nested key is dropped either way.
+fn normalize_nested_defer_loading(tool_entry: &mut Value) {
+    let Some(tool_object) = tool_entry.as_object_mut() else {
+        return;
+    };
+    let Some(nested) = tool_object
+        .get_mut("function")
+        .and_then(Value::as_object_mut)
+        .and_then(|function| function.remove("defer_loading"))
+    else {
+        return;
+    };
+    tool_object.entry("defer_loading").or_insert(nested);
 }
 
 /// Flatten Anthropic string|block-array content to plain text (the CC system/tool message form).

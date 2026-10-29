@@ -149,7 +149,7 @@ fn transcript_blocks(
     failed_server_tool_call_ids: &HashSet<&str>,
 ) -> Vec<AnthropicResponseContentBlock> {
     let mut blocks = Vec::new();
-    let mut rendered_calls: HashMap<&str, &str> = HashMap::new();
+    let mut rendered_tool_calls: HashMap<&str, &str> = HashMap::new();
     for message in transcript {
         match message {
             CcMessage::Assistant(assistant) => {
@@ -181,7 +181,7 @@ fn transcript_blocks(
                             },
                         },
                     ) {
-                        rendered_calls.insert(&call.id, &call.function.name);
+                        rendered_tool_calls.insert(&call.id, &call.function.name);
                         blocks.push(block);
                         continue;
                     }
@@ -197,21 +197,20 @@ fn transcript_blocks(
                     continue;
                 };
                 let raw = Value::String(content.clone());
-                if let Some(block) =
-                    rendered_calls
-                        .get(tool.tool_call_id.as_str())
-                        .and_then(|tool_name| {
-                            adapter_result_block(
-                                coding_adapter,
-                                &ToolResultToRender {
-                                    tool_name,
-                                    id: &tool.tool_call_id,
-                                    content: &raw,
-                                    is_error: failed_server_tool_call_ids
-                                        .contains(tool.tool_call_id.as_str()),
-                                },
-                            )
-                        })
+                if let Some(block) = rendered_tool_calls
+                    .get(tool.tool_call_id.as_str())
+                    .and_then(|tool_name| {
+                        adapter_result_block(
+                            coding_adapter,
+                            &ToolResultToRender {
+                                tool_name,
+                                id: &tool.tool_call_id,
+                                content: &raw,
+                                is_error: failed_server_tool_call_ids
+                                    .contains(tool.tool_call_id.as_str()),
+                            },
+                        )
+                    })
                 {
                     blocks.push(block);
                     continue;
@@ -291,13 +290,15 @@ fn messages_id() -> String {
     format!("msg_{}", next_id_seq())
 }
 
-/// Which content block is currently open. Tool blocks open and close inline, so they can never be
-/// open — which is why this is not the crate's `ContentKind`.
+/// Which content block is currently open. This is not the crate's `ContentKind`: that names the
+/// model's delta kinds, this is wire-block state (a tool block stays open while its args stream,
+/// and `ContentKind` has no such notion).
 #[derive(PartialEq)]
 enum OpenBlock {
     None,
     Thinking(u32),
     Text(u32),
+    ToolUse { index: u32, call_id: String },
 }
 
 struct MessagesFraming {
@@ -306,6 +307,9 @@ struct MessagesFraming {
     started: bool,
     next_block_index: u32,
     open: OpenBlock,
+    /// Calls whose args went out as `input_json_delta`s; their complete ToolCall only stops the
+    /// open block instead of rendering the args again.
+    args_streamed_for: HashSet<String>,
     /// Buffered to ride the next extras-preserving frame (see [`event_frame`]).
     pending_baseten: MessagesExtension,
     open_iteration_scope: OpenIterationScope<AnthropicUsage>,
@@ -320,6 +324,7 @@ impl MessagesFraming {
             started: false,
             next_block_index: 0,
             open: OpenBlock::None,
+            args_streamed_for: HashSet::new(),
             pending_baseten: MessagesExtension::default(),
             open_iteration_scope: OpenIterationScope::default(),
             coding_adapter,
@@ -384,8 +389,8 @@ impl MessagesFraming {
         frames.push(self.event_frame(AnthropicStreamEvent::MessageStart { message }));
     }
 
-    /// Open a content block at the next index, returning it. Caller records `self.open` for
-    /// streaming blocks; tool blocks close inline so they don't.
+    /// Open a content block at the next index, returning it. Caller records `self.open` when the
+    /// block must stay open across further chunks (thinking, text, a streamed tool call).
     fn open_block(
         &mut self,
         frames: &mut Vec<String>,
@@ -422,7 +427,9 @@ impl MessagesFraming {
                 ));
                 frames.push(self.block_stop(index));
             }
-            OpenBlock::Text(index) => frames.push(self.block_stop(index)),
+            OpenBlock::Text(index) | OpenBlock::ToolUse { index, .. } => {
+                frames.push(self.block_stop(index))
+            }
         }
     }
 
@@ -453,7 +460,7 @@ impl StreamFraming for MessagesFraming {
                 self.ensure_started(&mut frames);
                 let index = match self.open {
                     OpenBlock::Thinking(index) => index,
-                    OpenBlock::None | OpenBlock::Text(_) => {
+                    OpenBlock::None | OpenBlock::Text(_) | OpenBlock::ToolUse { .. } => {
                         self.close_open(&mut frames);
                         let index = self.open_block(
                             &mut frames,
@@ -477,7 +484,7 @@ impl StreamFraming for MessagesFraming {
                 self.ensure_started(&mut frames);
                 let index = match self.open {
                     OpenBlock::Text(index) => index,
-                    OpenBlock::None | OpenBlock::Thinking(_) => {
+                    OpenBlock::None | OpenBlock::Thinking(_) | OpenBlock::ToolUse { .. } => {
                         self.close_open(&mut frames);
                         let index = self.open_block(
                             &mut frames,
@@ -494,25 +501,69 @@ impl StreamFraming for MessagesFraming {
                     self.block_delta(index, AnthropicDelta::TextDelta { text: text.clone() }),
                 );
             }
+            SemanticChunk::ToolCallDelta(delta) => {
+                if self
+                    .coding_adapter
+                    .as_deref()
+                    .is_some_and(|adapter| adapter.handles_tool_call(&delta.name))
+                {
+                    // The adapter needs complete args to reshape this call; wait for `ToolCall`.
+                    return Vec::new();
+                }
+                self.ensure_started(&mut frames);
+                let index = match &self.open {
+                    OpenBlock::ToolUse { index, call_id } if call_id == &delta.id => *index,
+                    _ => {
+                        self.close_open(&mut frames);
+                        // `input` starts empty — the SDK builds it from the deltas.
+                        let index = self.open_block(
+                            &mut frames,
+                            AnthropicResponseContentBlock::ToolUse {
+                                id: delta.id.clone(),
+                                name: delta.name.clone(),
+                                input: serde_json::json!({}),
+                            },
+                        );
+                        self.open = OpenBlock::ToolUse {
+                            index,
+                            call_id: delta.id.clone(),
+                        };
+                        index
+                    }
+                };
+                self.args_streamed_for.insert(delta.id.clone());
+                if !delta.args_delta.is_empty() {
+                    frames.push(self.block_delta(
+                        index,
+                        AnthropicDelta::InputJsonDelta {
+                            partial_json: delta.args_delta.clone(),
+                        },
+                    ));
+                }
+            }
             SemanticChunk::ToolCall(call) => {
                 self.ensure_started(&mut frames);
+                // A streamed call's block is the one this closes; its args already went out.
                 self.close_open(&mut frames);
-                // One block: start + one complete-args delta + stop, so no stop precedes the args
-                // (no orphan-close). `input` starts empty — the SDK builds it from the delta.
-                let block = self.rendered_call_block(call).unwrap_or_else(|| {
-                    AnthropicResponseContentBlock::ToolUse {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        input: serde_json::json!({}),
-                    }
-                });
-                let partial_json = self
-                    .rendered_call_args(call)
-                    .unwrap_or_else(|| call.args.to_string());
-                let index = self.open_block(&mut frames, block);
-                frames
-                    .push(self.block_delta(index, AnthropicDelta::InputJsonDelta { partial_json }));
-                frames.push(self.block_stop(index));
+                if !self.args_streamed_for.remove(&call.id) {
+                    // One block: start + one complete-args delta + stop, so no stop precedes the args
+                    // (no orphan-close). `input` starts empty — the SDK builds it from the delta.
+                    let block = self.rendered_call_block(call).unwrap_or_else(|| {
+                        AnthropicResponseContentBlock::ToolUse {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            input: serde_json::json!({}),
+                        }
+                    });
+                    let partial_json = self
+                        .rendered_call_args(call)
+                        .unwrap_or_else(|| call.args.to_string());
+                    let index = self.open_block(&mut frames, block);
+                    frames.push(
+                        self.block_delta(index, AnthropicDelta::InputJsonDelta { partial_json }),
+                    );
+                    frames.push(self.block_stop(index));
+                }
             }
             SemanticChunk::Usage(_) | SemanticChunk::Stop { .. } => {}
         }
@@ -544,7 +595,7 @@ impl StreamFraming for MessagesFraming {
     }
 
     fn emit_client_tool_calls(&mut self, _calls: &[ToolCall]) -> Vec<String> {
-        // Already streamed as `tool_use` blocks by `on_chunk`.
+        // Already streamed as a `tool_use` block by `on_chunk`.
         Vec::new()
     }
 
@@ -616,7 +667,11 @@ impl StreamFraming for MessagesFraming {
         _error_code: Option<&str>,
         message: &str,
     ) -> String {
-        sse_frame(Some("error"), &error_json(class, message))
+        // The interrupted block must still close, or an SDK waiting on `content_block_stop` hangs.
+        let mut frames = Vec::new();
+        self.close_open(&mut frames);
+        frames.push(sse_frame(Some("error"), &error_json(class, message)));
+        frames.concat()
     }
 }
 

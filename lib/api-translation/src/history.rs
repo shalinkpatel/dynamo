@@ -170,13 +170,16 @@ impl MessageHistoryAccumulator {
     }
 
     /// Fold one semantic chunk in. Text/thinking concat; a complete tool call is collected.
-    /// Usage/Stop carry no history (usage accounting and loop control are the loop's).
+    /// Usage/Stop carry no history (usage accounting and loop control are the loop's), and a
+    /// ToolCallDelta is client-egress-only — history holds the complete call it accumulates into.
     pub fn push(&mut self, chunk: &SemanticChunk) {
         match chunk {
             SemanticChunk::TextDelta(t) => self.assistant_message.text.push_str(t),
             SemanticChunk::ThinkingDelta(t) => self.assistant_message.append_thinking_delta(t),
             SemanticChunk::ToolCall(tc) => self.assistant_message.tool_calls.push(tc.clone()),
-            SemanticChunk::Usage(_) | SemanticChunk::Stop { .. } => {}
+            SemanticChunk::ToolCallDelta(_)
+            | SemanticChunk::Usage(_)
+            | SemanticChunk::Stop { .. } => {}
         }
     }
 

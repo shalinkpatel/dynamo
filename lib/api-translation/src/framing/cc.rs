@@ -7,6 +7,8 @@
 //! `docs/architecture.md` "Protocol capability split"). `continuation_messages` carries the loop
 //! transcript as CC request-messages a client appends, which Messages gets natively from its blocks.
 
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionRequestAssistantMessageContent,
@@ -23,7 +25,7 @@ use crate::baseten_response_extension::{
     BasetenFrame, BasetenResponseExtension, IterationScope, ServerToolCallOutcome,
     ServerToolCallRecord,
 };
-use crate::model::{ErrorClass, ServerToolCall, Termination, ToolCall};
+use crate::model::{ErrorClass, ServerToolCall, Termination, ToolCall, ToolCallDelta};
 use crate::util::unix_secs;
 use crate::wire::{next_id_seq, sse_frame, to_json_string};
 use crate::{CcMessage, SemanticChunk};
@@ -153,14 +155,31 @@ fn cc_id(created: u32) -> String {
     format!("chatcmpl-{created}-{}", next_id_seq())
 }
 
+/// One call's position in the `tool_calls` array SDKs accumulate streamed fragments into.
+#[derive(Clone, Copy)]
+struct ToolCallSlot {
+    index: u32,
+    /// Set on the fragment that must carry id and name.
+    is_opener: bool,
+}
+
 struct CcFraming {
     id: String,
     created: u32,
     model: String,
     role_sent: bool,
-    /// Monotonic across the response: client tools stream one delta each, so the SDK-accumulated
-    /// `tool_calls[].index` can't be local to a single emit.
+    /// Index of each call still streaming, retired once the call completes. A model that restarts
+    /// its id numbering per iteration would otherwise have the repeat read as a continuation of the
+    /// finished call.
+    tool_call_index_by_id: HashMap<String, u32>,
+    /// SDKs accumulate streamed `tool_calls` by their integer `index`, which must stay distinct
+    /// across the whole response — not just within one iteration.
     next_tool_call_index: u32,
+    /// Streaming ids whose only fragment so far carried empty args. `finalize`'s empty-args ->
+    /// `"{}"` substitution never reaches a client mid-stream, so a call that stays in this set
+    /// through completion needs one more fragment correcting it, or the client's accumulated
+    /// `arguments` stays `""` forever.
+    streamed_with_empty_args: HashSet<String>,
 }
 
 impl CcFraming {
@@ -171,8 +190,64 @@ impl CcFraming {
             created,
             model,
             role_sent: false,
+            tool_call_index_by_id: HashMap::new(),
             next_tool_call_index: 0,
+            streamed_with_empty_args: HashSet::new(),
         }
+    }
+
+    fn streaming_slot(&mut self, call_id: &str) -> ToolCallSlot {
+        let next_index = self.next_tool_call_index;
+        let slot = match self.tool_call_index_by_id.entry(call_id.to_string()) {
+            Entry::Occupied(entry) => ToolCallSlot {
+                index: *entry.get(),
+                is_opener: false,
+            },
+            Entry::Vacant(entry) => ToolCallSlot {
+                index: *entry.insert(next_index),
+                is_opener: true,
+            },
+        };
+        if slot.is_opener {
+            self.next_tool_call_index += 1;
+        }
+        slot
+    }
+
+    /// The OpenAI streaming shape: the opener carries id/name, later fragments only the args.
+    fn tool_call_frame(
+        &mut self,
+        slot: ToolCallSlot,
+        call_id: &str,
+        name: &str,
+        arguments: String,
+    ) -> String {
+        let chunk = ChatCompletionMessageToolCallChunk {
+            index: slot.index,
+            id: slot.is_opener.then(|| call_id.to_string()),
+            r#type: slot.is_opener.then_some(FunctionType::Function),
+            function: Some(FunctionCallStream {
+                name: slot.is_opener.then(|| name.to_string()),
+                arguments: Some(arguments),
+            }),
+        };
+        let base = self.empty_delta();
+        self.delta_frame(ChatCompletionStreamResponseDelta {
+            tool_calls: Some(vec![chunk]),
+            ..base
+        })
+    }
+
+    fn tool_call_delta_frame(&mut self, delta: &ToolCallDelta) -> String {
+        let slot = self.streaming_slot(&delta.id);
+        if delta.args_delta.is_empty() {
+            if slot.is_opener {
+                self.streamed_with_empty_args.insert(delta.id.clone());
+            }
+        } else {
+            self.streamed_with_empty_args.remove(&delta.id);
+        }
+        self.tool_call_frame(slot, &delta.id, &delta.name, delta.args_delta.clone())
     }
 
     /// `role` rides the response's first delta only; every later one omits it.
@@ -261,7 +336,10 @@ impl StreamFraming for CcFraming {
         let (content, reasoning_content) = match chunk {
             SemanticChunk::TextDelta(text) => (Some(text.clone()), None),
             SemanticChunk::ThinkingDelta(thinking) => (None, Some(thinking.clone())),
-            // Surfaced elsewhere: emit_completed_iteration / emit_client_tool_calls, emit_iteration_usage / finish.
+            SemanticChunk::ToolCallDelta(tool_call_delta) => {
+                return vec![self.tool_call_delta_frame(tool_call_delta)];
+            }
+            // Surfaced by emit_client_tool_calls / emit_completed_iteration / finish instead.
             SemanticChunk::ToolCall(_) | SemanticChunk::Usage(_) | SemanticChunk::Stop { .. } => {
                 return Vec::new();
             }
@@ -284,30 +362,41 @@ impl StreamFraming for CcFraming {
         })]
     }
 
-    /// Native `tool_calls`. Streamed deltas need an integer `index` per call (the SDK accumulates
-    /// by it), monotonic across the separate emits the loop makes.
+    /// One frame carrying every call, never one frame each — the SDK reads `index` per entry.
     fn emit_client_tool_calls(&mut self, calls: &[ToolCall]) -> Vec<String> {
-        if calls.is_empty() {
-            return Vec::new();
-        }
-        let indexed: Vec<ChatCompletionMessageToolCallChunk> = calls
+        let chunks: Vec<ChatCompletionMessageToolCallChunk> = calls
             .iter()
-            .map(|call| {
-                let index = self.next_tool_call_index;
-                self.next_tool_call_index += 1;
-                ChatCompletionMessageToolCallChunk {
-                    index,
-                    id: Some(call.id.clone()),
-                    r#type: Some(FunctionType::Function),
-                    function: Some(FunctionCallStream {
-                        name: Some(call.name.clone()),
-                        arguments: Some(call.raw_args.clone()),
-                    }),
-                }
+            .filter_map(|call| {
+                let Some(index) = self.tool_call_index_by_id.remove(&call.id) else {
+                    // Linear emission opens every client call with a streamed fragment, which is
+                    // what registers its index.
+                    debug_assert!(false, "client tool call `{}` never streamed", call.id);
+                    tracing::error!(
+                        event_name = "cc.unstreamed_client_tool_call",
+                        "Client tool call `{}` completed without streaming a fragment",
+                        call.id
+                    );
+                    return None;
+                };
+                // A stream of only-empty deltas never saw `finalize`'s `"{}"` substitution.
+                self.streamed_with_empty_args.remove(&call.id).then_some(
+                    ChatCompletionMessageToolCallChunk {
+                        index,
+                        id: None,
+                        r#type: None,
+                        function: Some(FunctionCallStream {
+                            name: None,
+                            arguments: Some(call.raw_args.clone()),
+                        }),
+                    },
+                )
             })
             .collect();
+        if chunks.is_empty() {
+            return Vec::new();
+        }
         let delta = ChatCompletionStreamResponseDelta {
-            tool_calls: Some(indexed),
+            tool_calls: Some(chunks),
             ..self.empty_delta()
         };
         vec![self.delta_frame(delta)]

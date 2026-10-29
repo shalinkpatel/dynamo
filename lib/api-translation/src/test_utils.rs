@@ -66,6 +66,7 @@ pub(crate) fn kinds(chunks: &[SemanticChunk]) -> Vec<&'static str> {
         .map(|c| match c {
             SemanticChunk::TextDelta(_) => "text",
             SemanticChunk::ThinkingDelta(_) => "thinking",
+            SemanticChunk::ToolCallDelta(_) => "tool_call_delta",
             SemanticChunk::ToolCall(_) => "tool_call",
             SemanticChunk::Usage(_) => "usage",
             SemanticChunk::Stop { .. } => "stop",
@@ -215,6 +216,10 @@ pub(crate) struct FakeMessagesSearchAdapter {
 }
 
 impl CodingAdapter for FakeMessagesSearchAdapter {
+    fn handles_tool_call(&self, tool_name: &str) -> bool {
+        tool_name == self.tool_name
+    }
+
     fn render_tool_call(&self, call: &ToolCallToRender<'_>) -> Option<RenderedToolCall> {
         if call.tool_name != self.tool_name {
             return None;
@@ -280,6 +285,10 @@ pub(crate) struct FakeResponsesSearchAdapter {
 }
 
 impl CodingAdapter for FakeResponsesSearchAdapter {
+    fn handles_tool_call(&self, tool_name: &str) -> bool {
+        tool_name == self.tool_name
+    }
+
     fn render_tool_call(&self, call: &ToolCallToRender<'_>) -> Option<RenderedToolCall> {
         if call.tool_name != self.tool_name {
             return None;

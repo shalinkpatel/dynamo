@@ -34,32 +34,38 @@ fn split_tool_call_args_reconstructed() {
 }
 
 /// upstream: aggregator.rs::test_parallel_tool_calls_interleaved_chunks_aggregate_independently
-/// PORT: two parallel calls (index 0/1) whose chunks interleave must aggregate independently.
+/// ADAPT: dynamo's aggregator tolerates interleaving incidentally — it folds the whole stream into
+/// an index-keyed map and finalizes after, so arrival order never matters to it. Its streaming
+/// converter assumes linear emission just as we do, and would open two Anthropic content blocks at
+/// once without it. We keep the per-index accumulation and refuse the interleaving.
+/// The first call completes as `{}` when the second opener arrives — indistinguishable from a
+/// zero-argument call at that point — so the refusal lands on its resumed arguments.
 #[test]
-fn parallel_tool_calls_interleaved_aggregate_independently() {
+fn parallel_tool_calls_interleaved_are_refused() {
     let mut p = SseParser::default();
-    let out = collect(
-        &mut p,
-        &[
-            chunk(tool_delta(0, Some("tc0"), Some("get_weather"), None), None),
-            chunk(tool_delta(1, Some("tc1"), Some("get_time"), None), None),
-            chunk(tool_delta(0, None, None, Some(r#"{"city":"#)), None),
-            chunk(tool_delta(1, None, None, Some(r#"{"tz":"#)), None),
-            chunk(tool_delta(0, None, None, Some(r#""Tokyo"}"#)), None),
-            chunk(
-                tool_delta(1, None, None, Some(r#""JST"}"#)),
-                Some("tool_calls"),
-            ),
-        ],
+    p.push_and_yield(&chunk(
+        tool_delta(0, Some("tc0"), Some("get_weather"), None),
+        None,
+    ));
+    p.push_and_yield(&chunk(
+        tool_delta(1, Some("tc1"), Some("get_time"), None),
+        None,
+    ));
+    let pushed = p.push_and_yield(&chunk(tool_delta(0, None, None, Some(r#"{"city":"#)), None));
+    let error_codes: Vec<&str> = pushed
+        .chunks
+        .iter()
+        .filter_map(|r| match r {
+            Err(TranslationError::UpstreamUnavailable { error_code, .. }) => Some(*error_code),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        error_codes,
+        vec!["resumed_tool_call"],
+        "{:?}",
+        pushed.chunks
     );
-    let ts = tools(&out);
-    assert_eq!(ts.len(), 2, "both parallel tool calls surface");
-    assert_eq!(ts[0].id, "tc0");
-    assert_eq!(ts[0].name, "get_weather");
-    assert_eq!(ts[0].args, json!({"city": "Tokyo"}));
-    assert_eq!(ts[1].id, "tc1");
-    assert_eq!(ts[1].name, "get_time");
-    assert_eq!(ts[1].args, json!({"tz": "JST"}));
 }
 
 /// upstream: aggregator.rs::test_fragment_only_chunks_without_opener_drop_cleanly
