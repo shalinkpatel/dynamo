@@ -2899,6 +2899,7 @@ dependencies = [
  "tonic 0.14.5",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
 ]
 
 [[package]]

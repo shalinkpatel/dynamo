@@ -176,10 +176,13 @@ impl GrpcKVLocator {
     }
 }
 
+// The span records only the gRPC code; log the reason inside it so traces name the check.
 fn map_lifecycle_error(error: anyhow::Error) -> Status {
     if error.is::<lifecycle::AlreadyCommitted>() || error.is::<lifecycle::AlreadyRecorded>() {
+        tracing::debug!(%error, "KVLocator call rejected");
         return Status::already_exists(error.to_string());
     }
+    tracing::warn!(%error, "KVLocator call rejected");
     match error.downcast_ref::<lifecycle::InvalidAttempt>() {
         Some(invalid) => Status::invalid_argument(&invalid.0),
         None => Status::internal(error.to_string()),
@@ -199,10 +202,13 @@ impl KVLocatorService for GrpcKVLocator {
             Ok(response) => Ok(Response::new(response)),
             // A caller error the request could have avoided; everything
             // else is ours.
-            Err(error) => match error.downcast_ref::<scorer::InvalidRequest>() {
-                Some(invalid) => Err(Status::invalid_argument(&invalid.0)),
-                None => Err(Status::internal(error.to_string())),
-            },
+            Err(error) => {
+                tracing::warn!(%error, "KVLocator Locate rejected");
+                match error.downcast_ref::<scorer::InvalidRequest>() {
+                    Some(invalid) => Err(Status::invalid_argument(&invalid.0)),
+                    None => Err(Status::internal(error.to_string())),
+                }
+            }
         }
     }
 

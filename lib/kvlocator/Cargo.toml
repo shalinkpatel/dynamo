@@ -26,6 +26,7 @@ prost = "0.14.3"
 tokio = { workspace = true }
 tonic = { version = "0.14.5", features = ["transport"] }
 tonic-prost = "0.14.5"
+tracing = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"
