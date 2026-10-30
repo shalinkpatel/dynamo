@@ -248,8 +248,17 @@ impl GwpLifecycle {
         admission: &pb::Admission,
         commit: Option<&CommitContext>,
     ) -> anyhow::Result<PreparedAdmission> {
+        let topology = self.core.topology.load();
+        // The engine's DP rank is ignored: load is aggregated per worker, so the admission
+        // books the worker's first rank (0 for MCM-discovered workers, whose DP size is unknown).
+        let first_rank = |id| {
+            topology
+                .workers
+                .get(&id)
+                .map_or(0, |worker| worker.runtime.data_parallel_start_rank)
+        };
         let decode = match (admission.decode_worker_id, admission.decode_dp_rank) {
-            (Some(id), Some(rank)) => Some(WorkerWithDpRank::new(id, rank)),
+            (Some(id), Some(_)) => Some(WorkerWithDpRank::new(id, first_rank(id))),
             (None, None) => None,
             _ => {
                 return Err(InvalidAttempt(
@@ -259,12 +268,14 @@ impl GwpLifecycle {
             }
         };
         let native = crate::core::NativeAdmission {
-            prefill: WorkerWithDpRank::new(admission.prefill_worker_id, admission.prefill_dp_rank),
+            prefill: WorkerWithDpRank::new(
+                admission.prefill_worker_id,
+                first_rank(admission.prefill_worker_id),
+            ),
             decode,
             cached_tokens: usize::try_from(admission.estimated_overlap_tokens)
                 .unwrap_or(usize::MAX),
         };
-        let topology = self.core.topology.load();
         let mut prepared = PreparedAdmission {
             native,
             topology: topology.clone(),
@@ -1714,113 +1725,120 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn b10_invalid_admitted_dp_ranks_do_not_hide_load_or_poison_outcomes() {
+    async fn b10_admitted_dp_ranks_fold_into_the_workers_first_rank() {
         for terminal in [false, true] {
-            for decoder in [false, true] {
-                for rank in [1, 4] {
-                    let lifecycle = make_lifecycle().await;
-                    let mut snapshot = (*lifecycle.core.topology.load()).clone();
-                    let runtime = &mut snapshot.workers.get_mut(&WORKER).unwrap().runtime;
-                    runtime.data_parallel_start_rank = 2;
-                    runtime.data_parallel_size = 2;
-                    lifecycle
-                        .core
-                        .router
-                        .reconcile_topology(&snapshot, &snapshot.workers.keys().copied().collect())
-                        .await
-                        .unwrap();
-                    lifecycle.core.topology.replace(snapshot);
-                    let mut request = commit("dp-recover", "r1", ENDPOINT);
-                    let Some(pb::commit_intend_request::ChosenPlacement::Chosen(chosen)) =
-                        request.chosen_placement.as_mut()
-                    else {
-                        unreachable!()
-                    };
-                    chosen.dp_rank = 2;
-                    lifecycle.intend(&request).await.unwrap();
-                    if terminal {
-                        lifecycle
-                            .finish(&finish(
-                                "dp-recover",
-                                pb::response_finish_request::Reason::Completed,
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                    let mut opening = admitted("dp-recover");
-                    let Some(pb::response_open_outcome_request::Outcome::Admitted(admission)) =
-                        opening.outcome.as_mut()
-                    else {
-                        unreachable!()
-                    };
-                    admission.prefill_dp_rank = if decoder { 2 } else { rank };
-                    admission.decode_worker_id = Some(WORKER);
-                    admission.decode_dp_rank = Some(if decoder { rank } else { 2 });
-                    let error = lifecycle
-                        .open(&opening)
-                        .await
-                        .expect_err("out-of-range rank rejected");
-                    assert!(error.downcast_ref::<InvalidAttempt>().is_some());
-                    assert!(
-                        lifecycle
-                            .attempt(&attempt_id("dp-recover"))
-                            .lock()
-                            .await
-                            .outcome
-                            .is_none()
-                    );
-                    assert_eq!(active_requests(&lifecycle).await, usize::from(!terminal));
-                    let Some(pb::response_open_outcome_request::Outcome::Admitted(admission)) =
-                        opening.outcome.as_mut()
-                    else {
-                        unreachable!()
-                    };
-                    admission.prefill_dp_rank = 2;
-                    admission.decode_dp_rank = Some(3);
-                    lifecycle.open(&opening).await.unwrap();
-                    let router = lifecycle
-                        .core
-                        .router
-                        .model_router(&OracleVersionId::new("m").unwrap())
-                        .unwrap();
-                    let loads = router.potential_loads(TOKENS).await;
-                    assert_eq!(
-                        loads
-                            .iter()
-                            .find(|load| load.dp_rank == 2)
-                            .unwrap()
-                            .active_requests,
-                        0
-                    );
-                    assert_eq!(
-                        loads
-                            .iter()
-                            .find(|load| load.dp_rank == 3)
-                            .unwrap()
-                            .active_requests,
-                        usize::from(!terminal)
-                    );
-                    assert_eq!(
-                        router
-                            .cached_tokens(
-                                TOKENS,
-                                &Default::default(),
-                                WorkerWithDpRank::new(WORKER, 2)
-                            )
-                            .await,
-                        TOKENS.len()
-                    );
-                    lifecycle
-                        .finish(&finish(
-                            "dp-recover",
-                            pb::response_finish_request::Reason::Completed,
-                        ))
-                        .await
-                        .unwrap();
-                    assert_eq!(active_requests(&lifecycle).await, 0);
-                }
+            let lifecycle = make_lifecycle().await;
+            let mut snapshot = (*lifecycle.core.topology.load()).clone();
+            let runtime = &mut snapshot.workers.get_mut(&WORKER).unwrap().runtime;
+            runtime.data_parallel_start_rank = 2;
+            runtime.data_parallel_size = 2;
+            lifecycle
+                .core
+                .router
+                .reconcile_topology(&snapshot, &snapshot.workers.keys().copied().collect())
+                .await
+                .unwrap();
+            lifecycle.core.topology.replace(snapshot);
+            let mut request = commit("dp-fold", "r1", ENDPOINT);
+            let Some(pb::commit_intend_request::ChosenPlacement::Chosen(chosen)) =
+                request.chosen_placement.as_mut()
+            else {
+                unreachable!()
+            };
+            chosen.dp_rank = 2;
+            lifecycle.intend(&request).await.unwrap();
+            if terminal {
+                lifecycle
+                    .finish(&finish(
+                        "dp-fold",
+                        pb::response_finish_request::Reason::Completed,
+                    ))
+                    .await
+                    .unwrap();
             }
+            let mut opening = admitted("dp-fold");
+            let Some(pb::response_open_outcome_request::Outcome::Admitted(admission)) =
+                opening.outcome.as_mut()
+            else {
+                unreachable!()
+            };
+            // Ranks the topology doesn't model (here outside 2..4) are accepted and folded.
+            admission.prefill_dp_rank = 5;
+            admission.decode_worker_id = Some(WORKER);
+            admission.decode_dp_rank = Some(7);
+            lifecycle.open(&opening).await.unwrap();
+            let router = lifecycle
+                .core
+                .router
+                .model_router(&OracleVersionId::new("m").unwrap())
+                .unwrap();
+            let loads = router.potential_loads(TOKENS).await;
+            assert_eq!(
+                loads
+                    .iter()
+                    .find(|load| load.dp_rank == 2)
+                    .unwrap()
+                    .active_requests,
+                usize::from(!terminal),
+                "the decode booking lands on the worker's first rank"
+            );
+            assert_eq!(
+                loads
+                    .iter()
+                    .find(|load| load.dp_rank == 3)
+                    .unwrap()
+                    .active_requests,
+                0
+            );
+            assert_eq!(
+                router
+                    .cached_tokens(
+                        TOKENS,
+                        &Default::default(),
+                        WorkerWithDpRank::new(WORKER, 2)
+                    )
+                    .await,
+                TOKENS.len()
+            );
+            lifecycle
+                .finish(&finish(
+                    "dp-fold",
+                    pb::response_finish_request::Reason::Completed,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(active_requests(&lifecycle).await, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn b10_attention_dp_admission_on_a_discovered_worker_books_rank_zero() {
+        // MCM discovery gives workers the default runtime (one rank), while an
+        // attention-DP engine admits on ranks 0..N for prefill and an unadvertised decoder.
+        let lifecycle = make_lifecycle().await;
+        lifecycle
+            .intend(&commit("dp-zero", "r1", ENDPOINT))
+            .await
+            .unwrap();
+        let mut opening = admitted("dp-zero");
+        let Some(pb::response_open_outcome_request::Outcome::Admitted(admission)) =
+            opening.outcome.as_mut()
+        else {
+            unreachable!()
+        };
+        admission.prefill_dp_rank = 5;
+        admission.decode_worker_id = Some(WORKER);
+        admission.decode_dp_rank = Some(7);
+        lifecycle.open(&opening).await.unwrap();
+        assert_eq!(active_requests(&lifecycle).await, 1);
+        lifecycle
+            .finish(&finish(
+                "dp-zero",
+                pb::response_finish_request::Reason::Completed,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(active_requests(&lifecycle).await, 0);
     }
 
     #[tokio::test]
@@ -2006,7 +2024,8 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn b10_invalid_embedded_admission_does_not_terminate_a_rejected_denial() {
         for early in [false, true] {
-            for malformed in 0..6 {
+            // DP ranks aren't validated (they fold into the worker's first rank).
+            for malformed in [0, 1, 4, 5] {
                 if early && malformed >= 4 {
                     continue;
                 }
@@ -2033,11 +2052,6 @@ mod lifecycle_tests {
                 match malformed {
                     0 => admission.decode_worker_id = Some(WORKER),
                     1 => admission.decode_dp_rank = Some(0),
-                    2 => admission.prefill_dp_rank = 1,
-                    3 => {
-                        admission.decode_worker_id = Some(WORKER);
-                        admission.decode_dp_rank = Some(1);
-                    }
                     4 => admission.prefill_worker_id = WORKER + 1,
                     5 => {
                         admission.decode_worker_id = Some(WORKER + 1);
@@ -2238,7 +2252,6 @@ mod lifecycle_tests {
                         .data_parallel_start_rank = 4;
                 }
                 lifecycle.core.topology.replace(changed);
-                assert!(lifecycle.prepare_admission(&admission, None).is_err());
                 assert!(
                     lifecycle
                         .open(&opening)
