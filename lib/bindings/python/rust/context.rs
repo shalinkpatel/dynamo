@@ -267,10 +267,10 @@ impl Context {
         );
     }
 
-    /// Called alongside `record_prefill_worker`; `None` clears a name recorded for an earlier
-    /// worker so the id and name always describe the same pod.
-    pub(crate) fn record_prefill_worker_name(&self, pod_name: Option<String>) {
-        let key = RoutingMetadataKey::PrefillWorkerName.as_str();
+    /// Called with each generation outcome; `None` (denied, or no name published) clears a name
+    /// recorded by an earlier attempt.
+    pub(crate) fn record_serving_pod_name(&self, pod_name: Option<String>) {
+        let key = RoutingMetadataKey::ServingPodName.as_str();
         let mut metadata = self
             .metadata
             .lock()

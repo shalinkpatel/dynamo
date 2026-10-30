@@ -354,10 +354,9 @@ impl GenerationCoordinator {
                             admission.prefill_worker_id,
                             admission.prefill_dp_rank,
                         );
-                        context.record_prefill_worker_name(
-                            coordinator.worker_pod_name(admission.prefill_worker_id),
-                        );
                     }
+                    // No worker produced output, so no replica is charged with the denial.
+                    context.record_serving_pod_name(None);
                     Python::with_gil(|py| {
                         DeniedGenerationRequest::new(
                             DeniedRequest::from(denied.denied),
@@ -371,8 +370,8 @@ impl GenerationCoordinator {
                         generated.admission.prefill_worker_id,
                         generated.admission.prefill_dp_rank,
                     );
-                    context.record_prefill_worker_name(
-                        coordinator.worker_pod_name(generated.admission.prefill_worker_id),
+                    context.record_serving_pod_name(
+                        coordinator.serving_pod_name(&generated.admission),
                     );
                     if let (Some(worker_id), Some(dp_rank)) = (
                         generated.admission.decode_worker_id,

@@ -901,7 +901,7 @@ async fn inspection_does_not_consume_live_request_routing_metadata() {
         let worker = WorkerResponseMetadata {
             prefill_worker_id: None,
             prefill_dp_rank: None,
-            prefill_worker_name: None,
+            serving_pod_name: None,
             decode_worker_id: Some(42),
             decode_dp_rank: Some(0),
         };

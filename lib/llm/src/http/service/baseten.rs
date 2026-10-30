@@ -15,9 +15,9 @@ pub const X_BASETEN_DYN_WORKER_ID_HEADER: &str = "x-baseten-dyn-worker-id";
 pub const X_BASETEN_DYN_PREFILL_WORKER_ID_HEADER: &str = "x-baseten-dyn-prefill-worker-id";
 pub const X_BASETEN_DYN_PREFILL_DP_RANK_HEADER: &str = "x-baseten-dyn-prefill-dp-rank";
 pub const X_BASETEN_DYN_DECODE_DP_RANK_HEADER: &str = "x-baseten-dyn-decode-dp-rank";
-/// Kubernetes pod name of the worker that ran prefill, for beefeater's per-replica metrics: the
-/// serving pod on aggregated deployments, the prefill pod on disaggregated ones. Omitted when the
-/// worker published no name.
+/// Kubernetes pod name of the worker that produced the output, for beefeater's per-replica metrics:
+/// the decode pod on disaggregated deployments. Omitted on denials and when the worker published no
+/// name.
 pub const X_BASETEN_SERVING_POD_HEADER: &str = "x-baseten-serving-pod";
 pub const ORG_ID_METADATA_KEY: &str = "baseten.org_id";
 pub const REQUEST_ID_METADATA_KEY: &str = "baseten.request_id";
@@ -61,7 +61,7 @@ pub(crate) fn baseten_session_affinity_from_request(
 pub struct WorkerResponseMetadata {
     pub prefill_worker_id: Option<u64>,
     pub prefill_dp_rank: Option<u32>,
-    pub prefill_worker_name: Option<String>,
+    pub serving_pod_name: Option<String>,
     pub decode_worker_id: Option<u64>,
     pub decode_dp_rank: Option<u32>,
 }
@@ -81,8 +81,8 @@ impl WorkerResponseMetadata {
         let worker = Self {
             prefill_worker_id: parse_u64(RoutingMetadataKey::PrefillWorkerId),
             prefill_dp_rank: parse_u32(RoutingMetadataKey::PrefillDpRank),
-            prefill_worker_name: metadata
-                .get(RoutingMetadataKey::PrefillWorkerName.as_str())
+            serving_pod_name: metadata
+                .get(RoutingMetadataKey::ServingPodName.as_str())
                 .cloned(),
             decode_worker_id: parse_u64(RoutingMetadataKey::DecodeWorkerId),
             decode_dp_rank: parse_u32(RoutingMetadataKey::DecodeDpRank),
@@ -136,10 +136,7 @@ pub fn apply_worker_response_headers(headers: &mut HeaderMap, worker: WorkerResp
         X_BASETEN_DYN_DECODE_DP_RANK_HEADER,
         worker.decode_dp_rank,
     );
-    if let Some(value) = worker
-        .prefill_worker_name
-        .and_then(|name| name.parse().ok())
-    {
+    if let Some(value) = worker.serving_pod_name.and_then(|name| name.parse().ok()) {
         headers.insert(X_BASETEN_SERVING_POD_HEADER, value);
     }
 }
@@ -175,7 +172,7 @@ fn insert_numeric_header<T: std::fmt::Display>(
 pub enum RoutingMetadataKey {
     PrefillWorkerId,
     PrefillDpRank,
-    PrefillWorkerName,
+    ServingPodName,
     DecodeWorkerId,
     DecodeDpRank,
 }
@@ -185,7 +182,7 @@ impl RoutingMetadataKey {
         match self {
             Self::PrefillWorkerId => "dynamo.routing.prefill_worker_id",
             Self::PrefillDpRank => "dynamo.routing.prefill_dp_rank",
-            Self::PrefillWorkerName => "dynamo.routing.prefill_worker_name",
+            Self::ServingPodName => "dynamo.routing.serving_pod_name",
             Self::DecodeWorkerId => "dynamo.routing.decode_worker_id",
             Self::DecodeDpRank => "dynamo.routing.decode_dp_rank",
         }
@@ -368,14 +365,14 @@ mod tests {
     }
 
     #[test]
-    fn b10_serving_pod_header_names_the_prefill_worker() {
-        let name = "glm-worker-5d57-tdrf2";
-        // Prefill only, aggregated (one worker recorded as both prefill and decode), and
-        // disaggregated (decode worker 9 streamed it; the header still names prefill pod 7).
-        for decode_worker_id in [None, Some("7"), Some("9")] {
+    fn b10_serving_pod_header_passes_the_recorded_name() {
+        let name = "glm-worker-decode-5d57-tdrf2";
+        // Aggregated (one worker recorded as both prefill and decode) and disaggregated (prefill
+        // worker 7, decode worker 9); the frontend records the pod of the decode worker.
+        for decode_worker_id in [Some("7"), Some("9")] {
             let mut entries = vec![
                 (RoutingMetadataKey::PrefillWorkerId, "7"),
-                (RoutingMetadataKey::PrefillWorkerName, name),
+                (RoutingMetadataKey::ServingPodName, name),
             ];
             entries.extend(decode_worker_id.map(|id| (RoutingMetadataKey::DecodeWorkerId, id)));
             assert_eq!(b10_serving_pod_header(&entries).as_deref(), Some(name));

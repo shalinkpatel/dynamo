@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    DeniedGenerationRequest, DeniedRequest, DisaggregationStrategy, GenerationCoordinator,
-    GenerationCoordinatorClient, GenerationCoordinatorService, GenerationOptions,
-    GenerationOutcome, GenerationRequest, JsonPushRouter, PrefillMarkTiming,
+    DeniedGenerationRequest, DeniedRequest, DisaggregationStrategy, GenerationAdmission,
+    GenerationCoordinator, GenerationCoordinatorClient, GenerationCoordinatorService,
+    GenerationOptions, GenerationOutcome, GenerationRequest, JsonPushRouter, PrefillMarkTiming,
     RemoteGenerationCoordinator, RequestContext, RouterWorkerCoordinator,
 };
 use anyhow::{Context, Result, ensure};
@@ -140,10 +140,14 @@ impl Drop for Listener {
 }
 
 impl GenerationCoordinatorRuntime {
-    /// Kubernetes pod name of a primary-pool worker. `None` with a remote coordinator, which
+    /// See [`GenerationCoordinator::serving_pod_name`]. `None` with a remote coordinator, which
     /// holds the workers' model cards in another process, and before the local one has started.
-    pub fn worker_pod_name(&self, worker_id: u64) -> Option<String> {
-        self.local.as_ref()?.ready.get()?.worker_pod_name(worker_id)
+    pub fn serving_pod_name(&self, admission: &GenerationAdmission) -> Option<String> {
+        self.local
+            .as_ref()?
+            .ready
+            .get()?
+            .serving_pod_name(admission)
     }
 
     pub fn bid(

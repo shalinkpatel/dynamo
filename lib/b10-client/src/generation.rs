@@ -129,9 +129,18 @@ pub struct GenerationCoordinator {
 }
 
 impl GenerationCoordinator {
-    /// Kubernetes pod name of a primary-pool worker; see [`RouterWorkerCoordinator::worker_pod_name`].
-    pub fn worker_pod_name(&self, worker_id: u64) -> Option<String> {
-        self.primary.worker_pod_name(worker_id)
+    /// Kubernetes pod name of the worker that produced a connected response's output: the decode
+    /// worker on prefill-first, or the prefill worker when its terminal/error response opened no
+    /// decode leg. After stale reroutes it is the last connected worker; it is resolved once, so it
+    /// cannot follow a mid-stream migration (`migration_limit`, unset for BIS). See
+    /// [`RouterWorkerCoordinator::worker_pod_name`].
+    pub fn serving_pod_name(&self, admission: &GenerationAdmission) -> Option<String> {
+        match (self.strategy, admission.decode_worker_id) {
+            (DisaggregationStrategy::PrefillFirst, Some(decode_worker_id)) => {
+                self.next.as_ref()?.worker_pod_name(decode_worker_id)
+            }
+            _ => self.primary.worker_pod_name(admission.prefill_worker_id),
+        }
     }
 
     /// Return the best eligible worker (or prefill/decode pair), without admission.

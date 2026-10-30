@@ -275,6 +275,14 @@ impl RouterGuardClient for RouterGuardClientForTesting {
         None
     }
 
+    fn worker_pod_name(&self, worker_id: u64) -> Option<String> {
+        self.instance_ids
+            .lock()
+            .unwrap()
+            .contains(&worker_id)
+            .then(|| format!("pod-{worker_id}"))
+    }
+
     async fn direct_borrowed(
         &self,
         request: RsContext<&rmpv::Value>,
@@ -4375,4 +4383,53 @@ async fn coordinate_router_answers_like_the_coordinator_listener() {
     assert_eq!(expected.len(), 3);
     assert_eq!(frames(frontend_url).await, expected);
     listener.shutdown().await.unwrap();
+}
+
+#[test]
+fn b10_serving_pod_name_is_the_decode_worker_on_prefill_first() {
+    let pool = |id| RouterGuardClientForTesting::new(vec![id], vec![id], vec![]);
+    let admission = crate::GenerationAdmission {
+        prefill_worker_id: 1,
+        decode_worker_id: Some(2),
+        ..Default::default()
+    };
+
+    let prefill_first = generation_coordinator(
+        pool(7),
+        pool(1),
+        Some(pool(8)),
+        Some(pool(2)),
+        DisaggregationStrategy::PrefillFirst,
+    );
+    assert_eq!(
+        prefill_first.serving_pod_name(&admission).as_deref(),
+        Some("pod-2")
+    );
+    // Terminal/error prefill response with no decode leg: prefill produced the output.
+    let prefill_only = crate::GenerationAdmission {
+        decode_worker_id: None,
+        ..admission
+    };
+    assert_eq!(
+        prefill_first.serving_pod_name(&prefill_only).as_deref(),
+        Some("pod-1")
+    );
+
+    let aggregated = generation_coordinator(
+        pool(7),
+        pool(1),
+        None,
+        None,
+        DisaggregationStrategy::Aggregated,
+    );
+    let aggregated_admission = crate::GenerationAdmission {
+        decode_worker_id: Some(1),
+        ..admission
+    };
+    assert_eq!(
+        aggregated
+            .serving_pod_name(&aggregated_admission)
+            .as_deref(),
+        Some("pod-1")
+    );
 }
