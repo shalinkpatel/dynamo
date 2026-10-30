@@ -6,12 +6,13 @@ pub mod stream_converter;
 use std::collections::HashMap;
 
 use dynamo_protocols::types::responses::{
-    AssistantRole, FunctionToolCall, IncludeEnum, IncompleteDetails, InputTokenDetails,
-    Instructions, NamespaceToolParamTool, OutputItem, OutputMessage, OutputMessageContent,
-    OutputStatus, OutputTextContent, OutputTokenDetails, PromptCacheRetention, Reasoning,
-    ReasoningItem, ReasoningItemContent, ReasoningTextContent, Response, ResponseTextParam,
-    ResponseUsage, ServiceTierResponses, Status, SummaryPart, SummaryTextContent,
-    TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam, Truncation,
+    AssistantRole, FunctionCallStatus, FunctionToolCall, IncludeEnum, IncompleteDetails,
+    InputTokenDetails, Instructions, NamespaceToolParamTool, OutputItem, OutputMessage,
+    OutputMessageContent, OutputStatus, OutputTextContent, OutputTokenDetails,
+    PromptCacheRetention, Reasoning, ReasoningItem, ReasoningItemContent, ReasoningTextContent,
+    Response, ResponseTextParam, ResponseUsage, ServiceTierResponses, Status, SummaryPart,
+    SummaryTextContent, TextResponseFormatConfiguration, Tool, ToolChoiceOptions, ToolChoiceParam,
+    ToolSearchCall, ToolSearchExecutionType, Truncation,
 };
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
 use serde::{Deserialize, Serialize};
@@ -273,6 +274,49 @@ pub(super) fn resolve_tool_identity(
     (chat_name.to_string(), None)
 }
 
+/// Whether `chat_name` is the synthetic `tool_search` function the api-translation crate stands in
+/// for a client-executed `{"type": "tool_search", "execution": "client"}` declaration. A client's
+/// own function of that name wins, as it does at ingress.
+pub(super) fn is_client_tool_search(tools: Option<&[Tool]>, chat_name: &str) -> bool {
+    let tools = tools.unwrap_or_default();
+    chat_name == "tool_search"
+        && tools.iter().any(|tool| {
+            matches!(tool, Tool::ToolSearch(search)
+                if search.execution == Some(ToolSearchExecutionType::Client))
+        })
+        && !tools
+            .iter()
+            .any(|tool| matches!(tool, Tool::Function(f) if f.name == "tool_search"))
+}
+
+/// The output item for a model tool call: a native `tool_search_call` (which the client executes
+/// and replays as `tool_search_call` + `tool_search_output`) for the synthetic search function,
+/// a `function_call` otherwise.
+pub(super) fn call_output_item(tools: Option<&[Tool]>, call: FunctionToolCall) -> OutputItem {
+    if !is_client_tool_search(tools, &call.name) {
+        return OutputItem::FunctionCall(call);
+    }
+    let arguments = if call.arguments.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::String(call.arguments))
+    };
+    OutputItem::ToolSearchCall(ToolSearchCall {
+        id: call
+            .id
+            .unwrap_or_else(|| format!("tsc_{}", Uuid::new_v4().simple())),
+        call_id: Some(call.call_id),
+        execution: ToolSearchExecutionType::Client,
+        arguments,
+        status: match call.status {
+            Some(OutputStatus::InProgress) => FunctionCallStatus::InProgress,
+            Some(OutputStatus::Incomplete) => FunctionCallStatus::Incomplete,
+            Some(OutputStatus::Completed) | None => FunctionCallStatus::Completed,
+        },
+        created_by: None,
+    })
+}
+
 /// Canonicalize a `/v1/responses` request body — the JSON exactly as the
 /// client sent it — into the engine-bound Chat Completions request.
 ///
@@ -298,6 +342,18 @@ pub fn canonicalize_responses_body(
     result
 }
 
+/// Standard dynamo's Responses ingress: server tools drop, as under
+/// [`DropServerTools`](b10_dynamo_api_translation::hooks::DropServerTools), and a client-executed
+/// `tool_search` translates, because [`call_output_item`] renders the model's call to it back as a
+/// native `tool_search_call`. Same translation as tool-bank's.
+struct ResponsesIngress;
+
+impl b10_dynamo_api_translation::hooks::IngressHooks for ResponsesIngress {
+    fn translates_client_tool_search(&self) -> bool {
+        true
+    }
+}
+
 fn canonicalize_responses_body_inner(
     body: serde_json::Value,
 ) -> anyhow::Result<crate::protocols::unified::Canonicalized> {
@@ -311,7 +367,7 @@ fn canonicalize_responses_body_inner(
         body,
         b10_dynamo_api_translation::ClientProtocol::Responses,
         &http::HeaderMap::new(),
-        &mut b10_dynamo_api_translation::hooks::DropServerTools,
+        &mut ResponsesIngress,
     )
     .map_err(anyhow::Error::new)?;
     let losses = adapted.request.losses;
@@ -506,17 +562,25 @@ fn make_text_message(id: String, text: String) -> OutputItem {
 }
 
 /// Build a function call output item with generated IDs.
-fn make_function_call(name: String, arguments: String, namespace: Option<String>) -> OutputItem {
-    OutputItem::FunctionCall(FunctionToolCall {
-        caller: None,
-        r#async: None,
-        arguments,
-        call_id: format!("call_{}", Uuid::new_v4().simple()),
-        namespace,
-        name,
-        id: Some(format!("fc_{}", Uuid::new_v4().simple())),
-        status: Some(OutputStatus::Completed),
-    })
+fn make_function_call(
+    tools: Option<&[Tool]>,
+    name: String,
+    arguments: String,
+    namespace: Option<String>,
+) -> OutputItem {
+    call_output_item(
+        tools,
+        FunctionToolCall {
+            caller: None,
+            r#async: None,
+            arguments,
+            call_id: format!("call_{}", Uuid::new_v4().simple()),
+            namespace,
+            name,
+            id: Some(format!("fc_{}", Uuid::new_v4().simple())),
+            status: Some(OutputStatus::Completed),
+        },
+    )
 }
 
 /// Convert a ChatCompletion response into a Responses API response object,
@@ -545,16 +609,19 @@ pub fn chat_completion_to_response(
             for tc in &tool_calls {
                 let (name, namespace) =
                     resolve_tool_identity(params.tools.as_deref(), &tc.function.name);
-                output.push(OutputItem::FunctionCall(FunctionToolCall {
-                    caller: None,
-                    r#async: None,
-                    arguments: tc.function.arguments.clone(),
-                    call_id: tc.id.clone(),
-                    namespace,
-                    name,
-                    id: Some(format!("fc_{}", Uuid::new_v4().simple())),
-                    status: Some(OutputStatus::Completed),
-                }));
+                output.push(call_output_item(
+                    params.tools.as_deref(),
+                    FunctionToolCall {
+                        caller: None,
+                        r#async: None,
+                        arguments: tc.function.arguments.clone(),
+                        call_id: tc.id.clone(),
+                        namespace,
+                        name,
+                        id: Some(format!("fc_{}", Uuid::new_v4().simple())),
+                        status: Some(OutputStatus::Completed),
+                    },
+                ));
             }
         }
 
@@ -618,7 +685,12 @@ pub fn chat_completion_to_response(
             if !parsed_calls.is_empty() {
                 for (name, arguments) in parsed_calls {
                     let (name, namespace) = resolve_tool_identity(params.tools.as_deref(), &name);
-                    output.push(make_function_call(name, arguments, namespace));
+                    output.push(make_function_call(
+                        params.tools.as_deref(),
+                        name,
+                        arguments,
+                        namespace,
+                    ));
                 }
                 let remaining = strip_tool_call_text(&content_text);
                 if !remaining.trim().is_empty() {
@@ -665,13 +737,19 @@ pub fn chat_completion_to_response(
         Status::Completed
     };
     if output_limit_reached {
-        let reasoning_completed = output
-            .iter()
-            .any(|item| matches!(item, OutputItem::Message(_) | OutputItem::FunctionCall(_)));
+        let reasoning_completed = output.iter().any(|item| {
+            matches!(
+                item,
+                OutputItem::Message(_)
+                    | OutputItem::FunctionCall(_)
+                    | OutputItem::ToolSearchCall(_)
+            )
+        });
         for item in &mut output {
             match item {
                 OutputItem::Message(message) => message.status = OutputStatus::Incomplete,
                 OutputItem::FunctionCall(call) => call.status = Some(OutputStatus::Incomplete),
+                OutputItem::ToolSearchCall(call) => call.status = FunctionCallStatus::Incomplete,
                 OutputItem::Reasoning(reasoning) if !reasoning_completed => {
                     reasoning.status = Some(OutputStatus::Incomplete)
                 }
@@ -3015,6 +3093,80 @@ thinking
             panic!("expected function call output");
         };
         assert_eq!(call.status, Some(OutputStatus::Completed));
+    }
+
+    #[test]
+    fn b10_client_tool_search_round_trip() {
+        // Ingress: the declaration becomes the synthetic function, and a replayed discovery
+        // becomes a function-call pair whose delivered tool joins `tools` as deferred.
+        let body = serde_json::json!({
+            "model": "m",
+            "tools": [
+                {"type": "function", "name": "get_weather", "parameters": {}},
+                {"type": "tool_search", "execution": "client"}
+            ],
+            "input": [
+                {"type": "message", "role": "user", "content": "AAPL?"},
+                {"type": "tool_search_call", "call_id": "s1", "execution": "client",
+                    "arguments": {"query": "stock"}},
+                {"type": "tool_search_output", "call_id": "s1", "execution": "client",
+                    "tools": [{"type": "function", "name": "lookup_stock", "parameters": {}}]}
+            ]
+        });
+        let request =
+            serde_json::to_value(canonicalize_responses_body(body).unwrap().request).unwrap();
+        let tools = request["tools"].as_array().unwrap();
+        let names: Vec<_> = tools
+            .iter()
+            .map(|t| t["function"]["name"].clone())
+            .collect();
+        assert_eq!(names, ["get_weather", "tool_search", "lookup_stock"]);
+        assert_eq!(tools[2]["defer_loading"], true);
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[1]["tool_calls"][0]["function"]["name"],
+            "tool_search"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("lookup_stock")
+        );
+
+        // Egress: the model's call to it is a native `tool_search_call`.
+        let mut chat_resp = make_chat_resp_with_tool_call(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+            r#"{"query":"fx"}"#,
+        );
+        chat_resp.inner.choices[0]
+            .message
+            .tool_calls
+            .as_mut()
+            .unwrap()[0]
+            .function
+            .name = "tool_search".into();
+        let params = ResponseParams {
+            tools: Some(
+                serde_json::from_value(
+                    serde_json::json!([{"type": "tool_search", "execution": "client"}]),
+                )
+                .unwrap(),
+            ),
+            ..ResponseParams::default()
+        };
+        let response = chat_completion_to_response(chat_resp, &params, None).unwrap();
+        let OutputItem::ToolSearchCall(call) = &response.inner.output[0] else {
+            panic!(
+                "expected tool_search_call, got {:?}",
+                response.inner.output[0]
+            );
+        };
+        assert_eq!(call.call_id.as_deref(), Some("call_abc"));
+        assert_eq!(call.execution, ToolSearchExecutionType::Client);
+        assert_eq!(call.arguments, serde_json::json!({"query": "fx"}));
+        assert_eq!(call.status, FunctionCallStatus::Completed);
     }
 
     #[test]

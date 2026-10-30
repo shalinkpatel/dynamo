@@ -123,9 +123,9 @@ pub trait IngressHooks {
     /// `execution: "client"` (and Anthropic's `tool_search_tool_*` declaration) becomes a synthetic
     /// `tool_search` function, and replayed `tool_search_call` / `tool_search_output` items become a
     /// function-call pair whose delivered tools join the request as deferred functions. Off by
-    /// default: rendering the model's call back as a native `tool_search_call` item takes the
-    /// crate's own Responses framing, which dynamo's frontends do not use, so standard dynamo keeps
-    /// dropping the declaration. tool-bank turns it on.
+    /// default: the consumer must render the model's call back as a native `tool_search_call`
+    /// item. tool-bank (this crate's framing) and dynamo's `/v1/responses` (`lib/llm`'s converter)
+    /// turn it on; dynamo's `/v1/messages`, which has no `tool_search_tool_*` egress, leaves it off.
     fn translates_client_tool_search(&self) -> bool {
         false
     }

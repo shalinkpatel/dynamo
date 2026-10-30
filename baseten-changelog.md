@@ -3304,6 +3304,14 @@ schema is already in the prompt); an undeclared one renders
 `[tool "x" not available]`. Messages declared tools now expand before the
 messages translate. Baseten-specific.
 
+Standard dynamo `/v1/responses` translates client-executed tool search like
+tool-bank: a `{"type": "tool_search", "execution": "client"}` declaration and
+replayed `tool_search_call` / `tool_search_output` items no longer drop. The
+discovery reaches the model as a function-call pair, and its tools join the
+request as deferred. The model's call goes back as a native `tool_search_call`
+item (streaming and non-streaming). `/v1/messages` is unchanged.
+Baseten-specific.
+
 `ingress.loss` WARN lines read `` `field` outcome (reason); the request
 continues `` ([#1139](https://github.com/basetenlabs/dynamo/pull/1139)): each
 `LossKind` declares its outcome once (strum `message`), call sites pass only the

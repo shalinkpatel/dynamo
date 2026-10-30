@@ -127,6 +127,10 @@ impl ResponseStreamConverter {
         super::resolve_tool_identity(self.params.tools.as_deref(), chat_name)
     }
 
+    fn is_tool_search(&self, chat_name: &str) -> bool {
+        super::is_client_tool_search(self.params.tools.as_deref(), chat_name)
+    }
+
     #[allow(deprecated)] // Echo the legacy cache-retention field for existing clients.
     fn make_response(&self, status: Status, output: Vec<OutputItem>) -> Response {
         let is_incomplete = status == Status::Incomplete;
@@ -424,16 +428,19 @@ impl ResponseStreamConverter {
                                     ResponseOutputItemAddedEvent {
                                         sequence_number: seq,
                                         output_index,
-                                        item: OutputItem::FunctionCall(FunctionToolCall {
-                                            caller: None,
-                                            r#async: None,
-                                            id: Some(item_id),
-                                            call_id,
-                                            namespace,
-                                            name: wire_name,
-                                            arguments: String::new(),
-                                            status: Some(OutputStatus::InProgress),
-                                        }),
+                                        item: super::call_output_item(
+                                            self.params.tools.as_deref(),
+                                            FunctionToolCall {
+                                                caller: None,
+                                                r#async: None,
+                                                id: Some(item_id),
+                                                call_id,
+                                                namespace,
+                                                name: wire_name,
+                                                arguments: String::new(),
+                                                status: Some(OutputStatus::InProgress),
+                                            },
+                                        ),
                                     },
                                 );
                                 events.push(self.make_sse_event(&item_added));
@@ -442,6 +449,9 @@ impl ResponseStreamConverter {
                             self.function_call_items[tc_index]
                                 .accumulated_args
                                 .push_str(args);
+                            if self.is_tool_search(&self.function_call_items[tc_index].name) {
+                                continue;
+                            }
                             let output_index = self.function_call_items[tc_index].output_index;
 
                             let item_id = self.function_call_items[tc_index].item_id.clone();
@@ -501,30 +511,36 @@ impl ResponseStreamConverter {
         );
 
         let (wire_name, namespace) = self.resolve_tool_identity(&fc_name);
-        let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
-            ResponseFunctionCallArgumentsDoneEvent {
-                sequence_number: self.next_seq(),
-                item_id: item_id.clone(),
-                output_index,
-                arguments: fc_args.clone(),
-                name: Some(wire_name.clone()),
-            },
-        );
-        events.push(self.make_sse_event(&args_done));
+        // A native `tool_search_call` carries its arguments whole, on the item.
+        if !self.is_tool_search(&fc_name) {
+            let args_done = ResponseStreamEvent::ResponseFunctionCallArgumentsDone(
+                ResponseFunctionCallArgumentsDoneEvent {
+                    sequence_number: self.next_seq(),
+                    item_id: item_id.clone(),
+                    output_index,
+                    arguments: fc_args.clone(),
+                    name: Some(wire_name.clone()),
+                },
+            );
+            events.push(self.make_sse_event(&args_done));
+        }
 
         let item_done = ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
             sequence_number: self.next_seq(),
             output_index,
-            item: OutputItem::FunctionCall(FunctionToolCall {
-                caller: None,
-                r#async: None,
-                id: Some(item_id),
-                call_id,
-                namespace,
-                name: wire_name,
-                arguments: fc_args,
-                status: Some(output_status),
-            }),
+            item: super::call_output_item(
+                self.params.tools.as_deref(),
+                FunctionToolCall {
+                    caller: None,
+                    r#async: None,
+                    id: Some(item_id),
+                    call_id,
+                    namespace,
+                    name: wire_name,
+                    arguments: fc_args,
+                    status: Some(output_status),
+                },
+            ),
         });
         events.push(self.make_sse_event(&item_done));
 
@@ -645,16 +661,19 @@ impl ResponseStreamConverter {
                 let (wire_name, namespace) = self.resolve_tool_identity(&function_call.name);
                 output.push((
                     function_call.output_index,
-                    OutputItem::FunctionCall(FunctionToolCall {
-                        caller: None,
-                        r#async: None,
-                        id: Some(function_call.item_id.clone()),
-                        call_id: function_call.call_id.clone(),
-                        namespace,
-                        name: wire_name,
-                        arguments: function_call.accumulated_args.clone(),
-                        status: Some(output_status),
-                    }),
+                    super::call_output_item(
+                        self.params.tools.as_deref(),
+                        FunctionToolCall {
+                            caller: None,
+                            r#async: None,
+                            id: Some(function_call.item_id.clone()),
+                            call_id: function_call.call_id.clone(),
+                            namespace,
+                            name: wire_name,
+                            arguments: function_call.accumulated_args.clone(),
+                            status: Some(output_status),
+                        },
+                    ),
                 ));
             }
         }
@@ -1611,6 +1630,93 @@ mod tests {
     /// the first chunk together with only the first argument fragment, and the
     /// rest of the arguments stream in later chunks. Done events must carry the
     /// fully concatenated arguments, not just the first fragment.
+    fn client_tool_search_params(extra: Vec<serde_json::Value>) -> ResponseParams {
+        let mut tools = vec![serde_json::json!({"type": "tool_search", "execution": "client"})];
+        tools.extend(extra);
+        ResponseParams {
+            tools: Some(serde_json::from_value(serde_json::Value::Array(tools)).unwrap()),
+            ..ResponseParams::default()
+        }
+    }
+
+    #[test]
+    fn b10_client_tool_search_call_streams_as_native_item() {
+        let mut conv =
+            ResponseStreamConverter::new("test-model".into(), client_tool_search_params(vec![]));
+        let _ = conv.emit_start_events();
+        let mut events = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("call-s"),
+            Some("tool_search"),
+            Some("{\"query\":"),
+        ));
+        events.extend(conv.process_chunk(&tool_call_chunk(0, None, None, Some("\"stock\"}"))));
+        events.extend(conv.process_chunk(&finish_chunk(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+        )));
+        let typed = typed_events(&events);
+        // Arguments ride the item whole; no function_call_arguments events.
+        assert!(
+            typed
+                .iter()
+                .all(|(t, _)| !t.starts_with("response.function_call_arguments")),
+            "{typed:?}"
+        );
+        let added = typed
+            .iter()
+            .find(|(t, _)| t == "response.output_item.added")
+            .expect("added");
+        assert_eq!(added.1["item"]["type"], "tool_search_call");
+        assert_eq!(added.1["item"]["status"], "in_progress");
+        let done = typed
+            .iter()
+            .find(|(t, _)| t == "response.output_item.done")
+            .expect("done");
+        assert_eq!(done.1["item"]["type"], "tool_search_call");
+        assert_eq!(done.1["item"]["call_id"], "call-s");
+        assert_eq!(done.1["item"]["execution"], "client");
+        assert_eq!(
+            done.1["item"]["arguments"],
+            serde_json::json!({"query": "stock"})
+        );
+        assert_eq!(done.1["item"]["status"], "completed");
+        assert_eq!(done.1["item"]["id"], added.1["item"]["id"]);
+
+        let end = typed_events(&conv.emit_end_events());
+        let completed = end
+            .iter()
+            .find(|(t, _)| t == "response.completed")
+            .expect("completed");
+        assert_eq!(
+            completed.1["response"]["output"][0]["type"],
+            "tool_search_call"
+        );
+    }
+
+    #[test]
+    fn b10_client_function_named_tool_search_stays_a_function_call() {
+        let params = client_tool_search_params(vec![serde_json::json!(
+            {"type": "function", "name": "tool_search", "parameters": {}}
+        )]);
+        let mut conv = ResponseStreamConverter::new("test-model".into(), params);
+        let _ = conv.emit_start_events();
+        let mut events = conv.process_chunk(&tool_call_chunk(
+            0,
+            Some("c"),
+            Some("tool_search"),
+            Some("{}"),
+        ));
+        events.extend(conv.process_chunk(&finish_chunk(
+            dynamo_protocols::types::FinishReason::ToolCalls,
+        )));
+        let typed = typed_events(&events);
+        let done = typed
+            .iter()
+            .find(|(t, _)| t == "response.output_item.done")
+            .expect("done");
+        assert_eq!(done.1["item"]["type"], "function_call");
+    }
+
     #[test]
     fn b10_fragmented_args_done_carries_full_arguments() {
         let mut conv = ResponseStreamConverter::new("test-model".into(), default_params());
