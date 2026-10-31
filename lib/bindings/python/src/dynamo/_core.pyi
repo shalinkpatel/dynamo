@@ -1952,7 +1952,9 @@ class HttpService:
     It is a OpenAI compatible http ingress into the Dynamo Distributed Runtime.
     """
 
-    def __init__(self, port: Optional[int] = None) -> None:
+    def __init__(
+        self, port: Optional[int] = None, *, remote_generation_coordinator: bool = False
+    ) -> None:
         """
         Create a new HTTP service.
 

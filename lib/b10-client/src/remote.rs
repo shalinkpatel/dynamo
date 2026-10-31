@@ -121,7 +121,7 @@ impl RemoteGenerationCoordinator {
         if let Some(session_id) = session {
             headers.insert("x-session-affinity", session_id.parse()?);
         }
-        let (endpoint, affinity) = match &self.endpoints {
+        let (mut endpoint, affinity) = match &self.endpoints {
             RemoteEndpoints::Pool(pool) => {
                 let bid = protocol::BidRequestV1 {
                     tokens: wire_request.tokens.clone(),
@@ -144,6 +144,7 @@ impl RemoteGenerationCoordinator {
             }
             RemoteEndpoints::Fixed(endpoint) => (endpoint.clone(), None),
         };
+        b10_coordinate_path(&mut endpoint, &mut headers)?;
         let send = self
             .client
             .post(endpoint)
@@ -210,6 +211,15 @@ impl RemoteGenerationCoordinator {
             None => bail!("generation service sent an empty response frame"),
         }
     }
+}
+
+fn b10_coordinate_path(endpoint: &mut Url, headers: &mut reqwest::header::HeaderMap) -> Result<()> {
+    if let Some(prefix) =
+        headers.remove(dynamo_llm::http::service::b10_dedicated_routing::PREFIX_HEADER)
+    {
+        endpoint.set_path(&format!("{}/v1/coordinate", prefix.to_str()?));
+    }
+    Ok(())
 }
 
 async fn fetch_worker_loads(client: &Client, endpoint: &Url) -> Result<Vec<crate::WorkerLoad>> {
@@ -418,6 +428,35 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::convert::Infallible;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn b10_coordinate_url_uses_only_the_arrived_prefix() {
+        use dynamo_llm::http::service::b10_dedicated_routing::PREFIX_HEADER;
+        for prefix in [
+            None,
+            Some("/environments/staging/sync"),
+            Some("/deployment/abc/sync"),
+        ] {
+            let configured = if prefix.is_none() {
+                "http://alyx/v1/coordinate?a=b"
+            } else {
+                "http://alyx/environments/legacy/sync/v1/coordinate?a=b"
+            };
+            let mut endpoint = Url::parse(configured).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, "model-abc.api.baseten.co".parse().unwrap());
+            if let Some(prefix) = prefix {
+                headers.insert(PREFIX_HEADER, prefix.parse().unwrap());
+            }
+            b10_coordinate_path(&mut endpoint, &mut headers).unwrap();
+            assert_eq!(
+                endpoint.as_str(),
+                format!("http://alyx{}/v1/coordinate?a=b", prefix.unwrap_or(""))
+            );
+            assert!(!headers.contains_key(PREFIX_HEADER));
+            assert_eq!(headers[header::HOST], "model-abc.api.baseten.co");
+        }
+    }
 
     #[derive(Clone)]
     struct TestServerState {

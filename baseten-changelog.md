@@ -1859,6 +1859,9 @@ did not catch this.
 
 v1.2 remote generation coordinator:
 
+Remote-mode frontends strip dedicated API prefixes and restore them on coordinator URLs;
+unprefixed requests retain the configured URL ([#1159](https://github.com/basetenlabs/dynamo/pull/1159), keep).
+
 `DYNAMO_DEFAULT_GENERATION_COORDINATOR_URL` selects remote mode by default and
 supplies the `default` endpoint. Explicit configmap remotes override it;
 `is_client_force=False` keeps orchestration local regardless of the environment.

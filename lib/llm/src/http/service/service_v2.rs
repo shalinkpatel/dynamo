@@ -277,6 +277,9 @@ pub struct HttpService {
 #[derive(Clone, Builder)]
 #[builder(pattern = "owned", build_fn(private, name = "build_internal"))]
 pub struct HttpServiceConfig {
+    #[builder(default = "false")]
+    b10_remote_coordinator: bool,
+
     #[builder(default = "8787")]
     port: u16,
 
@@ -730,7 +733,10 @@ impl HttpServiceConfigBuilder {
                 .on_response(on_response),
         );
 
-        let router = system_router.merge(inference_router);
+        let router = super::b10_dedicated_routing::wrap(
+            system_router.merge(inference_router),
+            config.b10_remote_coordinator,
+        );
 
         // Echo x-request-id from request to response headers for client correlation
         let router = router.layer(axum::middleware::from_fn(echo_request_id_header));
