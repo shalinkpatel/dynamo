@@ -4028,7 +4028,10 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
         );
         let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
         prefill_worker.set_stream_chunks(vec![vec![jv!({
+            "input_tokens": 3,
+            "cached_tokens": 2,
             "outputs": [{
+                "token_ids_diff": [11],
                 "finish_reason": "not_finished",
                 "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 9}
             }]
@@ -4083,6 +4086,14 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
             denied.denied,
             DeniedRequest::RouterBackpressure { .. }
         ));
+        assert_eq!(
+            denied.usage,
+            Some(crate::protocol::TokenUsageV1 {
+                input_tokens: Some(3),
+                cached_tokens: Some(2),
+                output_tokens: Some(1),
+            })
+        );
         let admission = denied.admission.expect("prefill admission");
         assert!(admission.prefill_duration.is_some());
         assert_eq!(

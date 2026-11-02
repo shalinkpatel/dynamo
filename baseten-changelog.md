@@ -1867,6 +1867,9 @@ did not catch this.
 
 v1.2 remote generation coordinator:
 
+Each response frame adds a typed, cumulative `TokenUsage` snapshot with optional input,
+cached, and output counts; prefill cache counts survive decode-side zeros ([#1162](https://github.com/basetenlabs/dynamo/pull/1162), keep).
+
 Remote-mode frontends strip dedicated API prefixes and restore them on coordinator URLs;
 unprefixed requests retain the configured URL ([#1159](https://github.com/basetenlabs/dynamo/pull/1159), keep).
 

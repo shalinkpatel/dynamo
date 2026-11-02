@@ -319,8 +319,21 @@ message TraceContext
   optional string request_id = 6;
 }
 
+// Cumulative request-level token counts. Missing counters are unknown, not zero.
+// Input includes cached tokens. Output includes all choices and any prefill token.
+message TokenUsage
+{
+  optional uint64 input_tokens = 1;
+  optional uint64 cached_tokens = 2;
+  optional uint64 output_tokens = 3;
+}
+
 message GenerationResponseFrame
 {
+  // Latest known counts on every frame, including admission, denial and errors.
+  // Admission can precede worker usage; subsequent frames fill in missing counts.
+  // Older servers omit this field. Counts on interrupted streams can be partial.
+  TokenUsage usage = 5;
   oneof frame
   {
     Admission admission = 1;

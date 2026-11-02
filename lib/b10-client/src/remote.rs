@@ -193,7 +193,8 @@ impl RemoteGenerationCoordinator {
                 connected_outcome(context, admission, reader, lease)
             }
             Some(generation_response_frame_v1::Frame::Denied(denied)) => {
-                let denied: DeniedGenerationRequest = denied.try_into()?;
+                let mut denied: DeniedGenerationRequest = denied.try_into()?;
+                denied.usage = first.usage;
                 if let (Some(selection), Some(admission)) = (affinity, denied.admission) {
                     selection.complete_selection(AffinityTarget {
                         worker_id: admission.prefill_worker_id,
@@ -263,6 +264,7 @@ fn cancelled_outcome() -> GenerationOutcome {
     GenerationOutcome::Denied(DeniedGenerationRequest {
         denied: DeniedRequest::Cancelled(),
         admission: None,
+        usage: None,
     })
 }
 
@@ -506,6 +508,7 @@ mod tests {
         let second_chunk = Annotated::from_data(value(serde_json::json!({"finish": true})));
         let frames = [
             GenerationResponseFrameV1 {
+                usage: None,
                 frame: Some(generation_response_frame_v1::Frame::Admission(
                     AdmissionV1 {
                         estimated_overlap_tokens: 64,
@@ -520,11 +523,13 @@ mod tests {
                 )),
             },
             GenerationResponseFrameV1 {
+                usage: None,
                 frame: Some(generation_response_frame_v1::Frame::ChunkMsgpack(
                     rmp_serde::to_vec_named(&first_chunk).unwrap(),
                 )),
             },
             GenerationResponseFrameV1 {
+                usage: None,
                 frame: Some(generation_response_frame_v1::Frame::ChunkMsgpack(
                     rmp_serde::to_vec_named(&second_chunk).unwrap(),
                 )),

@@ -210,7 +210,11 @@ async fn coordinate(
             protocol::encode_response_frame(&denial_frame(denied)),
         )),
         Ok(GenerationOutcome::Connected(generated)) => {
+            let mut usage = crate::b10_token_usage::TokenUsageTracker::new(
+                service.strategy == DisaggregationStrategy::PrefillFirst,
+            );
             let admission = GenerationResponseFrameV1 {
+                usage: Some(usage.snapshot()),
                 frame: Some(generation_response_frame_v1::Frame::Admission(
                     generated.admission.into(),
                 )),
@@ -218,12 +222,18 @@ async fn coordinate(
             let first = stream::once(async move {
                 Ok::<_, Infallible>(Bytes::from(protocol::encode_response_frame(&admission)))
             });
-            let chunks = generated.stream.map(|chunk| {
+            let chunks = generated.stream.map(move |chunk| {
+                if !chunk.is_error() {
+                    usage.observe(chunk.data.as_ref());
+                }
+                let snapshot = Some(usage.snapshot());
                 let frame = match rmp_serde::to_vec_named(&chunk) {
                     Ok(chunk) => GenerationResponseFrameV1 {
+                        usage: snapshot,
                         frame: Some(generation_response_frame_v1::Frame::ChunkMsgpack(chunk)),
                     },
                     Err(error) => GenerationResponseFrameV1 {
+                        usage: snapshot,
                         frame: Some(generation_response_frame_v1::Frame::Error(
                             ProtocolErrorV1 {
                                 message: format!("failed to encode generation chunk: {error}"),

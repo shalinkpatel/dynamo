@@ -105,6 +105,7 @@ impl GenerationCoordinatorClient for LocalCoordinator {
                 Ok(GenerationOutcome::Denied(DeniedGenerationRequest {
                     denied: DeniedRequest::Cancelled(),
                     admission: None,
+                    usage: None,
                 }))
             };
             let coordinator = tokio::select! {

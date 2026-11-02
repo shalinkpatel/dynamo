@@ -95,6 +95,8 @@ pub struct GeneratedRequest {
 /// prefill leg that completed before a downstream decode denial.
 #[derive(Debug)]
 pub struct DeniedGenerationRequest {
+    /// Known prefill counters when a downstream decode admission is denied.
+    pub usage: Option<crate::protocol::TokenUsageV1>,
     pub denied: crate::DeniedRequest,
     pub admission: Option<GenerationAdmission>,
 }
@@ -265,6 +267,7 @@ impl GenerationCoordinator {
             return Ok(GenerationOutcome::Denied(DeniedGenerationRequest {
                 denied,
                 admission: None,
+                usage: None,
             }));
         };
 
@@ -331,6 +334,7 @@ impl GenerationCoordinator {
             return Ok(GenerationOutcome::Denied(DeniedGenerationRequest {
                 denied,
                 admission: None,
+                usage: None,
             }));
         };
 
@@ -409,6 +413,7 @@ impl GenerationCoordinator {
             return Ok(GenerationOutcome::Denied(DeniedGenerationRequest {
                 denied,
                 admission: Some(admission),
+                usage: Some(crate::b10_token_usage::prefill_usage(&prefill_response)),
             }));
         };
 

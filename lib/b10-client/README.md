@@ -230,3 +230,31 @@ The Python extension in `lib/bindings/python` only converts Python values,
 adapts the response stream, and exposes the Rust admission result as PyO3
 classes. Changes to routing, reroute, cancellation, and guard cleanup
 belong in this crate.
+
+Every protobuf `GenerationResponseFrame` carries a typed `usage` snapshot, separate
+from its admission/denial/chunk/error payload. Its optional `input_tokens` includes
+cached tokens; `cached_tokens` is the worker-reported cached subset; `output_tokens`
+is cumulative across choices and the visible prefill/decode output. Missing counters
+mean unknown, distinct from a reported zero. Admission and early denial can have an
+empty snapshot; later worker chunks fill in counters without delaying admission.
+A decode-side denial retains any counts already reported by prefill.
+Snapshots on interrupted streams can be partial. Older servers omit `usage` entirely.
+
+Input/cache counters are copied from worker `input_tokens`/`prompt_tokens` and
+`cached_tokens`, or `completion_usage`. In prefill-first mode these counters come
+only from the prefill response; decode counters cannot overwrite them, including
+when the prefill count is unknown. Output counts accumulate visible worker token
+deltas (`outputs[].token_ids_diff` or `token_ids`); aggregated workers can also
+supply cumulative `output_tokens`/`completion_tokens` or `completion_usage` counts.
+Visible deltas and reported totals are tracked separately and their maximum is
+published, since a worker total can include choices whose chunks have not arrived.
+Opaque MessagePack chunks retain their original fields.
+
+Mixed-version proxy chains are wire compatible. An older proxy that forwards raw
+bytes preserves `usage`; an older proxy that decodes and re-encodes protobuf frames
+can drop the unknown field. Worker MessagePack chunks remain unchanged, so a newer
+proxy later in the chain reconstructs usage from those chunks. Denial-only usage
+has no worker chunk to reconstruct from and can be lost at an older proxy. If the final proxy
+is old, clients must accept absent `usage` and may read the original worker fields.
+Future counters can be added with new protobuf field numbers without changing the
+existing payload variants or counter semantics.

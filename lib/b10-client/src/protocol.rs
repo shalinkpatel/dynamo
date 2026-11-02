@@ -27,7 +27,9 @@ pub use wire::{
     TraceContext as TraceContextV1, WeightedTaint as WeightedTaintV1,
     generation_response_frame as generation_response_frame_v1, mm_kwarg as mm_kwarg_v1,
 };
-pub use wire::{BidRequest as BidRequestV1, BidResponse as BidResponseV1};
+pub use wire::{
+    BidRequest as BidRequestV1, BidResponse as BidResponseV1, TokenUsage as TokenUsageV1,
+};
 pub use wire::{
     CommitIntendRequest as CommitIntendRequestV1, LocateCandidate as LocateCandidateV1,
     LocateRequest as LocateRequestV1, LocateResponse as LocateResponseV1,

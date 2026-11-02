@@ -7,6 +7,7 @@
 //! binding. Rust callers use [`RouterWorkerCoordinator`]; Python bindings adapt
 //! their native objects to the same request and outcome types.
 
+mod b10_token_usage;
 mod context;
 mod coordinator;
 mod generation;

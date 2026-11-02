@@ -437,6 +437,7 @@ impl From<crate::GenerationAdmission> for AdmissionV1 {
 
 pub(crate) fn denial_frame(value: DeniedGenerationRequest) -> GenerationResponseFrameV1 {
     GenerationResponseFrameV1 {
+        usage: Some(value.usage.unwrap_or_default()),
         frame: Some(generation_response_frame_v1::Frame::Denied(
             DeniedGenerationV1 {
                 denied: Some(denied_request_to_wire(value.denied)),
@@ -511,6 +512,7 @@ impl TryFrom<DeniedGenerationV1> for DeniedGenerationRequest {
         Ok(Self {
             denied,
             admission: value.admission.map(Into::into),
+            usage: None,
         })
     }
 }
