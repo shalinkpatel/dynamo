@@ -2946,6 +2946,10 @@ publishes a `b10.drain/until=<RFC 3339>` taint on its base model card (via PATCH
 `b10_routing_config.router_honor_draining` (`scheduling/{filter,queue}/b10_draining.rs`).
 PR: https://github.com/basetenlabs/dynamo/pull/962.
 
+`router_honor_draining` defaults to on; `false` in the base block or an override group
+turns it off per model (`default_router_honor_draining` in `baseten-configmap/config.rs`).
+PR: https://github.com/basetenlabs/dynamo/pull/1114.
+
 ## PATCH-025: SGLang mocker HiCache host tier and G2PB peer reads
 
 Status: `keep`

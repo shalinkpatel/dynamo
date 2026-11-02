@@ -97,7 +97,9 @@ mod tests {
     async fn b10_router_honor_draining_keeps_new_work_off_draining_workers() {
         const PROBES: usize = 64;
         let isl = 512;
-        let reader = baseten_configmap::ConfigReader::in_memory(Default::default());
+        let mut config = baseten_configmap::UnifiedConfig::default();
+        config.routing.router_honor_draining = false;
+        let reader = baseten_configmap::ConfigReader::in_memory(config);
         let (queue, _slots, cfg_tx) = baseten_configmap::with_reader(&reader, || {
             make_queue_with_sender(2, 16, isl, None, None)
         });
@@ -129,15 +131,13 @@ mod tests {
             (counters.steered_requests(), counters.fallback_requests())
         };
 
-        // Flag off (default): the draining worker is routable as today.
+        // Flag off: the draining worker is routable like any other.
         assert_eq!(route(None).await, HashSet::from([0, 1]));
         assert_eq!(counts(), (0, 0));
 
-        let mut config = baseten_configmap::UnifiedConfig::default();
-        config.routing.router_honor_draining = true;
-        reader.replace(config);
+        reader.replace(baseten_configmap::UnifiedConfig::default());
 
-        // Flag on: new work avoids the draining worker...
+        // Flag on (the default): new work avoids the draining worker...
         assert_eq!(route(None).await, HashSet::from([1]));
         assert_eq!(counts(), (PROBES as u64, 0));
         // ...but a pinned or sticky request still reaches it, uncounted.
@@ -230,9 +230,11 @@ mod tests {
             .expect("session-affinity request should be admitted");
         assert_eq!(queue.pending_count(), 1);
 
-        // Turning the flag off hot-reloads today's admission: the queued request
-        // drains onto the draining worker.
-        reader.replace(baseten_configmap::UnifiedConfig::default());
+        // Turning the flag off hot-reloads admission that counts draining workers as
+        // capacity: the queued request drains onto the draining worker.
+        let mut config = baseten_configmap::UnifiedConfig::default();
+        config.routing.router_honor_draining = false;
+        reader.replace(config);
         queue.update().await;
         rx2.await
             .expect("response sender dropped")

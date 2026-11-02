@@ -5,8 +5,8 @@
 //!
 //! A worker drains itself through `POST /engine/drain` (see `local_model::b10_drain` in
 //! `dynamo-llm`), which publishes a `b10.drain/until=<RFC 3339>` taint on its base model card;
-//! this module reads it back from the worker config and, behind `router_honor_draining`,
-//! excludes the worker from selection while any other worker is eligible.
+//! this module reads it back from the worker config and, unless `router_honor_draining` is
+//! set to `false`, excludes the worker from selection while any other worker is eligible.
 
 use std::collections::HashMap;
 
@@ -15,7 +15,7 @@ use crate::protocols::{WorkerConfigLike, WorkerId, WorkerWithDpRank};
 
 /// Prefix of the taint a draining worker publishes; the rest is the RFC 3339 deadline.
 /// Requests never name it in `required_taints`/`preferred_taints`, so it changes nothing for
-/// routers without `router_honor_draining`.
+/// routers with `router_honor_draining: false`.
 pub const DRAIN_TAINT_PREFIX: &str = "b10.drain/until=";
 
 /// The drain deadline a worker published (RFC 3339, as written), if it is draining. Every

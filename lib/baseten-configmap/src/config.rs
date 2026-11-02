@@ -247,8 +247,9 @@ pub struct B10RoutingConfig {
     pub router_session_affinity_score_multiplier: f64,
 
     /// Keep new work off workers publishing a `b10.drain/until=` taint, unless no other worker
-    /// is eligible. Requests pinned or sticky to a draining worker still reach it.
-    #[serde(default)]
+    /// is eligible. Requests pinned or sticky to a draining worker still reach it. On by
+    /// default; `false` restores routing that treats draining workers like any other.
+    #[serde(default = "default_router_honor_draining")]
     pub router_honor_draining: bool,
 
     #[serde(default = "default_router_residency_eviction_cost")]
@@ -359,7 +360,7 @@ impl Default for B10RoutingConfig {
             router_cache_miss_min_isl: default_router_cache_miss_min_isl(),
             router_session_affinity_score_multiplier:
                 default_router_session_affinity_score_multiplier(),
-            router_honor_draining: false,
+            router_honor_draining: default_router_honor_draining(),
             router_residency_eviction_cost: default_router_residency_eviction_cost(),
             router_residency_half_life: default_router_residency_half_life(),
             router_queue_threshold: None,
@@ -436,6 +437,10 @@ fn default_router_cache_miss_min_isl() -> usize {
 
 fn default_router_session_affinity_score_multiplier() -> f64 {
     0.7
+}
+
+fn default_router_honor_draining() -> bool {
+    true
 }
 
 fn default_router_residency_eviction_cost() -> f64 {
@@ -1045,20 +1050,96 @@ override_args:
     }
 
     #[test]
-    fn router_honor_draining_defaults_off_and_follows_override_group() {
+    fn router_honor_draining_defaults_on_and_explicit_false_turns_it_off() {
         let defaults = B10RoutingConfig::default();
-        assert!(!defaults.router_honor_draining);
-        let yaml = r#"
+        assert!(defaults.router_honor_draining);
+        // Both deserialization paths default it on: a bare routing block and a config
+        // without one.
+        assert!(
+            serde_yaml::from_str::<B10RoutingConfig>("{}")
+                .unwrap()
+                .router_honor_draining
+        );
+        assert!(
+            UnifiedConfig::parse("{}", None, &defaults)
+                .unwrap()
+                .routing
+                .router_honor_draining
+        );
+
+        struct Case {
+            name: &'static str,
+            yaml: &'static str,
+            group: Option<&'static str>,
+            expected: bool,
+        }
+        let base_off_group_on = r#"
 b10_routing_config:
-  router_honor_draining: true
+  router_honor_draining: false
+override_args:
+  decode:
+    b10_routing_config:
+      router_honor_draining: true
+"#;
+        let base_off_group_untouched = r#"
+b10_routing_config:
+  router_honor_draining: false
+override_args:
+  decode:
+    b10_routing_config:
+      router_temperature: 0.5
+"#;
+        let group_off = r#"
 override_args:
   decode:
     b10_routing_config:
       router_honor_draining: false
 "#;
-        for (group, expected) in [(None, true), (Some("decode"), false)] {
-            let config = UnifiedConfig::parse(yaml, group, &defaults).unwrap();
-            assert_eq!(config.routing.router_honor_draining, expected, "{group:?}");
+        let cases = [
+            Case {
+                name: "base off, no group",
+                yaml: base_off_group_on,
+                group: None,
+                expected: false,
+            },
+            Case {
+                name: "base off, group turns it back on",
+                yaml: base_off_group_on,
+                group: Some("decode"),
+                expected: true,
+            },
+            Case {
+                name: "base off, group present but silent: stays off",
+                yaml: base_off_group_untouched,
+                group: Some("decode"),
+                expected: false,
+            },
+            Case {
+                name: "base off, group selected that is not defined: stays off",
+                yaml: base_off_group_untouched,
+                group: Some("prefill"),
+                expected: false,
+            },
+            Case {
+                name: "base default, group off, no group selected: default on",
+                yaml: group_off,
+                group: None,
+                expected: true,
+            },
+            Case {
+                name: "base default, group off",
+                yaml: group_off,
+                group: Some("decode"),
+                expected: false,
+            },
+        ];
+        for case in cases {
+            let config = UnifiedConfig::parse(case.yaml, case.group, &defaults).unwrap();
+            assert_eq!(
+                config.routing.router_honor_draining, case.expected,
+                "{}",
+                case.name
+            );
         }
     }
 

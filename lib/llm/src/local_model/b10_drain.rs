@@ -4,8 +4,8 @@
 //! Worker lame-duck drain.
 //!
 //! `POST /engine/drain {"until": "<RFC 3339>"}` on the worker's system port marks the worker as
-//! draining: it stays registered and keeps serving the sessions bound to it, while routers with
-//! `router_honor_draining` stop giving it new work. The deadline is published as a
+//! draining: it stays registered and keeps serving the sessions bound to it, while routers stop
+//! giving it new work (`router_honor_draining`, on by default). The deadline is published as a
 //! `b10.drain/until=<RFC 3339>` taint on the worker's base model cards (through upstream's
 //! `Discovery::update_model_taints`), so routers and the planner read it from discovery. A worker is draining
 //! exactly while a deadline is set; an `until` at or before now (how llm-operator cancels), or
