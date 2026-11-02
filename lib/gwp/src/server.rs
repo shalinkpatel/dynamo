@@ -21,7 +21,7 @@ pub struct BuiltServer {
     pub health_task: tokio::task::JoinHandle<()>,
     pub core: GwpCore,
     pub lifecycle: Lifecycle,
-    pub kvlocator_service: crate::kvlocator::LocatorServer,
+    pub kvlocator_service: crate::kvlocator::LocatorService,
     pub authorization_service:
         envoy_types::ext_authz::v3::pb::AuthorizationServer<crate::grpc::GrpcAuthorization>,
     pub lifecycle_service:

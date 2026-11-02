@@ -23,19 +23,35 @@ pub type LocatorServer = dynamo_kvlocator::pb::kv_locator_service_server::KvLoca
     dynamo_kvlocator::GrpcKVLocator,
 >;
 
+/// [`LocatorServer`] behind the interceptor that stamps when each call's headers arrived.
+pub type LocatorService = tonic::service::interceptor::InterceptedService<
+    LocatorServer,
+    fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
+>;
+
 /// Wire Alyx's native RPCs to the same core and readiness used by Envoy.
 pub fn grpc_server(
     core: crate::core::GwpCore,
     readiness: crate::lifecycle::Lifecycle,
-) -> LocatorServer {
+) -> LocatorService {
+    let router = core.router.clone();
     let service = dynamo_kvlocator::GrpcKVLocator::new(move || readiness.is_ready())
         .with_scorer(std::sync::Arc::new(GwpScorer::new(
             core.router.clone(),
             core.topology.clone(),
             core.affinity.clone(),
         )))
+        .with_observer(std::sync::Arc::new(move |method, tokens, elapsed| {
+            router
+                .metrics()
+                .observe_kvlocator_call(method, tokens, elapsed)
+        }))
         .with_lifecycle(std::sync::Arc::new(GwpLifecycle::new(core)));
-    LocatorServer::new(service).max_decoding_message_size(dynamo_kvlocator::GRPC_MAX_MESSAGE_BYTES)
+    tonic::service::interceptor::InterceptedService::new(
+        LocatorServer::new(service)
+            .max_decoding_message_size(dynamo_kvlocator::GRPC_MAX_MESSAGE_BYTES),
+        dynamo_kvlocator::mark_received as fn(_) -> _,
+    )
 }
 
 /// Discovered `<model>/<plane>` ids travel as the plane alone.

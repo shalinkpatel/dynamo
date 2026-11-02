@@ -60,6 +60,7 @@ pub struct GwpMetrics {
     schedule_request_body_bytes: HistogramVec,
     lifecycle_rpc_total: IntCounterVec,
     lifecycle_rpc_duration_seconds: HistogramVec,
+    kvlocator_call_duration_seconds: HistogramVec,
     lifecycle_reconciliations: IntCounterVec,
     optimistic_tokenization_total: IntCounterVec,
     optimistic_tokenization_active: IntGauge,
@@ -254,6 +255,15 @@ impl GwpMetrics {
                 "Unary gRPC lifecycle notifications processed by GWP.",
                 &["method", "result"],
                 &[],
+            )?,
+            kvlocator_call_duration_seconds: metrics.create_histogramvec(
+                "gwp_kvlocator_call_duration_seconds",
+                "KVLocator Locate and CommitIntend time from request headers to handler end, so including receiving and decoding the token payload, by request token count.",
+                &["method", "tokens"],
+                &[],
+                Some(vec![
+                    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.015, 0.02, 0.03, 0.05, 0.1, 0.25,
+                ]),
             )?,
             lifecycle_rpc_duration_seconds: metrics.create_histogramvec(
                 "gwp_lifecycle_rpc_duration_seconds",
@@ -513,6 +523,18 @@ impl GwpMetrics {
             .inc();
         self.lifecycle_rpc_duration_seconds
             .with_label_values(&[method, result])
+            .observe(elapsed.as_secs_f64());
+    }
+
+    pub fn observe_kvlocator_call(&self, method: &str, tokens: usize, elapsed: Duration) {
+        let bucket = match tokens {
+            0..16_384 => "<16k",
+            16_384..131_072 => "16k-128k",
+            131_072..524_288 => "128k-512k",
+            _ => ">=512k",
+        };
+        self.kvlocator_call_duration_seconds
+            .with_label_values(&[method, bucket])
             .observe(elapsed.as_secs_f64());
     }
 

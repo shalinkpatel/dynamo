@@ -112,8 +112,11 @@ pub mod scorer {
 }
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
+use tracing::Instrument;
 
 use lifecycle::Lifecycle;
 use pb::kv_locator_service_server::KvLocatorService as KVLocatorService;
@@ -123,6 +126,21 @@ use scorer::Scorer;
 /// decoding budget the GWP authorization path uses.
 pub const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// When a call's headers arrived. The handler starts once the body is received
+/// and decoded, so its start minus this is what the token payload costs.
+#[derive(Clone, Copy)]
+pub struct ReceivedAt(pub Instant);
+
+/// Interceptor stamping [`ReceivedAt`]; tonic runs it on the headers, before the body.
+pub fn mark_received(mut request: Request<()>) -> Result<Request<()>, Status> {
+    request.extensions_mut().insert(ReceivedAt(Instant::now()));
+    Ok(request)
+}
+
+/// Observes each token-carrying call: method, token count, and time from its
+/// headers to the handler's end.
+pub type CallObserver = Arc<dyn Fn(&'static str, usize, Duration) + Send + Sync>;
+
 /// Native placement RPCs require readiness; completion RPCs remain available
 /// during drain so Alyx can release admitted attempts.
 #[derive(Clone)]
@@ -130,6 +148,9 @@ pub struct GrpcKVLocator {
     ready: Arc<dyn Fn() -> bool + Send + Sync>,
     scorer: Option<Arc<dyn Scorer>>,
     lifecycle: Option<Arc<dyn Lifecycle>>,
+    observer: Option<CallObserver>,
+    // Locate and CommitIntend calls in progress on this replica.
+    inflight: Arc<AtomicUsize>,
 }
 
 impl GrpcKVLocator {
@@ -139,7 +160,49 @@ impl GrpcKVLocator {
             ready: Arc::new(ready),
             scorer: None,
             lifecycle: None,
+            observer: None,
+            inflight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Wire the per-call observer (the serving process's metrics).
+    pub fn with_observer(mut self, observer: CallObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Run a token-carrying call inside a span with its token count, the time
+    /// its body took to arrive and decode, and the calls in flight beside it.
+    async fn traced<T>(
+        &self,
+        method: &'static str,
+        tokens: usize,
+        received: Option<ReceivedAt>,
+        call: impl std::future::Future<Output = T>,
+    ) -> T {
+        let start = received.map_or_else(Instant::now, |at| at.0);
+        // Decrements on drop, so a cancelled call still leaves the count.
+        struct Inflight(Arc<AtomicUsize>);
+        impl Drop for Inflight {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let inflight = self.inflight.fetch_add(1, Ordering::Relaxed);
+        let _guard = Inflight(self.inflight.clone());
+        let span = tracing::info_span!(
+            "kvlocator.call",
+            kvlocator.method = method,
+            // i64: tracing-opentelemetry exports only i64 (not usize or u64) as a number.
+            kvlocator.tokens = tokens as i64,
+            kvlocator.received_ms = start.elapsed().as_secs_f64() * 1e3,
+            kvlocator.inflight = inflight as i64,
+        );
+        let out = call.instrument(span).await;
+        if let Some(observer) = &self.observer {
+            observer(method, tokens, start.elapsed());
+        }
+        out
     }
 
     /// Wire the scorer seam (the bid phase).
@@ -197,8 +260,13 @@ impl KVLocatorService for GrpcKVLocator {
     ) -> Result<Response<pb::LocateResponse>, Status> {
         self.require_ready()?;
         let scorer = self.require_scorer()?;
+        let received = request.extensions().get::<ReceivedAt>().copied();
         let request = request.into_inner();
-        match scorer.rank(&request).await {
+        let tokens = request.bid.as_ref().map_or(0, |bid| bid.tokens.len());
+        match self
+            .traced("Locate", tokens, received, scorer.rank(&request))
+            .await
+        {
             Ok(response) => Ok(Response::new(response)),
             // A caller error the request could have avoided; everything
             // else is ours.
@@ -218,12 +286,17 @@ impl KVLocatorService for GrpcKVLocator {
     ) -> Result<Response<()>, Status> {
         self.require_ready()?;
         let lifecycle = self.require_lifecycle()?;
+        let received = request.extensions().get::<ReceivedAt>().copied();
         let request = request.into_inner();
         if request.attempt_id.is_empty() {
             return Err(Status::invalid_argument("attempt_id must not be empty"));
         }
-        lifecycle
-            .intend(&request)
+        let tokens = request
+            .input
+            .as_ref()
+            .and_then(|input| input.bid.as_ref())
+            .map_or(0, |bid| bid.tokens.len());
+        self.traced("CommitIntend", tokens, received, lifecycle.intend(&request))
             .await
             .map(|_| Response::new(()))
             .map_err(map_lifecycle_error)
@@ -290,6 +363,47 @@ mod tests {
                 RankOutcome::Internal(message) => Err(anyhow::anyhow!(message.clone())),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn token_calls_report_size_and_time_since_headers() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let locator = GrpcKVLocator::new(|| true)
+            .with_scorer(Arc::new(FakeScorer {
+                outcome: RankOutcome::Ok(pb::LocateResponse::default()),
+            }))
+            .with_observer(Arc::new(move |method, tokens, elapsed| {
+                record.lock().unwrap().push((method, tokens, elapsed));
+            }));
+        let mut request = Request::new(pb::LocateRequest {
+            bid: Some(pb::BidRequest {
+                tokens: vec![1; 300],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let headers = Instant::now() - Duration::from_millis(50);
+        request.extensions_mut().insert(ReceivedAt(headers));
+        locator.locate(request).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!((seen[0].0, seen[0].1), ("Locate", 300));
+        assert!(
+            seen[0].2 >= Duration::from_millis(50),
+            "timed from the headers"
+        );
+        assert_eq!(locator.inflight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_call_leaves_the_inflight_count() {
+        let locator = GrpcKVLocator::new(|| true);
+        let call = locator.traced("Locate", 0, None, std::future::pending::<()>());
+        let polled = tokio::time::timeout(Duration::from_millis(10), call).await;
+        assert!(polled.is_err(), "the call never finishes and is dropped");
+        assert_eq!(locator.inflight.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
