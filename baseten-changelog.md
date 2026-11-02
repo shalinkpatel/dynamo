@@ -1213,7 +1213,7 @@ layer on chat/completions/responses/messages stamps `baseten.api_surface` (and
 `baseten.server_tools` from tool-bank's `x-baseten-client-api`) into context
 metadata before translation, and writes the `dynamo` model-log record
 (`stage=frontend`) for error responses the engine never accepted. Hooks: one
-`mark_dispatched` after each successful `generate`, the layer in the four
+`mark_if_engine_saw` at each `generate` (Ok, or the processor's HttpError), the layer in the four
 routers, one call in `insert_baseten_context_metadata`.
 
 ## PATCH-006: OpenAI, Anthropic, and Baseten Protocol Compatibility

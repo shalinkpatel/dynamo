@@ -667,7 +667,9 @@ async fn completions_single(
     let annotations = request.annotations();
 
     // issue the generate call on the engine
-    let stream = engine.generate(request).await.map_err(|e| {
+    let result = engine.generate(request).await;
+    super::b10_request_log::mark_if_engine_saw(&request_id, &result);
+    let stream = result.map_err(|e| {
         if super::metrics::request_was_rejected(e.as_ref()) {
             state
                 .metrics_clone()
@@ -677,7 +679,6 @@ async fn completions_single(
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         err_response
     })?;
-    super::b10_request_log::mark_dispatched(&request_id);
 
     let worker_info = take_worker_response_metadata(&request_id);
     let ctx = stream.context();
@@ -842,7 +843,10 @@ async fn completions_batch(
         copy_x_request_id(&request, &mut single_request_context);
 
         // Generate stream for this prompt
-        let stream = engine.generate(single_request_context).await.map_err(|e| {
+        let result = engine.generate(single_request_context).await;
+        // Mark the base id: the layer keys on it, not on the per-prompt ids.
+        super::b10_request_log::mark_if_engine_saw(request.id(), &result);
+        let stream = result.map_err(|e| {
             if super::metrics::request_was_rejected(e.as_ref()) {
                 state
                     .metrics_clone()
@@ -852,7 +856,6 @@ async fn completions_batch(
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
             err_response
         })?;
-        super::b10_request_log::mark_dispatched(request.id());
 
         // Capture context from first stream
         if first_ctx.is_none() {

@@ -344,9 +344,9 @@ pub(crate) async fn generate(
 ) -> anyhow::Result<Generated> {
     let Ok(inspection) = request.get::<Inspection>(KEY) else {
         let context_id = request.id().to_string();
-        let stream = engine.generate(request).await?;
-        super::b10_request_log::mark_dispatched(&context_id);
-        return Ok(Generated::Stream(stream));
+        let result = engine.generate(request).await;
+        super::b10_request_log::mark_if_engine_saw(&context_id, &result);
+        return Ok(Generated::Stream(result?));
     };
     let hook = inspection
         .hook

@@ -14,9 +14,12 @@
 //!   surface into an internal header that [`insert_api_surface_metadata`] copies into
 //!   context metadata; tool-bank's `x-baseten-client-api` header overrides it.
 //! - **Requests rejected before the engine** (rate limit, not ready, unknown model, body
-//!   and field validation, `generate` failures). [`layer`] writes the `dynamo` record
-//!   for any error response whose request never reached the engine
-//!   ([`mark_dispatched`]); the processor logs everything that did.
+//!   and field validation, `generate` failures before the processor). [`layer`] writes
+//!   the `dynamo` record for any error response whose request never reached the engine.
+//!   [`mark_if_engine_saw`] marks the rest: a successful `generate`, or an `Err` carrying
+//!   the [`HttpError`] the Python processor raises after logging its own record
+//!   (`HttpAsyncEngine` blocks on the first stream item, so processor errors surface
+//!   from `generate` itself).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{LazyLock, Mutex};
@@ -29,6 +32,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use super::baseten::get_or_create_context_id;
+use super::error::HttpError;
 
 /// Resolved API surface: what the client called.
 pub const API_SURFACE_METADATA_KEY: &str = "baseten.api_surface";
@@ -46,14 +50,36 @@ pub const MESSAGES: &str = "messages";
 const SURFACES: [&str; 4] = [CHAT_COMPLETIONS, COMPLETIONS, RESPONSES, MESSAGES];
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Image identity, as the processor's record carries it (`GIT_SHA`, `DYNAMO_BACKEND`
+/// are baked into the image; the frontend runs in the same process).
+static IMAGE: LazyLock<(String, String)> = LazyLock::new(|| {
+    let var = |k| std::env::var(k).unwrap_or_default();
+    (var("GIT_SHA"), var("DYNAMO_BACKEND"))
+});
 const MAX_ERROR_CHARS: usize = 1000;
 
 // ponytail: one set keyed by context id. Two concurrent requests sharing an id (the client
 // reusing X-Baseten-Request-Id) can hide one rejection record; key per request if that matters.
 static DISPATCHED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
+/// Mark `context_id` dispatched when `result` shows the engine saw the request: `Ok`, or
+/// an error carrying the processor's [`HttpError`] (it logged before raising).
+pub(crate) fn mark_if_engine_saw<T>(context_id: &str, result: &anyhow::Result<T>) {
+    if engine_saw(result) {
+        mark_dispatched(context_id);
+    }
+}
+
+fn engine_saw<T>(result: &anyhow::Result<T>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(e) => e.chain().any(|cause| cause.is::<HttpError>()),
+    }
+}
+
 /// Note that the engine accepted this request, so the processor owns its record.
-pub(crate) fn mark_dispatched(context_id: &str) {
+fn mark_dispatched(context_id: &str) {
     DISPATCHED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -99,7 +125,8 @@ pub(crate) fn route<S: Clone + Send + Sync + 'static>(
     method_router: axum::routing::MethodRouter<S>,
     surface: &'static str,
 ) -> axum::routing::MethodRouter<S> {
-    method_router.layer(axum::middleware::from_fn_with_state(surface, layer))
+    // route_layer: a 405 for another method is not a request.
+    method_router.route_layer(axum::middleware::from_fn_with_state(surface, layer))
 }
 
 /// Route layer for one inference surface: stamp the surface, and write the `dynamo`
@@ -119,19 +146,20 @@ pub async fn layer(
     {
         headers.insert("x-baseten-request-id", id);
     }
+    let context_id = get_or_create_context_id(request.headers());
     // Waypoints inspections are internal replays; they are not traffic.
     if request
         .extensions()
         .get::<super::waypoints::Inspection>()
         .is_some()
     {
-        return next.run(request).await;
+        let response = next.run(request).await;
+        take_dispatched(&context_id);
+        return response;
     }
-    let context_id = get_or_create_context_id(request.headers());
     let api_surface = client_api(request.headers()).unwrap_or(surface);
     let server_tools = client_api(request.headers()).is_some();
     let model_name = header_string(request.headers(), "x-baseten-model-slug");
-    let service_tier = header_string(request.headers(), "x-baseten-service-tier");
     let start = SystemTime::now();
 
     let response = next.run(request).await;
@@ -148,17 +176,27 @@ pub async fn layer(
         return response;
     }
     let (parts, body) = response.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_ERROR_BODY_BYTES)
-        .await
-        .unwrap_or_default();
-    let (error, error_type) = error_from_body(&bytes);
+    // Read the error text only from a body of known small size (handler errors are
+    // buffered JSON); anything else passes through untouched, since a failed bounded
+    // read would drop the client's body. Content-Length is not set yet at this layer.
+    let small = axum::body::HttpBody::size_hint(&body)
+        .upper()
+        .is_some_and(|len| len <= MAX_ERROR_BODY_BYTES as u64);
+    let (body, error, error_type) = if small {
+        let bytes = axum::body::to_bytes(body, MAX_ERROR_BODY_BYTES)
+            .await
+            .unwrap_or_default();
+        let (error, error_type) = error_from_body(&bytes);
+        (Body::from(bytes), error, error_type)
+    } else {
+        (body, String::new(), String::new())
+    };
     let record = Rejection {
         context_id: &context_id,
         route_surface: surface,
         api_surface,
         server_tools,
         model_name: &model_name,
-        service_tier: &service_tier,
         http_status,
         error: &error,
         error_type: &error_type,
@@ -175,7 +213,7 @@ pub async fn layer(
         context_id = %context_id,
         "Inference request log line (frontend rejection): {api_surface} {http_status}"
     );
-    Response::from_parts(parts, Body::from(bytes))
+    Response::from_parts(parts, body)
 }
 
 fn header_string(headers: &HeaderMap, name: &str) -> String {
@@ -203,7 +241,6 @@ struct Rejection<'a> {
     api_surface: &'static str,
     server_tools: bool,
     model_name: &'a str,
-    service_tier: &'a str,
     http_status: u16,
     error: &'a str,
     error_type: &'a str,
@@ -248,7 +285,8 @@ impl Rejection<'_> {
             "org_namespace": org_namespace,
             "model_version_id": model_version_id,
             "model_name": self.model_name,
-            "service_tier": self.service_tier,
+            "image_git_sha": IMAGE.0.as_str(),
+            "backend": IMAGE.1.as_str(),
             "error": self.error,
             "error_type": self.error_type,
         });
@@ -289,7 +327,13 @@ mod tests {
                 "/v1/messages",
                 post(move |headers: HeaderMap| async move {
                     if dispatch {
-                        mark_dispatched(&get_or_create_context_id(&headers));
+                        // What the generate sites see when the processor raised after logging.
+                        let result: anyhow::Result<()> = Err(anyhow::Error::new(HttpError {
+                            code: status.as_u16(),
+                            message: "from the processor".into(),
+                        })
+                        .context("Failed to generate completions"));
+                        mark_if_engine_saw(&get_or_create_context_id(&headers), &result);
                     }
                     (status, r#"{"message":"nope","type":"Overload"}"#)
                 }),
@@ -339,6 +383,8 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 true,
             ),
+            // KV-backpressure 429 the processor already logged: no second record.
+            ("skip-processor-429", StatusCode::TOO_MANY_REQUESTS, true),
             ("skip-200", StatusCode::OK, false),
         ] {
             b10_call(
@@ -431,7 +477,6 @@ mod tests {
             api_surface: COMPLETIONS,
             server_tools: false,
             model_name: "",
-            service_tier: "flex",
             http_status: 429,
             error: "Too many requests",
             error_type: "Overload",
@@ -453,7 +498,6 @@ mod tests {
                 "context_id": "org-abc--deadbeef--none",
                 "b10_request_id": "deadbeef",
                 "org_namespace": "org-abc",
-                "service_tier": "flex",
                 "error": "Too many requests",
                 "error_type": "Overload",
             })
@@ -519,5 +563,40 @@ mod tests {
         let (status, _) = b10_call(router, &pairs).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!take_dispatched(&context_id), "layer must consume the mark");
+    }
+
+    #[test]
+    fn b10_engine_saw_ok_and_processor_errors_only() {
+        let processor = || {
+            anyhow::Error::new(HttpError {
+                code: 400,
+                message: "bad".into(),
+            })
+        };
+        assert!(engine_saw(&Ok(())));
+        assert!(engine_saw::<()>(&Err(processor())));
+        assert!(engine_saw::<()>(&Err(processor().context("wrapped"))));
+        assert!(!engine_saw::<()>(&Err(anyhow::anyhow!("no instances"))));
+    }
+
+    #[tokio::test]
+    async fn b10_layer_passes_large_or_unsized_error_bodies_through() {
+        let big = "x".repeat(MAX_ERROR_BODY_BYTES + 1);
+        let expected = big.clone();
+        let router = Router::new()
+            .route(
+                "/v1/messages",
+                post(move || {
+                    let big = big.clone();
+                    async move { (StatusCode::BAD_REQUEST, big) }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(MESSAGES, layer));
+        let (status, body) = b10_call(router, &[("x-baseten-request-id", "big-body")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, expected, "client keeps the full body");
+        let records = b10_emitted("big-body");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].get("error").is_none(), "{:?}", records[0]);
     }
 }
