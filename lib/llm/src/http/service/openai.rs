@@ -677,6 +677,7 @@ async fn completions_single(
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         err_response
     })?;
+    super::b10_request_log::mark_dispatched(&request_id);
 
     let worker_info = take_worker_response_metadata(&request_id);
     let ctx = stream.context();
@@ -851,6 +852,7 @@ async fn completions_batch(
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
             err_response
         })?;
+        super::b10_request_log::mark_dispatched(request.id());
 
         // Capture context from first stream
         if first_ctx.is_none() {
@@ -2519,7 +2521,13 @@ pub fn completions_router(
     let path = path.unwrap_or("/v1/completions".to_string());
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
-        .route(&path, post(handler_completions))
+        .route(
+            &path,
+            super::b10_request_log::route(
+                post(handler_completions),
+                super::b10_request_log::COMPLETIONS,
+            ),
+        )
         .layer(middleware::from_fn(smart_json_error_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state(state);
@@ -2536,7 +2544,13 @@ pub fn chat_completions_router(
     let path = path.unwrap_or("/v1/chat/completions".to_string());
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
-        .route(&path, post(handler_chat_completions))
+        .route(
+            &path,
+            super::b10_request_log::route(
+                post(handler_chat_completions),
+                super::b10_request_log::CHAT_COMPLETIONS,
+            ),
+        )
         .layer(middleware::from_fn(smart_json_error_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state((state, template));
@@ -2646,7 +2660,13 @@ pub fn responses_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let input_tokens_doc = RouteDoc::new(axum::http::Method::POST, &input_tokens_path);
     let router = Router::new()
-        .route(&path, post(handler_responses))
+        .route(
+            &path,
+            super::b10_request_log::route(
+                post(handler_responses),
+                super::b10_request_log::RESPONSES,
+            ),
+        )
         .route(&input_tokens_path, post(handler_responses_input_tokens))
         .layer(middleware::from_fn(smart_json_error_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))

@@ -343,7 +343,10 @@ pub(crate) async fn generate(
     request: Context<NvCreateChatCompletionRequest>,
 ) -> anyhow::Result<Generated> {
     let Ok(inspection) = request.get::<Inspection>(KEY) else {
-        return Ok(Generated::Stream(engine.generate(request).await?));
+        let context_id = request.id().to_string();
+        let stream = engine.generate(request).await?;
+        super::b10_request_log::mark_dispatched(&context_id);
+        return Ok(Generated::Stream(stream));
     };
     let hook = inspection
         .hook

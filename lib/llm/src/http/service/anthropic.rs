@@ -76,7 +76,13 @@ pub fn anthropic_messages_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let count_doc = RouteDoc::new(axum::http::Method::POST, &count_tokens_path);
     let router = Router::new()
-        .route(&path, post(handler_anthropic_messages))
+        .route(
+            &path,
+            super::b10_request_log::route(
+                post(handler_anthropic_messages),
+                super::b10_request_log::MESSAGES,
+            ),
+        )
         .route(&count_tokens_path, post(handler_count_tokens))
         .layer(middleware::from_fn(anthropic_error_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))

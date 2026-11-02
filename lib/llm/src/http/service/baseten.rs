@@ -295,6 +295,7 @@ pub(crate) fn insert_baseten_context_metadata(
     if !extras.user_id.is_empty() {
         metadata.insert(USER_ID_METADATA_KEY.into(), extras.user_id);
     }
+    super::b10_request_log::insert_api_surface_metadata(metadata, headers);
 }
 
 /// Header value as `&str`, treating a present-but-empty value as absent so the

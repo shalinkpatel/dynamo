@@ -1208,6 +1208,14 @@ Validation:
 Confirm Prometheus scrape output, dashboard metric names, router selection trace
 attributes, and OTel behavior with and without explicit log exporter settings.
 
+Per-request accounting (`lib/llm/src/http/service/b10_request_log.rs`): a route
+layer on chat/completions/responses/messages stamps `baseten.api_surface` (and
+`baseten.server_tools` from tool-bank's `x-baseten-client-api`) into context
+metadata before translation, and writes the `dynamo` model-log record
+(`stage=frontend`) for error responses the engine never accepted. Hooks: one
+`mark_dispatched` after each successful `generate`, the layer in the four
+routers, one call in `insert_baseten_context_metadata`.
+
 ## PATCH-006: OpenAI, Anthropic, and Baseten Protocol Compatibility
 
 Status: `mixed`
