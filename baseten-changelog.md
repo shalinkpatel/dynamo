@@ -1872,7 +1872,7 @@ default, with a short legacy reader fallback during the reader-first rollout ([#
 `DYN_COORDINATOR_DUAL_WRITE_TOKENS` optionally retains identical legacy IDs in Rust generation/bid senders, cached on first use ([#1172](https://github.com/basetenlabs/dynamo/pull/1172), keep).
 
 Each response frame adds a typed, cumulative `TokenUsage` snapshot with optional input,
-cached, and output counts; prefill cache counts survive decode-side zeros ([#1162](https://github.com/basetenlabs/dynamo/pull/1162), keep).
+cached, and output counts; usage-free prefill handoffs fall back to decode counts ([#1162](https://github.com/basetenlabs/dynamo/pull/1162), [#1174](https://github.com/basetenlabs/dynamo/pull/1174), keep).
 
 Remote-mode frontends strip dedicated API prefixes and restore them on coordinator URLs;
 unprefixed requests retain the configured URL ([#1159](https://github.com/basetenlabs/dynamo/pull/1159), keep).

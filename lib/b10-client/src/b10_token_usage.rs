@@ -17,7 +17,6 @@ pub(crate) struct TokenUsageTracker {
     // Worker-reported counters; visible output deltas are tracked separately.
     usage: TokenUsageV1,
     prefill_first: bool,
-    seen_prefill: bool,
     visible_output_tokens: Option<u64>,
 }
 
@@ -41,23 +40,20 @@ impl TokenUsageTracker {
             return;
         };
         let completion = &data["completion_usage"];
-        // GenerationCoordinator emits the prefill response before decode chunks,
-        // after collecting late completion metrics on empty-token handoffs.
-        if !self.prefill_first || !self.seen_prefill {
-            if let Some(count) = data["input_tokens"]
-                .as_u64()
-                .or_else(|| data["prompt_tokens"].as_u64())
-                .or_else(|| completion["prompt_tokens"].as_u64())
-            {
-                self.usage.input_tokens = Some(count);
-            }
-            if let Some(count) = data["cached_tokens"]
-                .as_u64()
-                .or_else(|| completion["prompt_tokens_details"]["cached_tokens"].as_u64())
-            {
-                self.usage.cached_tokens = Some(count);
-            }
-            self.seen_prefill = true;
+        let input = data["input_tokens"]
+            .as_u64()
+            .or_else(|| data["prompt_tokens"].as_u64())
+            .or_else(|| completion["prompt_tokens"].as_u64());
+        let cached = data["cached_tokens"]
+            .as_u64()
+            .or_else(|| completion["prompt_tokens_details"]["cached_tokens"].as_u64());
+        // Prefill counts win, but a usage-free prefill handoff (SGLang disagg
+        // bootstrap) must not hide the decode leg's counts.
+        if !self.prefill_first || self.usage.input_tokens.is_none() {
+            self.usage.input_tokens = input.or(self.usage.input_tokens);
+        }
+        if !self.prefill_first || self.usage.cached_tokens.is_none() {
+            self.usage.cached_tokens = cached.or(self.usage.cached_tokens);
         }
 
         // Count visible token deltas across both legs, including a prefill token.

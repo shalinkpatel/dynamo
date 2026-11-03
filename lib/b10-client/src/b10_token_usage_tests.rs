@@ -47,26 +47,27 @@ fn b10_usage_accepts_late_counts_and_retains_them() {
 }
 
 #[test]
-fn b10_disagg_preserves_prefill_counts_and_counts_all_choices() {
-    for cached_tokens in [None, Some(0), Some(7)] {
+fn b10_disagg_keeps_prefill_counts_and_fills_missing_ones() {
+    for (prefill, decode, want) in [
+        (
+            json!({"token_ids": [], "disaggregated_params": {}}),
+            json!({"completion_usage": {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 7}}}),
+            (Some(10_u64), Some(7_u64), Some(0_u64)),
+        ),
+        (
+            json!({"input_tokens": 10, "cached_tokens": 0}),
+            json!({"completion_usage": {"prompt_tokens": 11, "prompt_tokens_details": {"cached_tokens": 7}},
+                "outputs": [{"token_ids_diff": [11]}, {"token_ids_diff": [12, 13]}]}),
+            (Some(10_u64), Some(0_u64), Some(3_u64)),
+        ),
+    ] {
         let mut tracker = TokenUsageTracker::new(true);
-        b10_observe(
-            &mut tracker,
-            json!({
-                "input_tokens": 10, "cached_tokens": cached_tokens,
-                "outputs": [{"token_ids_diff": [11]}]
-            }),
+        b10_observe(&mut tracker, prefill);
+        let usage = b10_observe(&mut tracker, decode);
+        assert_eq!(
+            (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
+            want
         );
-        let usage = b10_observe(
-            &mut tracker,
-            json!({
-                "input_tokens": 11, "cached_tokens": 0, "output_tokens": 99,
-                "outputs": [{"token_ids_diff": [12]}, {"token_ids_diff": [13, 14]}]
-            }),
-        );
-        assert_eq!(usage.input_tokens, Some(10));
-        assert_eq!(usage.cached_tokens, cached_tokens);
-        assert_eq!(usage.output_tokens, Some(4));
     }
 }
 
