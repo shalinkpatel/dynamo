@@ -42,6 +42,8 @@ pub struct LocalCoordinatorOptions {
     pub mark_timing: PrefillMarkTiming,
     pub block_size: u32,
     pub machine_id: u64,
+    /// Native generation callbacks for the selected sending or serving boundary.
+    pub observer: Option<Arc<dyn crate::GenerationObserverFactory>>,
 }
 
 struct LocalCoordinator {
@@ -93,7 +95,10 @@ impl GenerationCoordinatorClient for LocalCoordinator {
     fn worker_loads(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
         Box::pin(async { self.start().await?.worker_loads().await })
     }
-    fn generate(
+    fn observer(&self) -> Option<&dyn crate::GenerationObserverFactory> {
+        self.options.observer.as_deref()
+    }
+    fn generate_inner(
         &self,
         context: RequestContext,
         request: GenerationRequest,
@@ -215,14 +220,15 @@ impl GenerationCoordinatorRuntime {
                     .namespace(namespace.context(
                         "namespace is required for configured remote coordinator mode",
                     )?)?;
-                (
-                    Arc::new(RemoteGenerationCoordinator::from_runtime_config(
-                        config,
-                        Some(&namespace),
-                        default_remote,
-                    )?),
-                    None,
-                )
+                let mut remote = RemoteGenerationCoordinator::from_runtime_config(
+                    config,
+                    Some(&namespace),
+                    default_remote,
+                )?;
+                if let Some(observer) = options.observer {
+                    remote = remote.with_observer(observer);
+                }
+                (Arc::new(remote), None)
             } else {
                 let local = Arc::new(LocalCoordinator {
                     options,
@@ -239,18 +245,37 @@ impl GenerationCoordinatorRuntime {
     }
 
     pub fn remote(backends: BTreeMap<String, String>) -> Result<Self> {
+        Self::remote_with_optional_observer(backends, None)
+    }
+
+    /// Construct a remote-only runtime with native sending-side callbacks.
+    pub fn remote_with_observer(
+        backends: BTreeMap<String, String>,
+        observer: Arc<dyn crate::GenerationObserverFactory>,
+    ) -> Result<Self> {
+        Self::remote_with_optional_observer(backends, Some(observer))
+    }
+
+    fn remote_with_optional_observer(
+        backends: BTreeMap<String, String>,
+        observer: Option<Arc<dyn crate::GenerationObserverFactory>>,
+    ) -> Result<Self> {
         let settings = GenerationCoordinatorConfig {
             remotes: Some(backends),
             ..Default::default()
         };
         settings.validate()?;
+        let mut client = RemoteGenerationCoordinator::from_config(ConfigReader::in_memory(
+            baseten_configmap::UnifiedConfig {
+                generation_coordinator: settings,
+                ..Default::default()
+            },
+        ))?;
+        if let Some(observer) = observer {
+            client = client.with_observer(observer);
+        }
         Ok(Self {
-            client: Arc::new(RemoteGenerationCoordinator::from_config(
-                ConfigReader::in_memory(baseten_configmap::UnifiedConfig {
-                    generation_coordinator: settings,
-                    ..Default::default()
-                }),
-            )?),
+            client: Arc::new(client),
             local: None,
             listener: None,
         })
@@ -358,6 +383,116 @@ mod tests {
     use baseten_configmap::UnifiedConfig;
     use dynamo_runtime::{Runtime, distributed::DistributedConfig};
 
+    #[derive(Clone, Default)]
+    struct Lifecycle {
+        begins: Arc<std::sync::atomic::AtomicUsize>,
+        ends: Arc<std::sync::Mutex<Vec<crate::GenerationObservationEnd>>>,
+    }
+    impl crate::GenerationObserverFactory for Lifecycle {
+        fn begin(
+            &self,
+            _: &RequestContext,
+            _: &GenerationRequest,
+        ) -> Result<Box<dyn crate::GenerationObserver>> {
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Box::new(self.clone()))
+        }
+    }
+    impl crate::GenerationObserver for Lifecycle {
+        fn on_finish(&mut self, end: crate::GenerationObservationEnd) {
+            self.ends.lock().unwrap().push(end);
+        }
+    }
+
+    #[tokio::test]
+    async fn b10_observer_starts_before_runtime_setup_in_both_modes() {
+        use crate::GenerationObservationEnd::{Denied, Dropped};
+        use dynamo_runtime::pipeline::{AsyncEngineContext, context::Controller};
+        let runtime = DistributedRuntime::new(
+            Runtime::from_current().unwrap(),
+            DistributedConfig::process_local(),
+        )
+        .await
+        .unwrap();
+        let endpoint = runtime
+            .namespace("observer")
+            .unwrap()
+            .component("worker")
+            .unwrap()
+            .endpoint("generate");
+        for mode in ["local", "configured_remote", "remote_only"] {
+            let remote = mode != "local";
+            let lifecycle = Lifecycle::default();
+            let options = LocalCoordinatorOptions {
+                primary_worker: CoordinatorClient::Endpoint(endpoint.clone()),
+                primary_router: CoordinatorClient::Endpoint(endpoint.clone()),
+                next_worker: None,
+                next_router: None,
+                strategy: DisaggregationStrategy::Aggregated,
+                mark_timing: PrefillMarkTiming::AfterPrefillCompute,
+                block_size: 32,
+                machine_id: 1,
+                observer: Some(Arc::new(lifecycle.clone())),
+            };
+            let coordinator = if mode == "remote_only" {
+                GenerationCoordinatorRuntime::remote_with_observer(
+                    BTreeMap::from([("test".into(), "http://127.0.0.1:1/v1/coordinate".into())]),
+                    Arc::new(lifecycle.clone()),
+                )
+                .unwrap()
+            } else {
+                GenerationCoordinatorRuntime::with_default_remote(
+                    runtime.clone(),
+                    options,
+                    ConfigReader::in_memory(UnifiedConfig::default()),
+                    Some("observer".into()),
+                    Some(remote),
+                    remote.then(|| "http://127.0.0.1:1/v1/coordinate".into()),
+                )
+                .unwrap()
+            };
+            let request = || GenerationRequest {
+                routing_request: crate::RouterRequestNew {
+                    tokens: vec![1, 2],
+                    ..Default::default()
+                },
+                primary_worker_request: rmpv::Value::Nil,
+                decode_worker_request: None,
+            };
+            let inner: Arc<dyn AsyncEngineContext> =
+                Arc::new(Controller::new("observer-runtime".into()));
+            let context = RequestContext::new(inner.clone(), None, Default::default());
+            let future = coordinator.generate(context.clone(), request(), Default::default());
+            assert_eq!(
+                lifecycle.begins.load(std::sync::atomic::Ordering::Relaxed),
+                1
+            );
+            if let Some(local) = &coordinator.local {
+                assert!(local.ready.get().is_none());
+            }
+            drop(future);
+            assert_eq!(*lifecycle.ends.lock().unwrap(), vec![Dropped]);
+            if !remote {
+                inner.stop_generating();
+                assert!(matches!(
+                    coordinator
+                        .generate(context, request(), Default::default())
+                        .await
+                        .unwrap(),
+                    GenerationOutcome::Denied(_)
+                ));
+                assert_eq!(
+                    lifecycle.begins.load(std::sync::atomic::Ordering::Relaxed),
+                    2
+                );
+                assert_eq!(*lifecycle.ends.lock().unwrap(), vec![Dropped, Denied]);
+                assert!(coordinator.local.as_ref().unwrap().ready.get().is_none());
+            }
+        }
+        runtime.shutdown();
+    }
+
     #[tokio::test]
     async fn startup_fixes_mode_and_listener_until_runtime_shutdown() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -382,6 +517,7 @@ mod tests {
                 mark_timing: PrefillMarkTiming::AfterPrefillCompute,
                 block_size: 32,
                 machine_id: 1,
+                observer: None,
             };
             let reader = ConfigReader::in_memory(UnifiedConfig::default());
             let new = |force, namespace, default_remote| {

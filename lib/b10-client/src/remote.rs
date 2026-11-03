@@ -60,6 +60,7 @@ impl std::error::Error for RemoteStatusError {}
 pub struct RemoteGenerationCoordinator {
     endpoints: RemoteEndpoints,
     client: Client,
+    observer: Option<Arc<dyn crate::GenerationObserverFactory>>,
 }
 
 impl RemoteGenerationCoordinator {
@@ -71,6 +72,7 @@ impl RemoteGenerationCoordinator {
         Ok(Self {
             endpoints: RemoteEndpoints::Fixed(endpoint),
             client: Client::new(),
+            observer: None,
         })
     }
 
@@ -91,7 +93,18 @@ impl RemoteGenerationCoordinator {
             namespace,
             default_remote,
         )?));
-        Ok(Self { endpoints, client })
+        Ok(Self {
+            endpoints,
+            client,
+            observer: None,
+        })
+    }
+
+    /// Configure native sending-side callbacks. Use distinct metric names or
+    /// labels when observing both ends of a remote request.
+    pub fn with_observer(mut self, observer: Arc<dyn crate::GenerationObserverFactory>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     async fn generate_remote(
@@ -309,7 +322,10 @@ impl GenerationCoordinatorClient for RemoteGenerationCoordinator {
             }
         })
     }
-    fn generate(
+    fn observer(&self) -> Option<&dyn crate::GenerationObserverFactory> {
+        self.observer.as_deref()
+    }
+    fn generate_inner(
         &self,
         context: RequestContext,
         request: GenerationRequest,

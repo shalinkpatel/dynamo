@@ -279,3 +279,40 @@ still prefer the byte buffer. The flag defaults off and is cached by `OnceLock`
 on first use, so changing it requires restarting the process. It does not affect
 Alyx/Go senders. Once old writers have drained, remove the legacy field and
 reserve its tag and name in a follow-up.
+
+
+Native generation metrics and other observation are optional side effects of
+`GenerationCoordinatorClient::generate`. Implement `GenerationObserverFactory`
+in the consumer (for example, an adapter to a Rust metrics library) and supply
+an `Arc<dyn GenerationObserverFactory>` on the client:
+
+```rust,ignore
+let remote = RemoteGenerationCoordinator::new(endpoint)?
+    .with_observer(metrics_callbacks);
+let outcome = remote.generate(context, request, options).await?;
+```
+
+`LocalCoordinatorOptions::observer` configures the same callbacks on the runtime's
+selected boundary: local mode observes the receiving/serving coordinator, and
+remote mode observes the sending client. Remote-only runtimes can use
+`GenerationCoordinatorRuntime::remote_with_observer`; the existing `remote`
+constructor keeps observation disabled. Configure each process separately to
+observe both ends, with distinct metric names or labels to avoid double counts.
+Callbacks default to disabled. This API has no dependency on a metrics library
+and adds no Python callbacks; the consumer owns metric names, labels and export.
+
+The factory's `begin` runs before `generate_inner` is called, before coordinator
+startup, routing, admission, or remote dispatch, even if the setup future is
+never polled. Receiving-side HTTP decoding/validation precedes this boundary.
+Observers receive admission or denial, borrowed stream items, and setup errors,
+then finalize exactly once on stream closure or drop, including unpolled futures
+and streams. A setup error in the observer is logged and generation proceeds
+without observation, preserving its stream, denial, or error. A closed stream
+does not itself imply successful generation; the observer interprets terminal
+worker messages.
+
+Callbacks run inline and must not block, panic, or enter Python. The hook does
+not queue work or clone stream payloads; consumers control the cost of recording.
+Incremental callback overhead has not been benchmarked. Implementors provide
+coordinator dispatch in `generate_inner`; callers continue using `generate`.
+Startup, bids, and load queries do not create observations.

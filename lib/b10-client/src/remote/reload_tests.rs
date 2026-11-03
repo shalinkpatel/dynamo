@@ -70,7 +70,7 @@ impl GenerationCoordinatorClient for Backend {
             }])
         })
     }
-    fn generate(
+    fn generate_inner(
         &self,
         context: RequestContext,
         request: GenerationRequest,

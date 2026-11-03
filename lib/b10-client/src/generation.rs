@@ -534,7 +534,39 @@ pub trait GenerationCoordinatorClient: Send + Sync {
     fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<WorkerLoad>>> {
         Box::pin(async { bail!("worker loads are not supported by this coordinator") })
     }
+    /// Optional native callbacks. Resolve the factory once per attempt; chunk
+    /// callbacks run inline without Python or an asynchronous callback queue.
+    fn observer(&self) -> Option<&dyn crate::GenerationObserverFactory> {
+        None
+    }
+
+    /// Start one attempt, observing setup and the returned stream when enabled.
+    /// Observer setup errors are logged and never prevent generation dispatch.
     fn generate(
+        &self,
+        context: RequestContext,
+        request: GenerationRequest,
+        options: GenerationOptions,
+    ) -> BoxFuture<'_, Result<GenerationOutcome>> {
+        let Some(factory) = self.observer() else {
+            return self.generate_inner(context, request, options);
+        };
+        let observer = match factory.begin(&context, &request) {
+            Ok(observer) => crate::b10_observer::ObserverGuard::new(observer),
+            Err(error) => {
+                tracing::warn!(%error, "generation observer setup failed; continuing without observation");
+                return self.generate_inner(context, request, options);
+            }
+        };
+        crate::b10_observer::observe_generation(
+            observer,
+            self.generate_inner(context, request, options),
+        )
+    }
+
+    /// Implement dispatch here and leave `generate` at its default implementation
+    /// so the observer lifecycle applies to every trait-client call.
+    fn generate_inner(
         &self,
         context: RequestContext,
         request: GenerationRequest,
@@ -552,7 +584,7 @@ impl GenerationCoordinatorClient for GenerationCoordinator {
     fn worker_loads(&self) -> BoxFuture<'_, Result<Vec<WorkerLoad>>> {
         Box::pin(GenerationCoordinator::worker_loads(self))
     }
-    fn generate(
+    fn generate_inner(
         &self,
         context: RequestContext,
         request: GenerationRequest,

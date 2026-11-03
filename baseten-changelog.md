@@ -1114,6 +1114,8 @@ fails without #906.
 
 Status: `keep`
 
+Native coordinator callbacks (#1181): keep optional sending/serving observers before routing, with stream-owned finalization and observer setup errors leaving generation unaffected.
+
 Source commits:
 
 - `40b1a7aed` feat: add kv_router.select_worker tracing event with routing metrics (#153)

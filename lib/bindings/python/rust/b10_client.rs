@@ -237,6 +237,7 @@ impl GenerationCoordinator {
         let machine_id =
             disagg_request_id_machine_id.unwrap_or_else(|| runtime.inner().connection_id());
         let options = LocalCoordinatorOptions {
+            observer: None,
             primary_worker: coordinator_client(primary_worker_client, runtime)?,
             primary_router: coordinator_client(primary_router_client, runtime)?,
             next_worker: next_worker_client

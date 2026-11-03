@@ -292,7 +292,7 @@ mod tests {
     }
 
     impl GenerationCoordinatorClient for CapturingCoordinator {
-        fn generate(
+        fn generate_inner(
             &self,
             context: RequestContext,
             request: GenerationRequest,
