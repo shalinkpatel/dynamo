@@ -1477,6 +1477,13 @@ client order. Already on main-v1.2.0 and NOT changed here: non-terminal
 `finish_reason` omission, string `error.code`, `document`/`search_result`
 tool_result blocks. Baseten-specific; not upstreamable.
 
+Responses input also replays Codex's id-less `custom_tool_call` /
+`local_shell_call` (and their outputs): the api-translation parse normalizes
+them to the `function_call` / `function_call_output` shape first (upstream's
+vendored structs require `id`, so the typed parse 400d the request), matching
+the declaration-side flattening that shows these tools to the model as
+functions (#1168).
+
 Chat-wire admission for deferred tool loading: `ChatCompletionTool` gains
 tool-level `defer_loading` and the shared request content-part enum gains a
 `tool_reference` part (`{"type": "tool_reference", "tool_name": ...}`), so

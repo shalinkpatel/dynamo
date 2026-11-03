@@ -1742,6 +1742,48 @@ impl Default for ResponsesInput {
     }
 }
 
+/// Codex replays `custom_tool_call`/`local_shell_call` (and their outputs) without the `id` the
+/// vendored structs require, so the typed parse 400s the whole request. Declaration flattening
+/// already shows these tools to the model as functions, so their echoes parse as the function
+/// shape: `input` becomes `arguments`, the shell `action` its JSON string, and a
+/// `local_shell_call_output`'s `id` its `call_id`.
+fn function_call_shaped_item(mut item: Value) -> Value {
+    let Some(object) = item.as_object_mut() else {
+        return item;
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("custom_tool_call") => {
+            object.insert("type".into(), "function_call".into());
+            if let Some(input) = object.remove("input") {
+                object.insert("arguments".into(), input);
+            }
+        }
+        Some("local_shell_call") => {
+            object.insert("type".into(), "function_call".into());
+            let arguments = object.get("action").map_or_else(
+                || Value::String(String::new()),
+                |a| Value::String(a.to_string()),
+            );
+            object.remove("action");
+            object.insert("arguments".into(), arguments);
+            object
+                .entry("name")
+                .or_insert_with(|| Value::String("local_shell".to_string()));
+        }
+        Some("custom_tool_call_output") => {
+            object.insert("type".into(), "function_call_output".into());
+        }
+        Some("local_shell_call_output") => {
+            object.insert("type".into(), "function_call_output".into());
+            if let Some(id) = object.remove("id") {
+                object.entry("call_id").or_insert(id);
+            }
+        }
+        _ => {}
+    }
+    item
+}
+
 /// Dispatch on `type`, as the spec's `InputItem` discriminator does. Untagged, `ItemReference`
 /// comes first and needs only `id`, so it absorbs every typeless message with an `id`; and the
 /// tagged `Item` arm needs `type`, so a typeless assistant message with `output_text` parts
@@ -1750,6 +1792,7 @@ fn parse_responses_input_item(
     enclosing_member: &str,
     item: Value,
 ) -> Result<InputItem, RequestRejection> {
+    let item = function_call_shaped_item(item);
     match item.get("type").and_then(Value::as_str) {
         Some("item_reference") => {
             parse_client_json(ClientProtocol::Responses, enclosing_member, item)

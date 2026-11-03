@@ -1398,6 +1398,63 @@ fn adapt_responses_malformed_replayed_call_is_not_refused() {
     assert_eq!(out[3]["role"], "user");
 }
 
+/// Codex replays custom-tool history without the `id` upstream's `CustomToolCall` requires.
+/// The echo parses as a function call (declaration flattening showed the model a function), and
+/// freeform `input` rides `arguments` verbatim like any non-JSON echo.
+#[test]
+fn adapt_responses_id_less_custom_tool_call_replays_as_function_call() {
+    let out = responses_input(json!([
+        {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"},
+        {"type": "custom_tool_call_output", "call_id": "c1", "output": "patched"},
+    ]));
+    assert_eq!(out[0]["role"], "assistant");
+    assert_eq!(out[0]["tool_calls"][0]["id"], "c1");
+    assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "apply_patch");
+    assert_eq!(
+        out[0]["tool_calls"][0]["function"]["arguments"],
+        "*** Begin Patch\n*** End Patch"
+    );
+    assert_eq!(
+        out[1],
+        json!({"role": "tool", "tool_call_id": "c1", "content": "patched"})
+    );
+}
+
+/// The upstream-shaped item (with `id`) takes the same path; the id is not required either way.
+#[test]
+fn adapt_responses_custom_tool_call_with_id_also_replays() {
+    let out = responses_input(json!([
+        {"type": "custom_tool_call", "id": "ctc_1", "call_id": "c1", "name": "apply_patch", "input": "{}"},
+        {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"},
+    ]));
+    assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "apply_patch");
+    assert_eq!(
+        out[1],
+        json!({"role": "tool", "tool_call_id": "c1", "content": "ok"})
+    );
+}
+
+/// `local_shell_call` replays id-less the same way: the call echoes as a `local_shell` function
+/// call with the exec action as its JSON arguments, and the output correlates on its `id`.
+#[test]
+fn adapt_responses_id_less_local_shell_call_replays_as_function_call() {
+    let out = responses_input(json!([
+        {"type": "local_shell_call", "call_id": "s1", "action": {"type": "exec", "command": ["ls", "-la"]}, "status": "completed"},
+        {"type": "local_shell_call_output", "id": "s1", "output": "total 0"},
+    ]));
+    assert_eq!(out[0]["role"], "assistant");
+    assert_eq!(out[0]["tool_calls"][0]["id"], "s1");
+    assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "local_shell");
+    assert_eq!(
+        out[0]["tool_calls"][0]["function"]["arguments"],
+        json!({"type": "exec", "command": ["ls", "-la"]}).to_string()
+    );
+    assert_eq!(
+        out[1],
+        json!({"role": "tool", "tool_call_id": "s1", "content": "total 0"})
+    );
+}
+
 /// The openai/codex SDKs send `tool_choice: "auto"` unconditionally, even with no tools declared —
 /// forwarded as-is, model backends 400 with "When using `tool_choice`, `tools` must be set."
 #[test]
