@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tokio_util::io::StreamReader;
 
+mod b10_served_model_name;
 mod pool;
 mod scoring;
 use pool::RemotePool;
@@ -100,8 +101,14 @@ impl RemoteGenerationCoordinator {
         options: GenerationOptions,
     ) -> Result<GenerationOutcome> {
         validate_remote_options(&options)?;
+        let served_model_name =
+            b10_served_model_name::from_worker_request(&request.primary_worker_request);
         let mut wire_request = encode_request(&context, request)?;
         let mut headers = forwarded_headers::take(&mut wire_request.metadata)?;
+        headers.remove(b10_served_model_name::HEADER);
+        if let Some(name) = served_model_name {
+            headers.insert(b10_served_model_name::HEADER, name);
+        }
         // Nest the remote's spans under this frontend's, not beside it under the caller's.
         if let Some(trace) = context.trace_context() {
             headers.insert("traceparent", trace.create_traceparent().parse()?);
@@ -501,11 +508,13 @@ mod tests {
     #[tokio::test]
     async fn remote_client_sends_typed_request_and_streams_framed_response() {
         for session_id in [Some("session-a"), None] {
-            b10_remote_client_roundtrip(session_id).await;
+            for model in [Some("test-model"), None] {
+                b10_remote_client_roundtrip(session_id, model).await;
+            }
         }
     }
 
-    async fn b10_remote_client_roundtrip(session_id: Option<&str>) {
+    async fn b10_remote_client_roundtrip(session_id: Option<&str>, model: Option<&str>) {
         let first_chunk = Annotated::from_data(value(serde_json::json!({"token": 17})));
         let second_chunk = Annotated::from_data(value(serde_json::json!({"finish": true})));
         let frames = [
@@ -572,16 +581,22 @@ mod tests {
                 ("tenant".to_string(), "acme".to_string()),
                 (
                     forwarded_headers::FORWARDED_HEADERS_METADATA_KEY.to_string(),
-                    serde_json::json!([[
-                        "traceparent",
-                        b"00-0123456789abcdef0123456789abcdef-1111111111111111-01".to_vec()
-                    ],])
+                    serde_json::json!([
+                        [
+                            "traceparent",
+                            b"00-0123456789abcdef0123456789abcdef-1111111111111111-01".to_vec()
+                        ],
+                        [
+                            b10_served_model_name::HEADER,
+                            b"client-supplied-model".to_vec()
+                        ]
+                    ])
                     .to_string(),
                 ),
             ]),
         );
         let mut worker_request = value(serde_json::json!({
-            "model": "test-model",
+            "model": model,
             "streaming": true,
             "sampling_params": {"temperature": 0.25, "max_tokens": 8},
             "dynamic_temperature_rules": [{"after": 4, "temperature": 0.1}],
@@ -669,6 +684,12 @@ mod tests {
         let (captured, headers) = captured.lock().unwrap().take().unwrap();
         assert_eq!(
             headers
+                .get(b10_served_model_name::HEADER)
+                .map(|value| value.to_str().unwrap()),
+            model
+        );
+        assert_eq!(
+            headers
                 .get("traceparent")
                 .map(|value| value.to_str().unwrap()),
             Some("00-0123456789abcdef0123456789abcdef-0123456789abcdef-01")
@@ -695,7 +716,7 @@ mod tests {
         );
         let request = captured;
         let worker: Value = rmp_serde::from_slice(&request.worker_msgpack).unwrap();
-        assert_eq!(worker["model"].as_str(), Some("test-model"));
+        assert_eq!(worker["model"].as_str(), model);
         assert!(request.tokens.is_empty());
         assert_eq!(
             request.token_buffer.as_ref().unwrap().payload.as_ref(),

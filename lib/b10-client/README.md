@@ -208,6 +208,9 @@ for the affinity scope, selection policy, and reload behavior. Call `start()` to
 initialize polling before serving requests. The single-endpoint constructor retains
 its direct HTTP path.
 
+Generation HTTP requests include `x-baseten-dynamo-served-model-name` from the
+worker payload's `model` when it is a nonempty, valid HTTP header value.
+
 The wire schema (compiled by Prost during the build) is
 [`proto/generation_coordinator.proto`](proto/generation_coordinator.proto).
 Tokens and multimodal payloads travel separately from `worker_msgpack`, an

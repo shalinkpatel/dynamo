@@ -1929,6 +1929,9 @@ and the binding mapping together when replaying.
 
 Remote coordinator header forwarding:
 
+Native coordinator requests emit `x-baseten-dynamo-served-model-name` from the
+worker payload's nonempty `model` when it is a valid HTTP header value ([#1180](https://github.com/basetenlabs/dynamo/pull/1180)).
+
 The HTTP service captures each request's incoming headers as JSON in the
 `baseten.forwarded_headers` context metadata key (`http::service::forwarded_headers`),
 excluding `Accept`, `Content-Type` and connection-specific headers while keeping
