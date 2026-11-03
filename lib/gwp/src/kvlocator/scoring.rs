@@ -77,7 +77,7 @@ impl Scorer for GwpScorer {
             None => None,
         };
         let mut ranked = model_router
-            .rank_candidates(tokens, &identity, &candidates, &worker_configs, policy)
+            .rank_candidates(&tokens, &identity, &candidates, &worker_configs, policy)
             .await?;
         let preferences = dynamo_kv_router::protocols::RoutingConstraints {
             preferred_taints: request
@@ -125,7 +125,10 @@ impl Scorer for GwpScorer {
 /// Validate the same routing input for lookup and commit.
 pub(super) fn validate_input(
     request: &pb::LocateRequest,
-) -> anyhow::Result<(&[u32], crate::tokens::RoutingTokenIdentity)> {
+) -> anyhow::Result<(
+    std::borrow::Cow<'_, [u32]>,
+    crate::tokens::RoutingTokenIdentity,
+)> {
     if request.model_id.is_empty() {
         return Err(InvalidRequest("model_id must not be empty".into()).into());
     }
@@ -143,15 +146,18 @@ pub(super) fn validate_input(
 
 pub(super) fn bid_tokens(
     request: &pb::LocateRequest,
-) -> anyhow::Result<(&[u32], crate::tokens::RoutingTokenIdentity)> {
+) -> anyhow::Result<(
+    std::borrow::Cow<'_, [u32]>,
+    crate::tokens::RoutingTokenIdentity,
+)> {
     use dynamo_kv_router::protocols::{BlockExtraInfo, BlockMmObjectInfo};
     let bid = request
         .bid
         .as_ref()
         .ok_or_else(|| InvalidRequest("bid is required".into()))?;
-    if bid.tokens.is_empty() {
-        return Err(InvalidRequest("bid tokens are required".into()).into());
-    }
+    let tokens = bid
+        .token_ids()
+        .map_err(|error| InvalidRequest(error.to_string()))?;
     let block_mm_infos = bid
         .mm_routing_args
         .as_ref()
@@ -200,7 +206,7 @@ pub(super) fn bid_tokens(
         })
         .transpose()?;
     Ok((
-        &bid.tokens,
+        tokens,
         crate::tokens::RoutingTokenIdentity {
             block_mm_infos,
             cache_salt: bid.cache_salt.clone(),
@@ -645,11 +651,22 @@ mod tests {
         router
             .record_routing_decision_with_identity(
                 "warm",
-                tokens,
+                &tokens,
                 &identity,
                 WorkerWithDpRank::new(WORKER, 0),
             )
             .await;
+        drop(tokens);
+        let bid = request.bid.as_mut().unwrap();
+        bid.token_buffer = Some(pb::Tokens {
+            payload: bid
+                .tokens
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>()
+                .into(),
+        });
+        bid.tokens.clear();
         let response = scorer.rank(&request).await.unwrap();
         let candidates = response.placements_v1.unwrap().candidates;
         assert_eq!(

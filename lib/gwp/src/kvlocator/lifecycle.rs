@@ -33,6 +33,13 @@ struct PreparedAdmission {
     router: Option<Arc<crate::router::GwpRouter>>,
 }
 
+type ValidatedCommit<'a> = (
+    &'a pb::Placement,
+    EndpointId,
+    crate::tokens::RoutingTokenIdentity,
+    std::borrow::Cow<'a, [u32]>,
+);
+
 struct CommitContext {
     model_id: String,
     endpoint: EndpointId,
@@ -121,11 +128,7 @@ impl GwpLifecycle {
     fn validate_commit<'a>(
         &self,
         request: &'a pb::CommitIntendRequest,
-    ) -> anyhow::Result<(
-        &'a pb::Placement,
-        EndpointId,
-        crate::tokens::RoutingTokenIdentity,
-    )> {
+    ) -> anyhow::Result<ValidatedCommit<'a>> {
         let input = request
             .input
             .as_ref()
@@ -135,7 +138,7 @@ impl GwpLifecycle {
         else {
             return Err(InvalidAttempt("exactly one chosen placement is required".into()).into());
         };
-        let (_, identity) = super::scoring::validate_input(input)
+        let (tokens, identity) = super::scoring::validate_input(input)
             .map_err(|error| InvalidAttempt(error.to_string()))?;
         let topology = self.core.topology.load();
         let (_, binding) = topology
@@ -151,7 +154,7 @@ impl GwpLifecycle {
             )
             .into());
         }
-        Ok((chosen, endpoint, identity))
+        Ok((chosen, endpoint, identity, tokens))
     }
 
     async fn intend_inner(&self, request: &pb::CommitIntendRequest) -> anyhow::Result<()> {
@@ -171,9 +174,8 @@ impl GwpLifecycle {
         if request.request_id.is_empty() {
             return Err(InvalidAttempt("request_id must not be empty".into()).into());
         }
-        let (chosen, endpoint, identity) = self.validate_commit(request)?;
+        let (chosen, endpoint, identity, tokens) = self.validate_commit(request)?;
         let input = request.input.as_ref().expect("validated input");
-        let tokens = &input.bid.as_ref().expect("validated bid").tokens;
         let worker = WorkerWithDpRank::new(chosen.worker_id, chosen.dp_rank);
         let session_id = input
             .bid
@@ -223,7 +225,7 @@ impl GwpLifecycle {
                 &Self::rid(&request.attempt_id),
                 &input.model_id,
                 session_id,
-                tokens.to_vec(),
+                tokens.into_owned(),
                 identity,
                 &endpoint,
                 worker,
@@ -850,8 +852,29 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn b10_commit_is_single_use_regardless_of_payload() {
         let lifecycle = make_lifecycle().await;
-        let request = commit("a1", "r1", ENDPOINT);
+        let mut request = commit("a1", "r1", ENDPOINT);
+        let bid = request.input.as_mut().unwrap().bid.as_mut().unwrap();
+        bid.token_buffer = Some(pb::Tokens {
+            payload: bid
+                .tokens
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>()
+                .into(),
+        });
+        bid.tokens.clear();
         lifecycle.intend(&request).await.unwrap();
+        assert_eq!(
+            lifecycle
+                .attempt(&request.attempt_id)
+                .lock()
+                .await
+                .commit
+                .as_ref()
+                .unwrap()
+                .tokens,
+            TOKENS,
+        );
         let created_at = lifecycle
             .attempt(&request.attempt_id)
             .lock()

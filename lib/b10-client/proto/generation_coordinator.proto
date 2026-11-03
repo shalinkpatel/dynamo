@@ -13,9 +13,20 @@ import "google/protobuf/empty.proto";
 // with unused numbers; reserve removed numbers and names. Incompatible changes
 // require a new protocol version.
 
+// Token IDs encoded as contiguous unsigned 32-bit little-endian integers.
+// payload must be nonempty and its length divisible by four. Token count is
+// payload.size / 4; no varints, native-endian casts, or tokenizer changes.
+message Tokens
+{
+  bytes payload = 1;
+}
+
 // POST /v1/bid is unary protobuf in both directions, without stream framing.
 message BidRequest
 {
+  // Legacy compatibility only. Byte-capable writers should leave this empty.
+  // Not required for admission when token_buffer is present and valid.
+  // Keep field 1 readable while older writers remain in the fleet.
   repeated uint32 tokens = 1 [packed = true];
   // Required for multimodal requests; may be omitted for text-only requests.
   optional MmRoutingArgs mm_routing_args = 2;
@@ -23,6 +34,9 @@ message BidRequest
   optional string cache_salt = 3;
   // Same key as Routing.session_id; the downstream owns affinity decisions.
   optional string session_id = 4;
+  // Preferred payload. Writers must populate this and leave legacy tokens empty.
+  // When present, readers use this payload and ignore the legacy field.
+  Tokens token_buffer = 5;
 }
 
 message BidResponse
@@ -227,6 +241,9 @@ message ResponseFinishRequest
 
 message NewRequest
 {
+  // Legacy compatibility only. Byte-capable writers should leave this empty.
+  // Not required for admission when token_buffer is present and valid.
+  // Keep field 1 readable while older writers remain in the fleet.
   repeated uint32 tokens = 1 [packed = true];
   optional MmRoutingArgs mm_routing_args = 2;
   optional Routing routing = 3;
@@ -237,6 +254,8 @@ message NewRequest
   string request_id = 6;
   optional TraceContext trace_context = 7;
   map<string, string> metadata = 8;
+  // Same migration and validation rules as BidRequest.token_buffer.
+  Tokens token_buffer = 9;
 }
 
 message Routing

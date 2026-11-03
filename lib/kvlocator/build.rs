@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../b10-client/proto/generation_coordinator.proto");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     tonic_prost_build::configure()
+        .bytes(".dynamo.b10.generation.v1.Tokens.payload")
         .btree_map(".dynamo.b10.generation.v1.NewRequest.metadata")
         .file_descriptor_set_path(out_dir.join("kvlocator_descriptor.bin"))
         .build_client(true)

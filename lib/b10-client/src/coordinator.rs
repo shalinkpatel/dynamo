@@ -119,7 +119,7 @@ impl RouterWorkerCoordinator {
         request: crate::protocol::BidRequestV1,
     ) -> Result<crate::protocol::BidResponseV1> {
         use anyhow::Context;
-        request.validate()?;
+        let request = request.into_routing_tokens()?;
         // The router RPC only models tokens/MM; salt remains
         // on the bid wire contract for future router support.
         let response = self

@@ -13,6 +13,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
+dynamo-tokens = { workspace = true }
 anyhow = { workspace = true }
 baseten-configmap = { workspace = true }
 async-stream = { workspace = true }

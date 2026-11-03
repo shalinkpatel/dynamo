@@ -258,3 +258,16 @@ has no worker chunk to reconstruct from and can be lost at an older proxy. If th
 is old, clients must accept absent `usage` and may read the original worker fields.
 Future counters can be added with new protobuf field numbers without changing the
 existing payload variants or counter semantics.
+
+Token writers use `Tokens.payload`: nonempty little-endian u32 IDs, four bytes per
+token. `NewRequest.token_buffer` (tag 9) and `BidRequest.token_buffer` (tag 5,
+including locator/commit inputs) replace legacy `tokens` (tag 1). Writers leave
+legacy tokens empty. Readers prefer the buffer and reject malformed payloads;
+they accept legacy IDs only while old writers drain. A valid buffer alone is
+sufficient for admission.
+
+Deployment order for the one-day migration: roll out readers on every decoding
+hop first, then roll out writers. This version writes byte payloads by default,
+so its client/forwarding components must only target upgraded readers. There is
+no dual-write period or old-proxy downgrade path. Once old writers have drained,
+remove the legacy field and reserve its tag and name in a follow-up.

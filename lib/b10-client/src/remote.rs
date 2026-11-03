@@ -124,7 +124,8 @@ impl RemoteGenerationCoordinator {
         let (mut endpoint, affinity) = match &self.endpoints {
             RemoteEndpoints::Pool(pool) => {
                 let bid = protocol::BidRequestV1 {
-                    tokens: wire_request.tokens.clone(),
+                    token_buffer: wire_request.token_buffer.clone(),
+                    tokens: Vec::new(),
                     mm_routing_args: wire_request.mm_routing_args.clone(),
                     cache_salt: wire_request
                         .routing
@@ -274,6 +275,7 @@ impl GenerationCoordinatorClient for RemoteGenerationCoordinator {
         request: protocol::BidRequestV1,
     ) -> BoxFuture<'_, Result<protocol::BidResponseV1>> {
         Box::pin(async {
+            let request = request.into_token_buffer()?;
             match &self.endpoints {
                 RemoteEndpoints::Fixed(endpoint) => {
                     fetch_bid(&self.client, endpoint, request).await
@@ -694,7 +696,11 @@ mod tests {
         let request = captured;
         let worker: Value = rmp_serde::from_slice(&request.worker_msgpack).unwrap();
         assert_eq!(worker["model"].as_str(), Some("test-model"));
-        assert_eq!(request.tokens, vec![1, 2, 3, 4]);
+        assert!(request.tokens.is_empty());
+        assert_eq!(
+            request.token_buffer.as_ref().unwrap().payload.as_ref(),
+            &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0],
+        );
         assert_eq!(worker["lora"].as_str(), Some("adapter-a"));
         let routing = request.routing.unwrap();
         assert_eq!(routing.session_id.as_deref(), session_id);

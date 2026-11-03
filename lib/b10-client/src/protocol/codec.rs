@@ -78,10 +78,13 @@ pub(crate) fn encode_request(
         request_id: trace.request_id.clone(),
     });
     let request = NewRequestV1 {
+        token_buffer: Some(super::TokensV1 {
+            payload: dynamo_tokens::b10_token_buffer::encode(&routing_request.tokens).into(),
+        }),
         request_id: context.id().to_string(),
         trace_context,
         metadata: context.metadata_snapshot(),
-        tokens: routing_request.tokens,
+        tokens: Vec::new(),
         mm_routing_args,
         routing: Some(RoutingV1 {
             session_id,
@@ -256,6 +259,13 @@ pub(crate) fn decode_new_request(
     request: NewRequestV1,
     strategy: DisaggregationStrategy,
 ) -> Result<GenerationRequest> {
+    let tokens = dynamo_tokens::b10_token_buffer::decode_owned(
+        request.tokens,
+        request
+            .token_buffer
+            .as_ref()
+            .map(|buffer| buffer.payload.as_ref()),
+    )?;
     let routing = request.routing.context("new_request.routing is required")?;
     let payload: Value =
         rmp_serde::from_slice(&request.worker_msgpack).context("invalid worker_msgpack")?;
@@ -273,7 +283,7 @@ pub(crate) fn decode_new_request(
     insert(
         &mut worker,
         "tokens",
-        Value::Map(vec![(Value::from("tokens"), uint_array(&request.tokens))]),
+        Value::Map(vec![(Value::from("tokens"), uint_array(&tokens))]),
     );
     // Decode needs the same generation parameters, but not the potentially
     // large multimodal input blobs consumed during prefill.
@@ -290,7 +300,7 @@ pub(crate) fn decode_new_request(
         .transpose()?;
     Ok(GenerationRequest {
         routing_request: RouterRequestNew {
-            tokens: request.tokens,
+            tokens,
             block_mm_infos,
             routing_constraints: RoutingConstraints {
                 required_taints: routing_constraints.required_taints.into_iter().collect(),

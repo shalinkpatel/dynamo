@@ -150,6 +150,7 @@ impl GenerationCoordinator {
         &self,
         request: crate::protocol::BidRequestV1,
     ) -> Result<crate::protocol::BidResponseV1> {
+        let request = request.into_routing_tokens()?;
         match self.strategy {
             DisaggregationStrategy::Aggregated => self.primary.bid(request).await,
             DisaggregationStrategy::PrefillFirst => {

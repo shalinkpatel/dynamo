@@ -2678,6 +2678,7 @@ dependencies = [
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-runtime",
+ "dynamo-tokens",
  "futures",
  "prost 0.13.5",
  "prost-build 0.13.5",
@@ -2894,6 +2895,7 @@ version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dynamo-tokens",
  "prost 0.14.3",
  "tokio",
  "tonic 0.14.5",

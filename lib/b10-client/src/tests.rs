@@ -3259,6 +3259,7 @@ async fn load_queries_http_choose_bid_without_dispatch() {
         ])
     );
     let request = BidRequestV1 {
+        token_buffer: None,
         tokens: vec![10, 20, 30],
         mm_routing_args: Some(MmRoutingArgsV1 {
             blocks: vec![

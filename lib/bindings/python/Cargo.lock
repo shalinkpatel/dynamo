@@ -2348,6 +2348,7 @@ dependencies = [
  "dynamo-kv-router",
  "dynamo-llm",
  "dynamo-runtime",
+ "dynamo-tokens",
  "futures",
  "prost 0.13.5",
  "prost-build 0.13.5",

@@ -4,6 +4,7 @@
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=proto/generation_coordinator.proto");
     prost_build::Config::new()
+        .bytes([".dynamo.b10.generation.v1.Tokens.payload"])
         .btree_map([".dynamo.b10.generation.v1.NewRequest.metadata"])
         .compile_protos(&["proto/generation_coordinator.proto"], &["proto"])
 }

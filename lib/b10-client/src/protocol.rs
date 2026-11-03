@@ -10,6 +10,7 @@
 
 use prost::Message;
 
+mod b10_token_buffer;
 pub(crate) mod codec;
 
 mod wire {
@@ -29,6 +30,7 @@ pub use wire::{
 };
 pub use wire::{
     BidRequest as BidRequestV1, BidResponse as BidResponseV1, TokenUsage as TokenUsageV1,
+    Tokens as TokensV1,
 };
 pub use wire::{
     CommitIntendRequest as CommitIntendRequestV1, LocateCandidate as LocateCandidateV1,
@@ -47,7 +49,12 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 impl BidRequestV1 {
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.tokens.is_empty(), "bid tokens are required");
+        dynamo_tokens::b10_token_buffer::validate(
+            &self.tokens,
+            self.token_buffer
+                .as_ref()
+                .map(|buffer| buffer.payload.as_ref()),
+        )?;
         if let Some(session) = &self.session_id {
             anyhow::ensure!(
                 session.len() <= dynamo_llm::session_affinity::MAX_SESSION_AFFINITY_ID_BYTES,
@@ -91,7 +98,13 @@ pub fn validate_request(request: &NewRequestV1) -> anyhow::Result<()> {
             "trace_context.span_id is required"
         );
     }
-    ensure!(!request.tokens.is_empty(), "new_request.tokens is required");
+    dynamo_tokens::b10_token_buffer::validate(
+        &request.tokens,
+        request
+            .token_buffer
+            .as_ref()
+            .map(|buffer| buffer.payload.as_ref()),
+    )?;
     ensure!(request.routing.is_some(), "new_request.routing is required");
     let routing = request.routing.as_ref().expect("checked above");
     ensure!(

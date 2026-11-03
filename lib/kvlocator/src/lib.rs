@@ -6,6 +6,8 @@
 //! GWP implements the scorer and attempt lifecycle and serves these handlers
 //! on its existing gRPC listener, using its shared readiness and accounting.
 
+mod b10_token_buffer;
+
 pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("kvlocator_descriptor");
 
 pub mod pb {
@@ -262,7 +264,7 @@ impl KVLocatorService for GrpcKVLocator {
         let scorer = self.require_scorer()?;
         let received = request.extensions().get::<ReceivedAt>().copied();
         let request = request.into_inner();
-        let tokens = request.bid.as_ref().map_or(0, |bid| bid.tokens.len());
+        let tokens = request.bid.as_ref().map_or(0, |bid| bid.token_count());
         match self
             .traced("Locate", tokens, received, scorer.rank(&request))
             .await
@@ -295,7 +297,7 @@ impl KVLocatorService for GrpcKVLocator {
             .input
             .as_ref()
             .and_then(|input| input.bid.as_ref())
-            .map_or(0, |bid| bid.tokens.len());
+            .map_or(0, |bid| bid.token_count());
         self.traced("CommitIntend", tokens, received, lifecycle.intend(&request))
             .await
             .map(|_| Response::new(()))
@@ -378,7 +380,9 @@ mod tests {
             }));
         let mut request = Request::new(pb::LocateRequest {
             bid: Some(pb::BidRequest {
-                tokens: vec![1; 300],
+                token_buffer: Some(pb::Tokens {
+                    payload: dynamo_tokens::b10_token_buffer::encode(&[1; 300]).into(),
+                }),
                 ..Default::default()
             }),
             ..Default::default()
