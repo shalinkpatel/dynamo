@@ -7,13 +7,12 @@ call `step` for each decoded text delta, and call `finish` at end of stream.
 
 The `backend` argument selects the Rust parser implementation:
 
-- `dynamo` (default) uses `dynamo-parsers-v2` 0.7.7 from
-  `michaelfeil/frontend-crates` revision
-  `79b3c206fc7af040e64572f5a630d6348d05a5b5` (the draft
-  [remaining frontend-crates fixes](https://github.com/ai-dynamo/frontend-crates/pull/301)).
+- `dynamo` (default) uses `dynamo-parsers-v2` 0.9.7 from
+  `ai-dynamo/frontend-crates` release revision
+  [`b4dbde79626e8182f78ba5abc5a6cdb962564d9a`](https://github.com/ai-dynamo/frontend-crates/commit/b4dbde79626e8182f78ba5abc5a6cdb962564d9a).
   Available families are in `UNIFIED_PARSER_FAMILIES`. Harmony (`harmony`,
   `gpt_oss`, `gpt-oss`) uses the v1 gpt-oss reasoning and Harmony tool parsers
-  from that same revision.
+  (`dynamo-parsers` 11.0.2) from that same revision.
 - `vllm` uses vLLM's native unified Rust parsers at revision
   `f84325c48c0acc1e3703103788c5f2976e719762`. Available families are in
   `VLLM_UNIFIED_PARSER_FAMILIES`. Supply a local `tokenizer.json` path with
@@ -102,7 +101,8 @@ or truncated input can fail after fragments have been emitted. Duplicate keys
 and invalid typed JSON that require rewriting prior output fail rather than
 revising committed fragments. Handle `ParserStreamError.events` explicitly.
 Guided JSON delegates to the ordinary upstream K3 parser and its configured policy.
-The existing `kimi_k3` selector keeps buffered-call behavior. This selector is
+The `kimi_k3` selector follows upstream 0.9.7, including its native argument
+streaming and recovery behavior. This selector is
 available through the Rust/Python stream adapter; serving integration remains
 owned by the caller, as for the other unified families above.
 
@@ -111,8 +111,8 @@ owned by the caller, as for the other unified families above.
 `baseten_kimi3_streaming` is implemented locally in `src/kimi3/` and uses only
 upstream's public `UnifiedParser` and event contracts. It does not require a
 streaming constructor in frontend-crates or a permanently customized dependency
-revision. The existing frontend-crates dependency remains at its pre-streaming
-version/revision and can be upgraded independently.
+revision. The frontend-crates dependency is pinned independently of the local native
+grammar snapshot.
 
 - `native.rs` contains the native K3 grammar extracted from frontend-crates
   0.7.7 at revision `79b3c206fc7af040e64572f5a630d6348d05a5b5`, with source
@@ -122,6 +122,9 @@ version/revision and can be upgraded independently.
 - `mod.rs` implements the public parser lifecycle and delegates guided JSON to
   upstream. `tests.rs` retains native grammar regressions and streaming tests;
   `tests/kimi3.rs` checks adapter-level guided parity and prefilled channels.
+
+The 0.9.7 upgrade retains this local native snapshot; its grammar and recovery
+remain independently maintained. Guided JSON uses the updated upstream parser.
 
 When upgrading frontend-crates, review upstream K3 native changes against this
 snapshot, port applicable fixes deliberately, and run `cargo test -p

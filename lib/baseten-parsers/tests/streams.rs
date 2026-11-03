@@ -246,3 +246,35 @@ fn baseten_kimi3_streaming_exposes_arguments_before_call_closure() {
     );
     assert!(stream.advance(Some("late")).is_err());
 }
+
+#[test]
+fn b10_message_boundaries_preserve_content_and_families_are_unique() {
+    struct BoundaryParser;
+    impl upstream::UnifiedParser for BoundaryParser {
+        fn parse_into(&mut self, _: &str, output: &mut UnifiedParserOutput) -> anyhow::Result<()> {
+            use upstream::unified::MessagePhase;
+            output
+                .events
+                .push(upstream::UnifiedParserEvent::MessageStart(
+                    MessagePhase::FinalAnswer,
+                ));
+            output.push_text("answer");
+            output.events.push(upstream::UnifiedParserEvent::MessageEnd);
+            Ok(())
+        }
+
+        fn finish(&mut self) -> anyhow::Result<UnifiedParserOutput> {
+            Ok(UnifiedParserOutput::default())
+        }
+    }
+    let mut stream =
+        UnifiedStream::from_parser(Box::new(BoundaryParser), UnifiedParserInit::default()).unwrap();
+    assert_eq!(
+        stream.advance(Some("input")).unwrap(),
+        vec![Event::Text("answer".into())]
+    );
+    assert!(stream.advance(None).unwrap().is_empty());
+    let families = unified_parser_families();
+    let unique: std::collections::HashSet<_> = families.iter().collect();
+    assert_eq!(families.len(), unique.len());
+}

@@ -2070,6 +2070,8 @@ Harmony unified adapter:
 
 Rust-owned parser API (#881):
 
+- `upstream-sync`: update v1/v2 to 11.0.2/0.9.7 at [frontend-crates release b4dbde7](https://github.com/ai-dynamo/frontend-crates/commit/b4dbde79626e8182f78ba5abc5a6cdb962564d9a); adapt boundary events and K3 streaming parity.
+  Drop the dependency-pin sync when the fork advances to an upstream release containing it; retain the local K3 native snapshot separately.
 - Adds `baseten-parsers` around public `dynamo-parsers-v2` 0.6.1, pinned to
   frontend-crates `23b402787dab4c1a859c07488cce42927362db3e`; no parser source copy.
 - Exposes all upstream tool/unified families through `dynamo.parsers` in the

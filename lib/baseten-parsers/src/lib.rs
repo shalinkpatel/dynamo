@@ -14,12 +14,13 @@ pub use upstream::{
     UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, UnifiedToolOutputMode,
 };
 
-pub const UPSTREAM_REVISION: &str = "79b3c206fc7af040e64572f5a630d6348d05a5b5";
+pub const UPSTREAM_REVISION: &str = "b4dbde79626e8182f78ba5abc5a6cdb962564d9a";
 
 /// Families accepted by the Dynamo backend, including local v1 adapters.
 pub fn unified_parser_families() -> Vec<&'static str> {
     REGISTERED_UNIFIED_FAMILIES
         .iter()
+        .filter(|family| !harmony::FAMILIES.contains(family))
         .chain(harmony::FAMILIES)
         .chain(["baseten_kimi3_streaming"].iter())
         .copied()
@@ -170,12 +171,16 @@ impl DynamoStream {
         let events = output
             .events
             .into_iter()
-            .map(|event| match event {
-                upstream::UnifiedParserEvent::Text(text) => Event::Text(text),
-                upstream::UnifiedParserEvent::Reasoning(text) => Event::Reasoning(text),
+            .filter_map(|event| match event {
+                // The stream API exposes text, reasoning, and calls only. Upstream
+                // message-phase boundaries do not carry content.
+                upstream::UnifiedParserEvent::MessageStart(_)
+                | upstream::UnifiedParserEvent::MessageEnd => None,
+                upstream::UnifiedParserEvent::Text(text) => Some(Event::Text(text)),
+                upstream::UnifiedParserEvent::Reasoning(text) => Some(Event::Reasoning(text)),
                 upstream::UnifiedParserEvent::ToolCall(call) => {
                     let index = call.tool_index;
-                    Event::ToolCall(Call::new(call, self.tool_call_id(index)))
+                    Some(Event::ToolCall(Call::new(call, self.tool_call_id(index))))
                 }
             })
             .collect();

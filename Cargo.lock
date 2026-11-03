@@ -340,19 +340,6 @@ checksum = "4288f83726785267c6f2ef073a3d83dc3f9b81464e9f99898240cced85fce35a"
 
 [[package]]
 name = "async-openai"
-version = "0.41.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d72db2750faea2ca5edbf6d0c50277a89dc8f75f5e6ddd695ef30f75e335019b"
-dependencies = [
- "bytes",
- "derive_builder",
- "getrandom 0.3.4",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "async-openai"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "174e979f1e2ffe94b88d584740c11fd071f6d829c29120b1ba88bcaeb3374063"
@@ -1218,7 +1205,7 @@ name = "baseten-parsers"
 version = "1.2.0"
 dependencies = [
  "anyhow",
- "dynamo-parsers 9.2.1",
+ "dynamo-parsers 11.0.2",
  "dynamo-parsers-v2",
  "futures",
  "serde_json",
@@ -2842,6 +2829,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynamo-harmony"
+version = "0.1.0"
+source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=b4dbde79626e8182f78ba5abc5a6cdb962564d9a#b4dbde79626e8182f78ba5abc5a6cdb962564d9a"
+dependencies = [
+ "anyhow",
+ "openai-harmony 0.0.8",
+ "sha2",
+]
+
+[[package]]
 name = "dynamo-kv-hashing"
 version = "1.2.0"
 dependencies = [
@@ -3129,16 +3126,19 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers"
-version = "9.2.1"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
+version = "11.0.2"
+source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=b4dbde79626e8182f78ba5abc5a6cdb962564d9a#b4dbde79626e8182f78ba5abc5a6cdb962564d9a"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "async-stream",
- "dynamo-protocols 6.1.0",
+ "dynamo-harmony",
+ "dynamo-protocols 10.0.0",
+ "dynamo-structural-tag",
  "futures",
  "num-traits",
  "openai-harmony 0.0.8",
+ "percent-encoding",
  "regex",
  "rustpython-ruff_python_ast",
  "rustpython-ruff_python_parser",
@@ -3151,11 +3151,14 @@ dependencies = [
 
 [[package]]
 name = "dynamo-parsers-v2"
-version = "0.7.7"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
+version = "0.9.7"
+source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=b4dbde79626e8182f78ba5abc5a6cdb962564d9a#b4dbde79626e8182f78ba5abc5a6cdb962564d9a"
 dependencies = [
  "anyhow",
+ "dynamo-harmony",
+ "dynamo-structural-tag",
  "openai-harmony 0.0.8",
+ "percent-encoding",
  "regex",
  "serde",
  "serde_json",
@@ -3168,7 +3171,7 @@ dependencies = [
 name = "dynamo-protocols"
 version = "1.2.0"
 dependencies = [
- "async-openai 0.42.2",
+ "async-openai",
  "derive_builder",
  "futures",
  "serde",
@@ -3183,12 +3186,13 @@ dependencies = [
 
 [[package]]
 name = "dynamo-protocols"
-version = "6.1.0"
-source = "git+https://github.com/michaelfeil/frontend-crates.git?rev=79b3c206fc7af040e64572f5a630d6348d05a5b5#79b3c206fc7af040e64572f5a630d6348d05a5b5"
+version = "10.0.0"
+source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=b4dbde79626e8182f78ba5abc5a6cdb962564d9a#b4dbde79626e8182f78ba5abc5a6cdb962564d9a"
 dependencies = [
- "async-openai 0.41.3",
+ "async-openai",
  "derive_builder",
  "futures",
+ "indexmap 2.14.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3287,6 +3291,17 @@ dependencies = [
  "uuid",
  "validator",
  "xxhash-rust",
+]
+
+[[package]]
+name = "dynamo-structural-tag"
+version = "0.1.0"
+source = "git+https://github.com/ai-dynamo/frontend-crates.git?rev=b4dbde79626e8182f78ba5abc5a6cdb962564d9a#b4dbde79626e8182f78ba5abc5a6cdb962564d9a"
+dependencies = [
+ "anyhow",
+ "regex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

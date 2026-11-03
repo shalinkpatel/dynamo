@@ -1231,7 +1231,7 @@ fn assistant_message_header_and_renderer_envelope_are_stripped_at_every_split() 
 }
 
 #[test]
-fn legacy_and_unified_are_exact_native_projections_at_every_split() {
+fn b10_legacy_and_unified_native_content_matches_at_every_split() {
     let input = format!(
         "{}private{}{}{}after{}",
         THINK_OPEN.canonical,
@@ -1250,9 +1250,22 @@ fn legacy_and_unified_are_exact_native_projections_at_every_split() {
         let mut legacy_result = legacy.push(&input[..split]).unwrap();
         legacy_result.append(legacy.push(&input[split..]).unwrap());
         legacy_result.append(legacy.finish().unwrap());
+        let unified_result = crate::upstream::ToolParseResult::from_deltas(unified_events);
+        assert_eq!(legacy_result.normal_text, unified_result.normal_text);
+        // Upstream now streams K3 argument fragments; compare completed calls
+        // rather than requiring its chunk boundaries to match our snapshot.
+        let calls = |result: crate::upstream::ToolParseResult| {
+            assemble(
+                &result
+                    .calls
+                    .into_iter()
+                    .map(crate::upstream::UnifiedParserEvent::ToolCall)
+                    .collect::<Vec<_>>(),
+            )
+        };
         assert_eq!(
-            legacy_result,
-            crate::upstream::ToolParseResult::from_deltas(unified_events),
+            calls(legacy_result),
+            calls(unified_result),
             "split at byte {split}"
         );
     }
