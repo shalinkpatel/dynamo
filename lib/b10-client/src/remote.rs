@@ -125,7 +125,7 @@ impl RemoteGenerationCoordinator {
             RemoteEndpoints::Pool(pool) => {
                 let bid = protocol::BidRequestV1 {
                     token_buffer: wire_request.token_buffer.clone(),
-                    tokens: Vec::new(),
+                    tokens: wire_request.tokens.clone(),
                     mm_routing_args: wire_request.mm_routing_args.clone(),
                     cache_salt: wire_request
                         .routing

@@ -268,6 +268,11 @@ sufficient for admission.
 
 Deployment order for the one-day migration: roll out readers on every decoding
 hop first, then roll out writers. This version writes byte payloads by default,
-so its client/forwarding components must only target upgraded readers. There is
-no dual-write period or old-proxy downgrade path. Once old writers have drained,
-remove the legacy field and reserve its tag and name in a follow-up.
+so its client/forwarding components must target upgraded readers by default.
+There is no automatic old-proxy downgrade path. To target older readers during rollout,
+set `DYN_COORDINATOR_DUAL_WRITE_TOKENS=1` on Dynamo Rust senders. Generation
+requests and bids then populate both fields with identical IDs; newer readers
+still prefer the byte buffer. The flag defaults off and is cached by `OnceLock`
+on first use, so changing it requires restarting the process. It does not affect
+Alyx/Go senders. Once old writers have drained, remove the legacy field and
+reserve its tag and name in a follow-up.

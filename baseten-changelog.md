@@ -1869,6 +1869,7 @@ v1.2 remote generation coordinator:
 
 `Tokens.payload` adds validated little-endian u32 buffers to generation and bid/locator inputs; writers use bytes by
 default, with a short legacy reader fallback during the reader-first rollout ([#1167](https://github.com/basetenlabs/dynamo/pull/1167), keep).
+`DYN_COORDINATOR_DUAL_WRITE_TOKENS` optionally retains identical legacy IDs in Rust generation/bid senders, cached on first use ([#1172](https://github.com/basetenlabs/dynamo/pull/1172), keep).
 
 Each response frame adds a typed, cumulative `TokenUsage` snapshot with optional input,
 cached, and output counts; prefill cache counts survive decode-side zeros ([#1162](https://github.com/basetenlabs/dynamo/pull/1162), keep).

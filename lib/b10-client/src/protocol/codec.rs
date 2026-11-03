@@ -84,7 +84,11 @@ pub(crate) fn encode_request(
         request_id: context.id().to_string(),
         trace_context,
         metadata: context.metadata_snapshot(),
-        tokens: Vec::new(),
+        tokens: if super::b10_token_buffer::write_legacy_tokens() {
+            routing_request.tokens
+        } else {
+            Vec::new()
+        },
         mm_routing_args,
         routing: Some(RoutingV1 {
             session_id,
