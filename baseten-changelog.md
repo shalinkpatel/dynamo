@@ -942,6 +942,9 @@ separate endpoint-exposure patch.
 - The selector keeps the v1.0 strict-DP decision: strict rank is returned when
   the selected rank has more than a 5% score advantage over the worst
   same-worker alternative.
+- `B10WorkerSelector` lives in `dynamo-kv-router` (`scheduling::b10_selector`),
+  generic over `WorkerConfigLike`; `dynamo_llm::kv_router::b10_worker_selector`
+  re-exports it so offline tools can replay it without `dynamo-llm`.
 - Keep this scheduler PR in the v1.2 replay to preserve ISL tracking at both
   scopes: per worker and per DP rank. The scheduler now records running mean
   and variance for each worker, and for each worker/rank pair when DP is
@@ -1032,7 +1035,7 @@ Compatibility and API notes:
 
 Conflict/rebase notes:
 
-- If `b10_worker_selector.rs` conflicts during replay, keep the
+- If `b10_selector.rs` (`dynamo-kv-router`) conflicts during replay, keep the
   `B10WorkerSelector` implementation with active-request scoring, softmax
   temperature sampling, throttled score logs, and the `(worker_id, dp_rank)`
   zero-temperature tie-break. Do not revert to the simpler upstream-style

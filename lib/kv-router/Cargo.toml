@@ -40,7 +40,9 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# A range, not the workspace's exact pin (which still locks it here), so crates outside this
+# workspace with a newer tokio can depend on the router (e.g. baseten's kv-hit-ceiling).
+tokio = { version = "1.48", features = ["full"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 zmq = { version = "0.10", optional = true }
