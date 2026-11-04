@@ -1489,6 +1489,16 @@ vendored structs require `id`, so the typed parse 400d the request), matching
 the declaration-side flattening that shows these tools to the model as
 functions (#1168).
 
+Responses `custom` tool declarations bridge to client function tools at every
+declaration site (top-level `tools`, `additional_tools` items, namespace
+members): a custom tool is client-executed freeform text, advertised to Chat
+Completions as a function with one string argument (a grammar format stays
+client-enforced), `defer_loading` preserved, and a `{"type": "custom"}`
+`tool_choice` maps to the named function; customs never reach the server-tool
+hooks. Supersedes the #938 graceful drop, which tool-bank masked with its own
+top-level-only ingress bridge — that bridge is redundant once the pin
+advances (#1183). Baseten-specific; upstream has no api-translation crate.
+
 Chat-wire admission for deferred tool loading: `ChatCompletionTool` gains
 tool-level `defer_loading` and the shared request content-part enum gains a
 `tool_reference` part (`{"type": "tool_reference", "tool_name": ...}`), so

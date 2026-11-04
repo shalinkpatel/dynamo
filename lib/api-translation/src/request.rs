@@ -322,6 +322,9 @@ fn adapt_request_json_inner(
             None
         };
     let ingress_rewrite = hooks.rewrite_ingress(protocol, headers, &mut body_json)?;
+    // Placement matters: the typed parses and the echo capture both run after this and lose
+    // format-less customs.
+    default_body_custom_tool_formats(&mut body_json);
     let responses_params = matches!(protocol, ClientProtocol::Responses)
         .then(|| ResponsesParams::from_body(&body_json));
     let (mut request, server_tool_claims, max_tool_calls) = match protocol {
@@ -2675,6 +2678,17 @@ fn responses_client_function_tool(
             cc_tool.defer_loading = defer_loading;
             Ok(vec![cc_tool])
         }
+        // Client-executed freeform text bridges to one string argument, the only CC-advertisable
+        // shape; a grammar format stays client-enforced, so the schema is fixed.
+        ResponsesTool::Custom(custom) => {
+            let mut cc_tool = function_tool(
+                &custom.name,
+                custom.description.as_deref().unwrap_or_default(),
+                custom_tool_bridge_schema(),
+            );
+            cc_tool.defer_loading = defer_loading;
+            Ok(vec![cc_tool])
+        }
         other => {
             // Bounded: the entry embeds the client's full tool definition, whole-`Debug` echoes it back.
             let tool_debug = crate::util::truncate(&format!("{other:?}"), 80);
@@ -2701,6 +2715,14 @@ fn translate_responses_tool_choice(
             ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionName { name: name.clone() },
+            })
+        }
+        ToolChoiceParam::Custom(custom) => {
+            ChatCompletionToolChoiceOption::Named(ChatCompletionNamedToolChoice {
+                r#type: ChatCompletionToolType::Function,
+                function: FunctionName {
+                    name: custom.name.clone(),
+                },
             })
         }
         other => {
@@ -2784,11 +2806,63 @@ fn is_anthropic_server_tool_shaped(entry: &Value) -> bool {
 
 /// Only function tools cross the CC bridge. Namespace members are already flattened;
 /// unsupported custom tools follow the consumer's drop/reject policy like hosted tools.
+/// The one schema a bridged custom tool advertises, shared by the declaration bridge and the
+/// tool_search delivery renderer so discovery text and the callable tool agree.
+pub(crate) fn custom_tool_bridge_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+    })
+}
+
+/// OpenAI defaults an omitted custom-tool `format` to text; the vendored `CustomToolParam`
+/// requires it, so the typed parses would 400 a valid declaration. Default it beforehand,
+/// namespace members included.
+fn default_custom_tool_format(entries: &mut [Value]) {
+    for entry in entries.iter_mut() {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("custom") => {
+                if entry.get("format").is_none_or(Value::is_null) {
+                    entry["format"] = json!({"type": "text"});
+                }
+            }
+            Some("namespace") => {
+                if let Some(members) = entry.get_mut("tools").and_then(Value::as_array_mut) {
+                    default_custom_tool_format(members);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Every declaration site the Responses translation reads: top-level `tools` and the tools of
+/// `additional_tools` input items.
+fn default_body_custom_tool_formats(body: &mut Value) {
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        default_custom_tool_format(tools);
+    }
+    for item in body
+        .get_mut("input")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+            && let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut)
+        {
+            default_custom_tool_format(tools);
+        }
+    }
+}
+
 fn is_responses_server_tool_shaped(entry: &Value) -> bool {
+    // `custom` is client-executed, not hosted: it never reaches the hooks.
     entry
         .get("type")
         .and_then(Value::as_str)
-        .is_some_and(|kind| kind != "function")
+        .is_some_and(|kind| kind != "function" && kind != "custom")
 }
 
 fn function_tool(name: &str, description: &str, parameters: Value) -> ChatCompletionTool {

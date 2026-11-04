@@ -45,7 +45,7 @@ pub(crate) fn rewrite_responses(body: &mut Value) -> Result<ToolSearchAdapter, S
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|tool| tool["type"] == "function")
+        .filter(|tool| matches!(tool["type"].as_str(), Some("function" | "custom")))
         .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
         .collect();
     if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
@@ -92,7 +92,9 @@ pub(crate) fn rewrite_responses(body: &mut Value) -> Result<ToolSearchAdapter, S
                     bare_names.extend(
                         tools
                             .iter()
-                            .filter(|tool| tool["type"] == "function")
+                            .filter(|tool| {
+                                matches!(tool["type"].as_str(), Some("function" | "custom"))
+                            })
                             .filter_map(|tool| tool["name"].as_str().map(str::to_owned)),
                     );
                     for tool in tools {
@@ -128,16 +130,17 @@ pub(crate) fn rewrite_responses(body: &mut Value) -> Result<ToolSearchAdapter, S
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry["type"] == "function" && entry["name"] == "tool_search")
+            entries.iter().any(|entry| {
+                matches!(entry["type"].as_str(), Some("function" | "custom"))
+                    && entry["name"] == "tool_search"
+            })
         });
     let mut names: HashSet<String> = fields
         .get("tools")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|entry| entry["type"] == "function")
+        .filter(|entry| matches!(entry["type"].as_str(), Some("function" | "custom")))
         .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
         .collect();
     if !delivered.is_empty() {
@@ -365,10 +368,13 @@ fn delivered_function_envelope(tool: &Value) -> Result<serde_json::Map<String, V
         "description".to_string(),
         tool.get("description").cloned().unwrap_or(json!("")),
     );
-    function.insert(
-        "parameters".to_string(),
-        tool.get("parameters").cloned().unwrap_or(json!({})),
-    );
+    // A delivered custom tool must show the schema its declaration-side bridge advertises.
+    let parameters = if tool.get("type").and_then(Value::as_str) == Some("custom") {
+        crate::request::custom_tool_bridge_schema()
+    } else {
+        tool.get("parameters").cloned().unwrap_or(json!({}))
+    };
+    function.insert("parameters".to_string(), parameters);
     Ok(function)
 }
 
@@ -555,6 +561,23 @@ mod tests {
         let identity = adapter.resolve_tool_identity("crm__lookup").unwrap();
         assert_eq!(identity.name, "lookup");
         assert_eq!(identity.namespace, "crm");
+    }
+
+    /// A custom counts as a flat client tool in the shadow check: a discovered namespace member
+    /// mangling onto its name fails the request, as it does for a function.
+    #[test]
+    fn discovered_namespaces_cannot_shadow_flat_customs() {
+        let mut body = replay();
+        body["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"custom", "name":"crm__lookup"}));
+        assert!(
+            rewrite_responses(&mut body)
+                .err()
+                .unwrap()
+                .contains("collides")
+        );
     }
 
     /// The discovering `tool_search_output` was compacted out of the replay: the call keeps its

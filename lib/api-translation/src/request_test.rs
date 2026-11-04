@@ -2252,50 +2252,78 @@ fn drop_server_tools_omits_tool_choice_when_no_tools_survive() {
     assert!(adapted.server_tool_claims.is_empty());
 }
 
+/// A `custom` tool is client-executed freeform text: it bridges to a one-string-argument
+/// function tool at every declaration site (top-level, `additional_tools` item, namespace
+/// member) — never a server claim, even under hooks that reject every unknown server tool.
 #[test]
-fn responses_custom_only_tools_drop_without_dangling_choice() {
-    let custom = json!({"type": "custom", "name": "exec", "format": {"type": "text"}});
-    for tools in [
-        json!([custom.clone()]),
-        json!([{"type": "namespace", "name": "functions", "description": "Tools", "tools": [custom]}]),
-    ] {
+fn responses_custom_tools_bridge_at_every_declaration_site() {
+    // Format omitted on purpose: OpenAI defaults it to text, and the vendored type requires it.
+    let custom = json!({"type": "custom", "name": "exec", "description": "Run it"});
+    let bridge_schema = json!({"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]});
+    let cases = [
+        (json!({"tools": [custom.clone()]}), "exec"),
+        (
+            json!({"input": [
+                {"type": "additional_tools", "role": "developer", "tools": [custom.clone()]},
+                {"role": "user", "content": "hi"},
+            ]}),
+            "exec",
+        ),
+        (
+            json!({"tools": [
+                {"type": "namespace", "name": "functions", "description": "Tools",
+                 "tools": [custom.clone()]},
+            ]}),
+            "functions__exec",
+        ),
+    ];
+    for (site_fragment, want_name) in cases {
         for choice in [json!("required"), json!({"type": "custom", "name": "exec"})] {
-            for additional in [false, true] {
-                let mut body = json!({"model": "m", "input": "hi", "tool_choice": choice});
-                if additional {
-                    body["input"] = json!([
-                        {"type": "additional_tools", "role": "developer", "tools": tools},
-                        {"role": "user", "content": "hi"},
-                    ]);
-                } else {
-                    body["tools"] = tools.clone();
-                }
-                let adapted = adapt_request_json(
-                    body,
-                    ClientProtocol::Responses,
-                    &HeaderMap::new(),
-                    &mut DropServerTools,
-                )
-                .unwrap()
-                .request;
-                assert!(adapted.request.tools.is_none());
-                assert!(adapted.request.tool_choice.is_none());
-                assert!(adapted.server_tool_claims.is_empty());
-                assert_eq!(
-                    adapted
-                        .losses
-                        .iter()
-                        .filter(|l| l.kind == LossKind::ServerToolDropped)
-                        .count(),
-                    1,
-                );
+            if want_name != "exec" && choice != json!("required") {
+                // A choice names the tool as declared; namespace member mangling is the client's.
+                continue;
             }
+            let mut body = json!({"model": "m", "input": "hi", "tool_choice": choice});
+            if let Some(tools) = site_fragment.get("tools") {
+                body["tools"] = tools.clone();
+            } else {
+                body["input"] = site_fragment["input"].clone();
+            }
+            let adapted = adapt_request_json(
+                body,
+                ClientProtocol::Responses,
+                &HeaderMap::new(),
+                &mut test_hooks(),
+            )
+            .unwrap_or_else(|e| panic!("{want_name} / {choice}: {e:?}"))
+            .request;
+            let cc = serde_json::to_value(&adapted.request).unwrap();
+            let tools = cc["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), 1, "{want_name} / {choice}");
+            assert_eq!(tools[0]["function"]["name"], want_name);
+            assert_eq!(tools[0]["function"]["parameters"], bridge_schema);
+            let want_choice = if choice == json!("required") {
+                json!("required")
+            } else {
+                json!({"type": "function", "function": {"name": "exec"}})
+            };
+            assert_eq!(cc["tool_choice"], want_choice, "{want_name} / {choice}");
+            assert!(adapted.server_tool_claims.is_empty());
+            assert!(
+                !adapted
+                    .losses
+                    .iter()
+                    .any(|l| l.kind == LossKind::ServerToolDropped),
+                "{want_name} / {choice}"
+            );
         }
     }
 }
 
+/// Bridging a custom member leaves the namespace's function members and their `strict` flags
+/// untouched, and a `tool_choice` naming the bridged member by its mangled name stays valid.
 #[test]
-fn responses_custom_drop_preserves_namespace_functions_and_strict_policy() {
+fn responses_custom_bridge_preserves_namespace_functions_and_strict_policy() {
     let body = json!({
         "model": "m", "input": "hi",
         "tools": [
@@ -2311,31 +2339,113 @@ fn responses_custom_drop_preserves_namespace_functions_and_strict_policy() {
         "tool_choice": {"type": "function", "name": "functions__exec"},
     });
     let adapted = adapt_request_json(
-        body.clone(),
+        body,
         ClientProtocol::Responses,
         &HeaderMap::new(),
-        &mut DropServerTools,
+        &mut test_hooks(),
     )
     .unwrap()
     .request;
     let cc = serde_json::to_value(&adapted.request).unwrap();
-    assert_eq!(cc["tool_choice"], "auto");
-    let tools = cc["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 2);
-    assert_eq!(tools[0]["function"]["name"], "functions__lookup");
-    assert_eq!(tools[0]["function"]["strict"], true);
-    assert_eq!(tools[1]["function"]["name"], "lookup");
-    assert!(adapted.server_tool_claims.is_empty());
-    assert!(
-        adapt_request_json(
-            body,
-            ClientProtocol::Responses,
-            &HeaderMap::new(),
-            &mut test_hooks(),
-        )
-        .is_err(),
-        "strict consumers still reject unsupported custom tools"
+    assert_eq!(
+        cc["tool_choice"],
+        json!({"type": "function", "function": {"name": "functions__exec"}})
     );
+    let tools = cc["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[0]["function"]["name"], "functions__exec");
+    assert_eq!(
+        tools[0]["function"]["parameters"],
+        json!({"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}),
+        "a grammar format does not survive the bridge; it stays client-enforced"
+    );
+    assert_eq!(tools[1]["function"]["name"], "functions__lookup");
+    assert_eq!(tools[1]["function"]["strict"], true);
+    assert_eq!(tools[2]["function"]["name"], "lookup");
+    assert!(adapted.server_tool_claims.is_empty());
+}
+
+/// The `defer_loading` marker survives the bridge, as on a function tool.
+#[test]
+fn responses_custom_tool_bridge_keeps_defer_loading() {
+    let adapted = adapt_responses_body(json!({
+        "tools": [{"type": "custom", "name": "exec", "format": {"type": "text"},
+            "defer_loading": true}],
+    }))
+    .expect("custom tool bridges");
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    assert_eq!(cc["tools"][0]["defer_loading"], true);
+}
+
+/// The echo-back params capture defaults an omitted custom `format`, so the terminal response's
+/// tools echo keeps the entry — and a whole namespace that contains one.
+#[test]
+fn responses_params_capture_defaults_omitted_custom_format() {
+    let ingress = adapt(
+        &serde_json::to_vec(&json!({
+            "model": "m", "input": "hi",
+            "tools": [
+                {"type": "custom", "name": "exec"},
+                {"type": "namespace", "name": "crm", "description": "CRM", "tools": [
+                    {"type": "custom", "name": "lookup"},
+                    {"type": "function", "name": "read", "parameters": {}}]},
+            ],
+        }))
+        .unwrap(),
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+    )
+    .expect("format-less customs adapt");
+    let params = ingress.responses_params.expect("responses params captured");
+    assert_eq!(params.tools[0]["format"], json!({"type": "text"}));
+    assert_eq!(
+        params.tools[1]["tools"][0]["format"],
+        json!({"type": "text"})
+    );
+}
+
+/// A custom tool discovered via `tool_search` shows the same schema in the discovery output the
+/// model reads and in the delivered declaration's callable form.
+#[test]
+fn responses_custom_tool_discovery_and_bridge_schemas_agree() {
+    let adapted = adapt_request_json(
+        json!({
+            "model": "m",
+            "input": [
+                {"type": "tool_search_call", "call_id": "s", "arguments": "{}"},
+                {"type": "tool_search_output", "call_id": "s", "tools": [
+                    {"type": "custom", "name": "freeform", "description": "freeform tool"},
+                ]},
+                {"role": "user", "content": "hi"},
+            ],
+        }),
+        ClientProtocol::Responses,
+        &HeaderMap::new(),
+        &mut test_hooks(),
+    )
+    .expect("custom discovery translates")
+    .request;
+    let cc = serde_json::to_value(&adapted.request).unwrap();
+    let tool = cc["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "freeform")
+        .expect("delivered custom advertised");
+    assert_eq!(
+        tool["function"]["parameters"],
+        json!({"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]})
+    );
+    assert_eq!(tool["defer_loading"], true);
+    let output = cc["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("the discovery result reaches the model")["content"]
+        .to_string();
+    assert!(output.contains("freeform"), "{output}");
+    assert!(output.contains(r#"\"input\""#), "{output}");
 }
 
 #[test]
@@ -2510,8 +2620,7 @@ fn adapt_responses_refusal_truncates_non_ascii_tool_definition() {
     for pad in 0..8 {
         let description = format!("{}{}", "a".repeat(pad), "é".repeat(200));
         let err = responses_client_function_tool(json!({
-            "type": "custom", "name": "crm", "description": description,
-            "format": {"type": "text"},
+            "type": "mcp", "server_label": "crm", "server_description": description,
         }))
         .err()
         .unwrap();
