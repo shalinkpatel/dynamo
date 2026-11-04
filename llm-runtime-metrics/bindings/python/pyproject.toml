@@ -1,0 +1,38 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "llm-runtime-metrics"
+version = "0.0.24"
+description = "Rust-backed performance metrics and request tracing"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Baseten" },
+]
+requires-python = ">=3.10"
+dependencies = [
+    "prometheus-client>=0.20",
+]
+keywords = ["metrics", "observability", "prometheus", "llm"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/basetenlabs/dynamo"
+Repository = "https://github.com/basetenlabs/dynamo"
+Issues = "https://github.com/basetenlabs/dynamo/issues"
+
+[tool.maturin]
+python-source = "src"
+module-name = "llm_runtime_metrics._core"
+features = []

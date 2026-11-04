@@ -1,0 +1,34 @@
+[package]
+name = "llm-runtime-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Snapshot-first performance metrics and request tracing primitives"
+readme = "README.md"
+homepage = "https://github.com/basetenlabs/dynamo"
+documentation = "https://docs.rs/llm-runtime-metrics"
+keywords = ["metrics", "observability", "prometheus", "llm"]
+
+[dependencies]
+prometheus = "0.13"
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = "0.1"
+blake3 = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+arrow = { version = "53.0", default-features = false, features = ["ipc"] }
+parquet = { version = "53.0", default-features = false, features = ["arrow", "flate2", "snap", "lz4", "zstd"] }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokenizers = { workspace = true }
+reqwest = { workspace = true }
+indicatif = { workspace = true }
+
+[dev-dependencies]
+fastokens = { package = "fastokens-b10", version = "0.2.10", default-features = false }

@@ -1,0 +1,30 @@
+[workspace]
+members = [
+  "crates/performance-metrics-core",
+  "bindings/python",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.24"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Baseten"]
+repository = "https://github.com/basetenlabs/dynamo"
+
+[workspace.dependencies]
+anyhow = "1"
+arc-swap = "1"
+blake3 = "1"
+bytes = "1"
+futures = "0.3"
+object_store = { version = "0.13.1", features = ["aws"] }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync", "rt-multi-thread", "signal"] }
+pyo3 = { version = "0.25", default-features = false, features = ["macros", "extension-module", "abi3-py310"] }
+numpy = "0.25"
+tokenizers = "0.22.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+indicatif = "0.18"

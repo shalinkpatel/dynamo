@@ -1,0 +1,21 @@
+[package]
+name = "llm-runtime-metrics-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust extension module backing the llm-runtime-metrics Python package"
+readme = "README.md"
+homepage = "https://github.com/basetenlabs/dynamo"
+publish = false
+
+[lib]
+name = "_core"
+path = "rust/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+performance-metrics-core = { package = "llm-runtime-metrics", version = "0.0.24", path = "../../crates/performance-metrics-core" }
+pyo3 = { workspace = true }
+numpy = { workspace = true }

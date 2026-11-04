@@ -38,6 +38,7 @@ members = [
     "lib/bindings/g2direct",
     "lib/bindings/python/codegen",
 ]
+exclude = ["llm-runtime-metrics"]
 resolver = "3"
 
 [workspace.package]

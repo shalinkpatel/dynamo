@@ -1,0 +1,32 @@
+name: Build and Release llm-runtime-metrics
+
+on:
+  push:
+    branches:
+      - main-v1.2.0
+    paths:
+      - "llm-runtime-metrics/**"
+      - ".github/workflows/b10-metrics-*.yml"
+  pull_request:
+    paths:
+      - "llm-runtime-metrics/**"
+      - ".github/workflows/b10-metrics-*.yml"
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: "Publish to PyPI?"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-package:
+    uses: ./.github/workflows/b10-metrics-build-maturin.yml
+    with:
+      folder: llm-runtime-metrics/bindings/python
+      publish_pypi: ${{ github.event_name == 'workflow_dispatch' && fromJSON(github.event.inputs.publish_pypi) }}
+    secrets:
+      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}

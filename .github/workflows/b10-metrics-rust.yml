@@ -1,0 +1,41 @@
+name: LLM Metrics Rust CI
+
+on:
+  pull_request:
+    paths:
+      - "llm-runtime-metrics/**"
+      - ".github/workflows/b10-metrics-*.yml"
+  push:
+    branches:
+      - main-v1.2.0
+    paths:
+      - "llm-runtime-metrics/**"
+      - ".github/workflows/b10-metrics-*.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: llm-runtime-metrics
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust format check
+        run: cargo fmt --all -- --check
+
+      - name: Rust lint
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --locked -p llm-runtime-metrics

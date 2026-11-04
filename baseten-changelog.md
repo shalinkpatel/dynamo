@@ -3431,3 +3431,7 @@ path and the position the axum `Json<T>` rejection carried:
 "messages[6].role: unknown variant `tool`, ... at line 1 column 64" rather than
 "unknown variant `tool`". `RawJson` replaces `Json<serde_json::Value>` in those
 two handlers and keeps its content-type and syntax-error rejections unchanged.
+
+## PATCH-027: Standalone LLM runtime metrics package
+
+Status: `keep` ([PR #1184](https://github.com/basetenlabs/dynamo/pull/1184)). Move `llm-runtime-metrics` (Rust core, Python bindings, tests and wheel CI) into a top-level independent workspace; preserve it and the wheel-builder COPY paths when rebasing.

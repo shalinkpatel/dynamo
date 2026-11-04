@@ -1,0 +1,46 @@
+name: LLM Metrics Python CI
+
+on:
+  pull_request:
+    paths:
+      - "llm-runtime-metrics/**"
+      - ".github/workflows/b10-metrics-*.yml"
+  push:
+    branches:
+      - main-v1.2.0
+    paths:
+      - "llm-runtime-metrics/**"
+      - ".github/workflows/b10-metrics-*.yml"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: llm-runtime-metrics
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.93.1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build Python extension and run tests
+        run: |
+          uv venv
+          . .venv/bin/activate
+          uv pip install maturin pytest numpy pyarrow
+          maturin develop --locked --manifest-path bindings/python/Cargo.toml
+          python -m pytest -q -c bindings/python/pyproject.toml --confcutdir=bindings/python bindings/python/tests/

@@ -98,6 +98,7 @@ core:
   - 'tools/**'
   - '.cargo/config.toml'
   - 'lib/**'
+  - 'llm-runtime-metrics/**'
   - 'tests/**'
   - 'components/src/dynamo/router/**'
   - 'components/src/dynamo/thunderagent_router/**'
@@ -191,6 +192,7 @@ frontend:
   - *ci
   - '.cargo/config.toml'
   - 'lib/**'
+  - 'llm-runtime-metrics/**'
   - '*.toml'
   - '*.lock'
   - 'container/deps/*'

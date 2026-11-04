@@ -503,6 +503,7 @@ COPY lib/gpu_memory_service/ /opt/dynamo/lib/gpu_memory_service/
 COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
 COPY lib/ /opt/dynamo/lib/
+COPY llm-runtime-metrics/ /opt/dynamo/llm-runtime-metrics/
 COPY components/ /opt/dynamo/components/
 
 # Build ai-dynamo (pure Python) and ai-dynamo-runtime (maturin) wheels
@@ -676,6 +677,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=shared \
 COPY .cargo/ /opt/dynamo/.cargo/
 COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
 COPY lib/ /opt/dynamo/lib/
+COPY llm-runtime-metrics/ /opt/dynamo/llm-runtime-metrics/
 COPY components/ /opt/dynamo/components/
 
 # Build kvbm wheel (with nixl linkage via auditwheel repair)

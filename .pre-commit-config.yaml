@@ -101,7 +101,7 @@ repos:
       name: cargo fmt
       language: system
       entry: >-
-        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm;
+        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm llm-runtime-metrics;
         do echo "fmt $d" && (cd "$d" && cargo fmt -- --check) || exit 1; done'
       pass_filenames: false
       types: [rust]
@@ -109,7 +109,7 @@ repos:
       name: cargo check
       language: system
       entry: >-
-        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm;
+        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm llm-runtime-metrics;
         do echo "check $d" && (cd "$d" && cargo check) || exit 1; done'
       pass_filenames: false
       types: [rust]
@@ -117,7 +117,7 @@ repos:
       name: cargo clippy
       language: system
       entry: >-
-        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm;
+        bash -c 'for d in . lib/bindings/python lib/runtime/examples lib/bindings/kvbm llm-runtime-metrics;
         do echo "clippy $d" && (cd "$d" && cargo clippy --no-deps --all-targets -- -D warnings) || exit 1; done'
       pass_filenames: false
       types: [rust]
