@@ -225,6 +225,8 @@ pub(crate) struct PyRouterRequestNew {
     pub(super) priority_load_shed_percent: u8,
     #[pyo3(get, set)]
     pub(super) do_not_queue: bool,
+    #[pyo3(get, set)]
+    pub(super) lora_name: Option<String>,
 }
 
 #[pymethods]
@@ -238,7 +240,9 @@ impl PyRouterRequestNew {
         priority_jump = 0.0,
         priority_load_shed_percent = 0,
         do_not_queue = false,
+        lora_name = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         tokens: &Bound<'_, PyAny>,
         block_mm_infos: Option<PyObject>,
@@ -247,6 +251,7 @@ impl PyRouterRequestNew {
         priority_jump: f64,
         priority_load_shed_percent: u8,
         do_not_queue: bool,
+        lora_name: Option<String>,
     ) -> PyResult<Self> {
         Ok(Self {
             tokens: extract_list_or_numpy_u32(tokens)?,
@@ -256,6 +261,7 @@ impl PyRouterRequestNew {
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,
+            lora_name,
         })
     }
 

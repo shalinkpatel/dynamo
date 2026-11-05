@@ -18,6 +18,9 @@ pub struct RouterRequestNew {
     pub priority_jump: f64,
     pub priority_load_shed_percent: u8,
     pub do_not_queue: bool,
+    /// LoRA adapter served by this request. The router salts block hashes with it, so
+    /// adapter traffic matches the adapter-tagged `BlockStored` events engines publish.
+    pub lora_name: Option<String>,
 }
 
 impl From<RouterRequestNew> for RouterRequest {
@@ -30,6 +33,7 @@ impl From<RouterRequestNew> for RouterRequest {
             priority_jump: req.priority_jump,
             priority_load_shed_percent: req.priority_load_shed_percent,
             do_not_queue: req.do_not_queue,
+            lora_name: req.lora_name,
         }
     }
 }

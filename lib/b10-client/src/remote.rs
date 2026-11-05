@@ -667,6 +667,7 @@ mod tests {
             priority_jump: 1.5,
             priority_load_shed_percent: 25,
             do_not_queue: true,
+            lora_name: None,
         };
         let outcome = coordinator
             .generate(

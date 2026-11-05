@@ -267,6 +267,8 @@ message Routing
   repeated uint64 allowed_worker_ids = 5 [packed = true];
   optional RoutingConstraints constraints = 6;
   optional string cache_salt = 7;
+  // LoRA adapter served by this request; salts the router's block hashes.
+  optional string lora_name = 8;
 }
 
 message RoutingConstraints

@@ -120,6 +120,7 @@ fn extract_router_request(
     let priority_jump = borrowed.priority_jump;
     let priority_load_shed_percent = borrowed.priority_load_shed_percent;
     let do_not_queue = borrowed.do_not_queue;
+    let lora_name = borrowed.lora_name.clone();
     drop(borrowed);
 
     let block_mm_infos = match block_mm_infos_py {
@@ -145,6 +146,7 @@ fn extract_router_request(
         priority_jump,
         priority_load_shed_percent,
         do_not_queue,
+        lora_name,
     })
 }
 
@@ -562,6 +564,7 @@ impl RouterWorkerCoordinator {
         let priority_jump: f64 = borrowed.priority_jump;
         let priority_load_shed_percent: u8 = borrowed.priority_load_shed_percent;
         let do_not_queue: bool = borrowed.do_not_queue;
+        let lora_name = borrowed.lora_name.clone();
         drop(borrowed);
 
         // `block_mm_infos` is held loosely as an `Optional[Any]` on the pyclass;
@@ -596,6 +599,7 @@ impl RouterWorkerCoordinator {
             priority_jump,
             priority_load_shed_percent,
             do_not_queue,
+            lora_name,
         };
         let worker_request: rmpv::Value = match worker_args {
             Some(wa) => depythonize_worker_args(&wa.into_bound(py))?,

@@ -747,6 +747,7 @@ fn router_request_new_priority_fields_round_trip() {
         priority_jump: 0.5,
         priority_load_shed_percent: 10,
         do_not_queue: true,
+        lora_name: None,
     };
     let value = req.into_routing_request_value().expect("build ok");
 
@@ -797,6 +798,21 @@ fn router_request_new_allowed_worker_ids_round_trip() {
 }
 
 #[test]
+fn router_request_new_lora_name_round_trip() {
+    let req = RouterRequestNew {
+        tokens: vec![1, 2, 3],
+        lora_name: Some("greek".to_string()),
+        ..Default::default()
+    };
+    let value = req.into_routing_request_value().expect("build ok");
+
+    match round_trip_wire(&value) {
+        RouterRequest::New { lora_name, .. } => assert_eq!(lora_name.as_deref(), Some("greek")),
+        _ => panic!("expected New"),
+    }
+}
+
+#[test]
 fn router_request_new_block_mm_infos_carried() {
     let infos: Vec<Option<BlockExtraInfo>> = serde_json::from_value(
         serde_json::json!([{"mm_objects": [{"mm_hash": 22, "offsets": [[0, 1]]}]}]),
@@ -810,6 +826,7 @@ fn router_request_new_block_mm_infos_carried() {
         priority_jump: 0.0,
         priority_load_shed_percent: 0,
         do_not_queue: false,
+        lora_name: None,
     };
     let value = req.into_routing_request_value().expect("build ok");
 
@@ -841,6 +858,7 @@ fn router_request_new_routing_constraints_non_default_round_trip() {
         priority_jump: 0.0,
         priority_load_shed_percent: 0,
         do_not_queue: false,
+        lora_name: None,
     };
     let value = req.into_routing_request_value().expect("build ok");
 

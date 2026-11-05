@@ -983,6 +983,14 @@ Queue admission fields to replay:
 - Add `do_not_queue: bool` to `RouterRequest::New`, with
   `#[serde(default, skip_serializing_if = "is_false")]` and default `false`.
   Thread the value through the same scheduler path into `SchedulingRequest`.
+- Add `lora_name: Option<String>` to `RouterRequest::New`, with
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`. The `New` arm
+  passes it to `find_best_match_details`, so adapter requests hash in the
+  adapter's salted block-hash space and match vLLM's `BlockStored.lora_name`
+  events. The B10 client carries it through `RouterRequestNew`,
+  `PyRouterRequestNew(lora_name=...)` and the remote coordinator protocol
+  (`Routing.lora_name = 8`). Upstream 1.6 already has the field on
+  `RouterRequest::New`; on a 1.6 rebase keep only the B10 client plumbing.
 - `do_not_queue` preserves queue-by-default behavior. If the field is omitted,
   the router should behave exactly as before and may park the request in the
   pending queue.

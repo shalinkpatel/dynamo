@@ -647,6 +647,7 @@ class PyRouterRequestNew:
     priority_jump: float
     priority_load_shed_percent: int
     do_not_queue: bool
+    lora_name: Optional[str]
 
     @property
     def tokens(self) -> List[int]: ...
@@ -662,6 +663,7 @@ class PyRouterRequestNew:
         priority_jump: float = 0.0,
         priority_load_shed_percent: int = 0,
         do_not_queue: bool = False,
+        lora_name: Optional[str] = None,
     ) -> None: ...
 
 

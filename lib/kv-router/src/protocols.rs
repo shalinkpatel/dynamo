@@ -547,6 +547,9 @@ pub enum RouterRequest {
         priority_load_shed_percent: u8,
         #[serde(default, skip_serializing_if = "is_false")]
         do_not_queue: bool,
+        /// LoRA adapter served by this request; salts block hashes per adapter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lora_name: Option<String>,
     },
     /// Read-only candidate selection; unsupported routers reject this method.
     Bid {
@@ -589,6 +592,7 @@ impl Default for RouterRequest {
             priority_jump: 0.0,
             priority_load_shed_percent: 0,
             do_not_queue: false,
+            lora_name: None,
         }
     }
 }
@@ -1304,6 +1308,7 @@ mod token_blob_tests {
             priority_jump: 0.0,
             priority_load_shed_percent: 0,
             do_not_queue: false,
+            lora_name: None,
         }
     }
 
@@ -1667,6 +1672,7 @@ mod tests {
             priority_jump: 5.0,
             priority_load_shed_percent: 0,
             do_not_queue: false,
+            lora_name: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -1696,6 +1702,7 @@ mod tests {
             priority_jump: 5.0,
             priority_load_shed_percent: 10,
             do_not_queue: false,
+            lora_name: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();

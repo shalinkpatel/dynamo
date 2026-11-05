@@ -93,6 +93,7 @@ pub(crate) fn encode_request(
         routing: Some(RoutingV1 {
             session_id,
             cache_salt,
+            lora_name: routing_request.lora_name,
             do_not_queue: routing_request.do_not_queue,
             priority_jump: routing_request.priority_jump,
             priority_load_shed_percent: u32::from(routing_request.priority_load_shed_percent),
@@ -324,6 +325,7 @@ pub(crate) fn decode_new_request(
             priority_load_shed_percent: u8::try_from(routing.priority_load_shed_percent)
                 .context("routing.priority_load_shed_percent exceeds uint8")?,
             do_not_queue: routing.do_not_queue,
+            lora_name: routing.lora_name,
         },
         primary_worker_request,
         decode_worker_request,
@@ -738,6 +740,7 @@ mod tests {
             GenerationRequest {
                 routing_request: RouterRequestNew {
                     tokens: vec![1, 2, 151_643],
+                    lora_name: Some("greek".to_string()),
                     ..Default::default()
                 },
                 primary_worker_request: worker,
@@ -765,6 +768,7 @@ mod tests {
             DisaggregationStrategy::PrefillFirst,
         )
         .unwrap();
+        assert_eq!(decoded.routing_request.lora_name.as_deref(), Some("greek"));
         let expected = uint_array(&[1_u32, 2, 151_643]);
         assert_eq!(decoded.primary_worker_request["tokens"]["tokens"], expected);
         let decode = decoded.decode_worker_request.unwrap();

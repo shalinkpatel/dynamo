@@ -1231,6 +1231,7 @@ where
                 priority_jump,
                 priority_load_shed_percent,
                 do_not_queue,
+                lora_name,
             } => {
                 self.affinity_metrics.worker_selection_requests_total.inc();
                 let request_context = ctx.context();
@@ -1272,7 +1273,7 @@ where
                     None,
                     true,
                     false,
-                    None,
+                    lora_name,
                     priority_jump,
                     priority_load_shed_percent,
                     do_not_queue,
@@ -1671,6 +1672,7 @@ mod tests {
                 priority_jump: 0.0,
                 priority_load_shed_percent: 0,
                 do_not_queue: false,
+                lora_name: None,
             },
             request_id.to_string(),
             Default::default(),
