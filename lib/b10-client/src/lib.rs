@@ -7,6 +7,8 @@
 //! binding. Rust callers use [`RouterWorkerCoordinator`]; Python bindings adapt
 //! their native objects to the same request and outcome types.
 
+mod b10_metrics;
+pub use b10_metrics::{GenerationMetrics, MetricsConfig};
 mod b10_observer;
 pub use b10_observer::{GenerationObservationEnd, GenerationObserver, GenerationObserverFactory};
 

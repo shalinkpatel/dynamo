@@ -4,6 +4,7 @@ use super::coordinator::{
 };
 use super::guard::{ROUTER_GUARD_CLEANUP_GRACE_PERIOD, RouterRequestGuard};
 use super::types::{AdmittedRequestTimings, DeniedRequest, MinReplicaAvailable, RouterRequestNew};
+use crate::GenerationCoordinatorClient;
 use crate::{
     CancellationPolicy, DisaggregationStrategy, GenerationCoordinator, GenerationOptions,
     GenerationOutcome, GenerationRequest, PrefillMarkTiming, RequestContext, RouteOptions,
@@ -3375,6 +3376,50 @@ async fn generation_transport(
     (client, Some(server))
 }
 
+struct B10ObservedClient {
+    inner: Arc<dyn crate::GenerationCoordinatorClient>,
+    observer: Arc<dyn crate::GenerationObserverFactory>,
+}
+
+impl B10ObservedClient {
+    fn new(
+        inner: Arc<dyn crate::GenerationCoordinatorClient>,
+        observer: Arc<dyn crate::GenerationObserverFactory>,
+    ) -> Self {
+        Self { inner, observer }
+    }
+}
+
+impl crate::GenerationCoordinatorClient for B10ObservedClient {
+    fn bid(
+        &self,
+        request: crate::protocol::BidRequestV1,
+    ) -> futures::future::BoxFuture<'_, Result<crate::protocol::BidResponseV1>> {
+        self.inner.bid(request)
+    }
+
+    fn start(&self) -> futures::future::BoxFuture<'_, Result<()>> {
+        self.inner.start()
+    }
+
+    fn worker_loads(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::WorkerLoad>>> {
+        self.inner.worker_loads()
+    }
+
+    fn observer(&self) -> Option<&dyn crate::GenerationObserverFactory> {
+        Some(self.observer.as_ref())
+    }
+
+    fn generate_inner(
+        &self,
+        context: RequestContext,
+        request: GenerationRequest,
+        options: GenerationOptions,
+    ) -> futures::future::BoxFuture<'_, Result<GenerationOutcome>> {
+        self.inner.generate_inner(context, request, options)
+    }
+}
+
 #[tokio::test]
 async fn generation_coordinator_preserves_prefill_error() {
     generation_error_scenario("prefill").await;
@@ -3455,6 +3500,11 @@ async fn generation_error_scenario(phase: &str) {
         7,
     )
     .unwrap();
+    let metrics = Arc::new(crate::b10_metrics::tests::metrics());
+    let coordinator = B10ObservedClient::new(
+        Arc::new(coordinator),
+        metrics.observer_factory(TEST_BLOCK_SIZE),
+    );
     let context = build_test_context(phase);
     let outcome = coordinator
         .generate(
@@ -3528,6 +3578,10 @@ async fn generation_error_scenario(phase: &str) {
     {
         assert_eq!(prefill_router.method_call_count("mark_prefill"), 0);
     }
+    assert_eq!(
+        crate::b10_metrics::tests::value(&metrics, "current_inflight_requests"),
+        0.0
+    );
 }
 
 #[tokio::test]
@@ -3770,7 +3824,9 @@ async fn generation_coordinator_empty_prefill_handoff_preserves_completion() {
 
 #[tokio::test]
 async fn generation_coordinator_empty_prefill_handoff_waits_for_completion_without_eof() {
-    for remote in [false, true] {
+    use crate::b10_metrics::tests::{metrics, value};
+    for (remote, cancel) in [(false, false), (false, true), (true, false), (true, true)] {
+        let metrics = Arc::new(metrics());
         let prefill_router =
             RouterGuardClientForTesting::new(vec![7], vec![7], vec![route_response_new(1)]);
         let prefill_worker = RouterGuardClientForTesting::new(vec![1], vec![1], vec![]);
@@ -3819,6 +3875,8 @@ async fn generation_coordinator_empty_prefill_handoff_waits_for_completion_witho
             DisaggregationStrategy::PrefillFirst,
         );
         let (coordinator, server) = generation_transport(coordinator, remote).await;
+        let coordinator =
+            B10ObservedClient::new(coordinator, metrics.observer_factory(TEST_BLOCK_SIZE));
         let outcome = coordinator
             .generate(
                 build_test_context("sglang-stream"),
@@ -3854,6 +3912,12 @@ async fn generation_coordinator_empty_prefill_handoff_waits_for_completion_witho
         assert_eq!(prefill["cached_tokens"].as_i64(), Some(2));
         assert_eq!(prefill["kv_cache_metrics"], jv!({"num_reused_blocks": 2}));
         assert!(prefill["outputs"][0]["finish_reason"].is_nil());
+        assert_eq!(value(&metrics, "total_successful_requests"), 0.0);
+        assert_eq!(value(&metrics, "current_inflight_requests"), 1.0);
+        assert_eq!(
+            value(&metrics, "llm_time_to_first_token_seconds_count_total"),
+            0.0
+        );
         let first_decode = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("decode must not wait for prefill EOF")
@@ -3866,6 +3930,21 @@ async fn generation_coordinator_empty_prefill_handoff_waits_for_completion_witho
             first_decode["kv_cache_metrics"],
             jv!({"num_reused_blocks": 0})
         );
+        assert_eq!(value(&metrics, "llm_output_tokens_total"), 2.0);
+        if cancel {
+            drop(stream);
+            assert_eq!(value(&metrics, "total_successful_requests"), 0.0);
+            assert_eq!(value(&metrics, "total_pre_20_token_cancellations"), 1.0);
+            assert_eq!(value(&metrics, "llm_output_tokens_total"), 2.0);
+            wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2))
+                .await;
+            wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2))
+                .await;
+            if let Some(server) = server {
+                server.shutdown().await.unwrap();
+            }
+            continue;
+        }
         let last = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .unwrap()
@@ -3880,6 +3959,10 @@ async fn generation_coordinator_empty_prefill_handoff_waits_for_completion_witho
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(value(&metrics, "total_successful_requests"), 1.0);
+        assert_eq!(value(&metrics, "llm_output_tokens_total"), 3.0);
+        assert_eq!(value(&metrics, "llm_cached_input_tokens_total"), 2.0);
+        assert_eq!(value(&metrics, "llm_uncached_input_tokens_total"), 2.0);
         wait_for_method_call_count(&prefill_router, "mark_free", 1, Duration::from_secs(2)).await;
         wait_for_method_call_count(&decode_router, "mark_free", 1, Duration::from_secs(2)).await;
         assert_eq!(prefill_router.method_call_count("mark_free"), 1);
@@ -4014,7 +4097,9 @@ async fn generation_coordinator_empty_prefill_failure_cleans_up_both_workers() {
 
 #[tokio::test]
 async fn generation_coordinator_decode_denial_retains_prefill_admission() {
+    use crate::b10_metrics::tests::{metrics, value};
     for remote in [false, true] {
+        let metrics = Arc::new(metrics());
         let prefill_router = RouterGuardClientForTesting::new(
             vec![7],
             vec![7],
@@ -4056,6 +4141,8 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
         );
 
         let (coordinator, server) = generation_transport(coordinator, remote).await;
+        let coordinator =
+            B10ObservedClient::new(coordinator, metrics.observer_factory(TEST_BLOCK_SIZE));
 
         let outcome = coordinator
             .generate(
@@ -4094,6 +4181,21 @@ async fn generation_coordinator_decode_denial_retains_prefill_admission() {
                 cached_tokens: Some(2),
                 output_tokens: Some(1),
             })
+        );
+        assert_eq!(value(&metrics, "llm_output_tokens_total"), 1.0);
+        assert_eq!(value(&metrics, "total_output_tokens"), 1.0);
+        assert_eq!(
+            value(&metrics, "llm_processor_output_tokens_histogram_sum_total"),
+            1.0
+        );
+        assert_eq!(value(&metrics, "total_pre_20_token_cancellations"), 1.0);
+        assert_eq!(
+            value(&metrics, "llm_time_to_first_token_seconds_count_total"),
+            0.0
+        );
+        assert_eq!(
+            value(&metrics, "llm_time_per_output_token_seconds_count_total"),
+            0.0
         );
         let admission = denied.admission.expect("prefill admission");
         assert!(admission.prefill_duration.is_some());
@@ -4140,6 +4242,11 @@ async fn generation_coordinator_shields_prefill_to_decode_handoff() {
         Some(decode_worker.clone()),
         DisaggregationStrategy::PrefillFirst,
     );
+    let metrics = Arc::new(crate::b10_metrics::tests::metrics());
+    let coordinator = B10ObservedClient::new(
+        Arc::new(coordinator),
+        metrics.observer_factory(TEST_BLOCK_SIZE),
+    );
     let context = build_test_context("generation-handoff-cancel");
     let context_for_task = context.clone();
     let task = tokio::spawn(async move {
@@ -4183,6 +4290,14 @@ async fn generation_coordinator_shields_prefill_to_decode_handoff() {
     assert_eq!(
         decode_worker.calls()[0].1["disaggregated_params"]["disagg_request_id"].as_u64(),
         Some(9)
+    );
+    assert_eq!(
+        crate::b10_metrics::tests::value(&metrics, "current_inflight_requests"),
+        0.0
+    );
+    assert_eq!(
+        crate::b10_metrics::tests::value(&metrics, "total_pre_first_token_cancellations"),
+        1.0
     );
 }
 

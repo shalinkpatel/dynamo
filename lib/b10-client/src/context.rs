@@ -41,6 +41,10 @@ impl RequestContext {
         self.trace_context.as_ref()
     }
 
+    pub fn metadata(&self) -> &BTreeMap<String, String> {
+        &self.metadata
+    }
+
     pub fn metadata_snapshot(&self) -> BTreeMap<String, String> {
         self.metadata.clone()
     }

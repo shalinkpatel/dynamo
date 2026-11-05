@@ -197,6 +197,7 @@ impl GenerationCoordinator {
         runtime,
         namespace=None,
         is_client_force=None,
+        metrics_config=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -212,6 +213,7 @@ impl GenerationCoordinator {
         runtime: &crate::DistributedRuntime,
         namespace: Option<String>,
         is_client_force: Option<bool>,
+        metrics_config: Option<String>,
     ) -> PyResult<Self> {
         let _ = model_name;
         let strategy = match enum_value(disaggregation_strategy)?.as_deref() {
@@ -250,6 +252,14 @@ impl GenerationCoordinator {
             mark_timing,
             block_size: kv_block_size,
             machine_id,
+            metrics: metrics_config
+                .map(|config| -> anyhow::Result<_> {
+                    Ok(Arc::new(dynamo_b10_client::GenerationMetrics::new(
+                        serde_json::from_str(&config)?,
+                    )?))
+                })
+                .transpose()
+                .map_err(to_pyerr)?,
         };
         let config = baseten_configmap::current_reader();
         Ok(Self {
@@ -278,6 +288,27 @@ impl GenerationCoordinator {
             inner: Arc::new(GenerationCoordinatorRuntime::remote(backends).map_err(to_pyerr)?),
             config: baseten_configmap::current_reader(),
         })
+    }
+
+    fn configure_metrics(&self, trace_json: String, session_metrics_enabled: bool) -> PyResult<()> {
+        if let Some(metrics) = self.inner.metrics() {
+            metrics
+                .configure(
+                    serde_json::from_str(&trace_json)
+                        .map_err(|error| PyValueError::new_err(error.to_string()))?,
+                    session_metrics_enabled,
+                )
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn metrics_samples_json(&self, py: Python<'_>) -> PyResult<String> {
+        py.allow_threads(|| match self.inner.metrics() {
+            Some(metrics) => serde_json::to_string(&metrics.samples()),
+            None => Ok("[]".into()),
+        })
+        .map_err(to_pyerr)
     }
 
     #[getter]

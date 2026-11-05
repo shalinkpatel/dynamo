@@ -13,6 +13,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
+llm-runtime-metrics = { path = "../../llm-runtime-metrics/crates/performance-metrics-core" }
 dynamo-tokens = { workspace = true }
 anyhow = { workspace = true }
 baseten-configmap = { workspace = true }

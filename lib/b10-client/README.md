@@ -316,3 +316,12 @@ not queue work or clone stream payloads; consumers control the cost of recording
 Incremental callback overhead has not been benchmarked. Implementors provide
 coordinator dispatch in `generate_inner`; callers continue using `generate`.
 Startup, bids, and load queries do not create observations.
+
+Native generation metrics use these callbacks in both runtime modes when
+`metrics` is configured and no custom observer is supplied. Receiving coordinators
+use `GenerationMetrics::observer_factory(block_size)` with deployment labels;
+sending clients use `sending_observer_factory(block_size)` with the request's
+billing namespace and model version. A remote runtime exposes the same metric
+configuration and snapshot APIs as a local runtime. Python retains configuration,
+trace hot reload, and snapshot scraping; generation recording is native on both
+boundaries. Custom Rust clients without a metrics configuration remain opt-in.

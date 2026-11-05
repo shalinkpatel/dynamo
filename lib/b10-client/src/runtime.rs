@@ -42,6 +42,7 @@ pub struct LocalCoordinatorOptions {
     pub mark_timing: PrefillMarkTiming,
     pub block_size: u32,
     pub machine_id: u64,
+    pub metrics: Option<Arc<crate::GenerationMetrics>>,
     /// Native generation callbacks for the selected sending or serving boundary.
     pub observer: Option<Arc<dyn crate::GenerationObserverFactory>>,
 }
@@ -119,7 +120,9 @@ impl GenerationCoordinatorClient for LocalCoordinator {
                 _ = inner.killed() => return cancelled(),
                 result = self.start() => result?,
             };
-            coordinator.generate(context, request, options).await
+            coordinator
+                .generate(context.clone(), request, options)
+                .await
         })
     }
 }
@@ -129,6 +132,7 @@ pub struct GenerationCoordinatorRuntime {
     client: Arc<dyn GenerationCoordinatorClient>,
     local: Option<Arc<LocalCoordinator>>,
     listener: Option<Listener>,
+    metrics: Option<Arc<crate::GenerationMetrics>>,
 }
 
 struct Listener {
@@ -210,6 +214,7 @@ impl GenerationCoordinatorRuntime {
             started: OnceCell::new(),
             shutdown: runtime.child_token(),
         });
+        let metrics = options.metrics.clone();
         let (client, local): (Arc<dyn GenerationCoordinatorClient>, _) =
             if is_client_force.unwrap_or(settings.remotes.is_some() || default_remote.is_some()) {
                 ensure!(
@@ -225,11 +230,21 @@ impl GenerationCoordinatorRuntime {
                     Some(&namespace),
                     default_remote,
                 )?;
-                if let Some(observer) = options.observer {
+                if let Some(observer) = options.observer.or_else(|| {
+                    metrics
+                        .as_ref()
+                        .map(|metrics| metrics.sending_observer_factory(options.block_size))
+                }) {
                     remote = remote.with_observer(observer);
                 }
                 (Arc::new(remote), None)
             } else {
+                let mut options = options;
+                if options.observer.is_none()
+                    && let Some(metrics) = options.metrics.clone()
+                {
+                    options.observer = Some(metrics.observer_factory(options.block_size));
+                }
                 let local = Arc::new(LocalCoordinator {
                     options,
                     ready: OnceCell::new(),
@@ -241,6 +256,7 @@ impl GenerationCoordinatorRuntime {
             client,
             local,
             listener,
+            metrics,
         })
     }
 
@@ -278,6 +294,7 @@ impl GenerationCoordinatorRuntime {
             client: Arc::new(client),
             local: None,
             listener: None,
+            metrics: None,
         })
     }
 
@@ -288,6 +305,10 @@ impl GenerationCoordinatorRuntime {
         options: GenerationOptions,
     ) -> futures::future::BoxFuture<'_, Result<GenerationOutcome>> {
         self.client.generate(context, request, options)
+    }
+
+    pub fn metrics(&self) -> Option<&Arc<crate::GenerationMetrics>> {
+        self.metrics.as_ref()
     }
 
     pub fn is_client(&self) -> bool {
@@ -433,6 +454,7 @@ mod tests {
                 mark_timing: PrefillMarkTiming::AfterPrefillCompute,
                 block_size: 32,
                 machine_id: 1,
+                metrics: None,
                 observer: Some(Arc::new(lifecycle.clone())),
             };
             let coordinator = if mode == "remote_only" {
@@ -494,6 +516,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn b10_metrics_cover_unpolled_setup_and_cancel_before_start() {
+        use crate::b10_metrics::tests::{metrics, value};
+        use dynamo_runtime::pipeline::{AsyncEngineContext, context::Controller};
+        let runtime = DistributedRuntime::new(
+            Runtime::from_current().unwrap(),
+            DistributedConfig::process_local(),
+        )
+        .await
+        .unwrap();
+        let endpoint = runtime
+            .namespace("metrics")
+            .unwrap()
+            .component("worker")
+            .unwrap()
+            .endpoint("generate");
+        let metrics = Arc::new(metrics());
+        let local = LocalCoordinator {
+            options: LocalCoordinatorOptions {
+                primary_worker: CoordinatorClient::Endpoint(endpoint.clone()),
+                primary_router: CoordinatorClient::Endpoint(endpoint),
+                next_worker: None,
+                next_router: None,
+                strategy: DisaggregationStrategy::Aggregated,
+                mark_timing: PrefillMarkTiming::AfterPrefillCompute,
+                block_size: 32,
+                machine_id: 1,
+                metrics: Some(metrics.clone()),
+                observer: Some(metrics.observer_factory(32)),
+            },
+            ready: OnceCell::new(),
+            shutdown_token: runtime.primary_token(),
+        };
+        let request = || GenerationRequest {
+            routing_request: crate::RouterRequestNew {
+                tokens: vec![1, 2],
+                ..Default::default()
+            },
+            primary_worker_request: rmpv::Value::Nil,
+            decode_worker_request: None,
+        };
+        let inner: Arc<dyn AsyncEngineContext> =
+            Arc::new(Controller::new("org--request--version".into()));
+        let context = RequestContext::new(inner.clone(), None, BTreeMap::new());
+        let future = local.generate(context.clone(), request(), GenerationOptions::default());
+        assert_eq!(value(&metrics, "current_inflight_requests"), 1.0);
+        drop(future);
+        assert_eq!(value(&metrics, "current_inflight_requests"), 0.0);
+        inner.stop_generating();
+        assert!(matches!(
+            local
+                .generate(context, request(), GenerationOptions::default())
+                .await
+                .unwrap(),
+            GenerationOutcome::Denied(_)
+        ));
+        assert!(local.ready.get().is_none());
+        assert_eq!(value(&metrics, "total_pre_first_token_cancellations"), 2.0);
+        assert_eq!(value(&metrics, "llm_input_tokens_total"), 6.0);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn b10_metrics_auto_observer_records_both_modes_and_yields_to_custom_observer() {
+        use crate::b10_metrics::tests::{metrics as test_metrics, value};
+        use dynamo_runtime::pipeline::{AsyncEngineContext, context::Controller};
+        let runtime = DistributedRuntime::new(
+            Runtime::from_current().unwrap(),
+            DistributedConfig::process_local(),
+        )
+        .await
+        .unwrap();
+        let endpoint = runtime
+            .namespace("metrics-auto")
+            .unwrap()
+            .component("worker")
+            .unwrap()
+            .endpoint("generate");
+        let options =
+            |metrics: &Arc<crate::GenerationMetrics>,
+             observer: Option<Arc<dyn crate::GenerationObserverFactory>>| {
+                LocalCoordinatorOptions {
+                    primary_worker: CoordinatorClient::Endpoint(endpoint.clone()),
+                    primary_router: CoordinatorClient::Endpoint(endpoint.clone()),
+                    next_worker: None,
+                    next_router: None,
+                    strategy: DisaggregationStrategy::Aggregated,
+                    mark_timing: PrefillMarkTiming::AfterPrefillCompute,
+                    block_size: 32,
+                    machine_id: 1,
+                    metrics: Some(metrics.clone()),
+                    observer,
+                }
+            };
+        let stopped_context = || {
+            let inner: Arc<dyn AsyncEngineContext> =
+                Arc::new(Controller::new("org--request--version".into()));
+            inner.stop_generating();
+            RequestContext::new(inner, None, BTreeMap::new())
+        };
+        let request = || GenerationRequest {
+            routing_request: crate::RouterRequestNew {
+                tokens: vec![1, 2],
+                ..Default::default()
+            },
+            primary_worker_request: rmpv::Value::Nil,
+            decode_worker_request: None,
+        };
+
+        let metrics = Arc::new(test_metrics());
+        let local = GenerationCoordinatorRuntime::with_default_remote(
+            runtime.clone(),
+            options(&metrics, None),
+            ConfigReader::in_memory(UnifiedConfig::default()),
+            Some("metrics-auto".into()),
+            Some(false),
+            None,
+        )
+        .unwrap();
+        assert!(local.metrics().is_some());
+        assert!(local.local.as_ref().unwrap().options.observer.is_some());
+        assert!(matches!(
+            local
+                .generate(stopped_context(), request(), GenerationOptions::default())
+                .await
+                .unwrap(),
+            GenerationOutcome::Denied(_)
+        ));
+        assert_eq!(value(&metrics, "llm_input_tokens_total"), 3.0);
+        assert_eq!(value(&metrics, "total_pre_first_token_cancellations"), 1.0);
+
+        let remote_metrics = Arc::new(test_metrics());
+        let remote = GenerationCoordinatorRuntime::with_default_remote(
+            runtime.clone(),
+            options(&remote_metrics, None),
+            ConfigReader::in_memory(UnifiedConfig::default()),
+            Some("metrics-auto".into()),
+            Some(true),
+            Some("http://127.0.0.1:1/v1/coordinate".into()),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(remote.metrics().unwrap(), &remote_metrics));
+        assert!(remote.local.is_none());
+        let future = remote.generate(stopped_context(), request(), GenerationOptions::default());
+        assert_eq!(value(&remote_metrics, "current_inflight_requests"), 1.0);
+        drop(future);
+        assert_eq!(value(&remote_metrics, "llm_input_tokens_total"), 3.0);
+        assert_eq!(
+            value(&remote_metrics, "total_pre_first_token_cancellations"),
+            1.0
+        );
+        assert_eq!(value(&remote_metrics, "current_inflight_requests"), 0.0);
+
+        let custom_metrics = Arc::new(test_metrics());
+        let lifecycle = Lifecycle::default();
+        let custom = GenerationCoordinatorRuntime::with_default_remote(
+            runtime.clone(),
+            options(&custom_metrics, Some(Arc::new(lifecycle.clone()))),
+            ConfigReader::in_memory(UnifiedConfig::default()),
+            Some("metrics-auto".into()),
+            Some(false),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            custom
+                .generate(stopped_context(), request(), GenerationOptions::default())
+                .await
+                .unwrap(),
+            GenerationOutcome::Denied(_)
+        ));
+        assert_eq!(
+            lifecycle.begins.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            *lifecycle.ends.lock().unwrap(),
+            vec![crate::GenerationObservationEnd::Denied]
+        );
+        assert_eq!(value(&custom_metrics, "llm_input_tokens_total"), 0.0);
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
     async fn startup_fixes_mode_and_listener_until_runtime_shutdown() {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let runtime = DistributedRuntime::new(
@@ -517,6 +722,7 @@ mod tests {
                 mark_timing: PrefillMarkTiming::AfterPrefillCompute,
                 block_size: 32,
                 machine_id: 1,
+                metrics: None,
                 observer: None,
             };
             let reader = ConfigReader::in_memory(UnifiedConfig::default());

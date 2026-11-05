@@ -1114,6 +1114,7 @@ fails without #906.
 
 Status: `keep`
 
+Native OV generation metrics (basetenlabs/dynamo#1178): keep the LocalCoordinator stream-owned observer and scrape facade with the llm-runtime-metrics core dependency; prefill handoffs and late metadata must not close accounting early.
 Native coordinator callbacks (#1181): keep optional sending/serving observers before routing, with stream-owned finalization and observer setup errors leaving generation unaffected.
 
 Source commits:

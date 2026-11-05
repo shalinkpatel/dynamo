@@ -822,7 +822,11 @@ class GenerationCoordinator:
         runtime: DistributedRuntime,
         namespace: str | None = None,
         is_client_force: bool | None = None,
+        metrics_config: str | None = None,
     ) -> None: ...
+    def metrics_samples_json(self) -> str: ...
+    def configure_metrics(self, trace_json: str, session_metrics_enabled: bool) -> None: ...
+
     @classmethod
     def remote(cls, backends: Dict[str, str]) -> GenerationCoordinator:
         """Connect to named remote generation-coordinator backends."""
