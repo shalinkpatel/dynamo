@@ -142,7 +142,7 @@ routing:
   planner_staleness_grace_secs: 30
   replica_warmup_secs: 90
   shutdown_grace_secs: 30
-  approx_indexer_ttl_secs: 120
+  approx_indexer_ttl_secs: 900
 ```
 
 `ingress_url` must use the exact path `/v1`; GWP rejects other paths during

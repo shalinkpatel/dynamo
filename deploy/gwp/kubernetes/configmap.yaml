@@ -49,7 +49,7 @@ data:
       planner_staleness_grace_secs: 30
       replica_warmup_secs: 90
       shutdown_grace_secs: 30
-      approx_indexer_ttl_secs: 120
+      approx_indexer_ttl_secs: 900
     # Precedence: models.<canonical>.load_balancing > default.load_balancing > b10-router.yaml > hardcoded
     model_policies:
       default:

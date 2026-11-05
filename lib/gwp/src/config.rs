@@ -183,8 +183,7 @@ pub struct RoutingConfig {
     pub shutdown_grace_secs: u64,
     /// Lifetime of entries in the approximate indexer (the local prune-TTL'd
     /// radix tree populated by `record_routing_decision`), in seconds.
-    /// Routing decisions older than this are pruned. Mirrors the KV router's
-    /// `router_ttl_secs`. Startup-only; not hot-reloadable.
+    /// Routing decisions older than this are pruned. Startup-only; not hot-reloadable.
     #[serde(default = "default_approx_indexer_ttl_secs")]
     pub approx_indexer_ttl_secs: u64,
 }
@@ -361,7 +360,7 @@ fn default_shutdown_grace_secs() -> u64 {
     30
 }
 fn default_approx_indexer_ttl_secs() -> u64 {
-    120
+    900
 }
 
 impl GwpConfig {
@@ -950,7 +949,7 @@ model_policies:
         assert_eq!(config.routing.planner_staleness_grace_secs, 45);
         assert_eq!(config.routing.replica_warmup_secs, 90);
         assert_eq!(config.routing.shutdown_grace_secs, 30);
-        assert_eq!(config.routing.approx_indexer_ttl_secs, 120);
+        assert_eq!(config.routing.approx_indexer_ttl_secs, 900);
         assert_eq!(
             config.model_policy("deepseek-v3-preview"),
             ModelStagePolicy {
