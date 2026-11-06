@@ -825,3 +825,25 @@ def test_anonymize_parquet_defaults_accept_old_schema_files(tmp_path: Path) -> N
     assert table.column("provided_session_id").to_pylist() == ["1", None]
     assert table.column("org_id").to_pylist() == ["1", "1"]
     assert table.column("total_hashes").to_pylist() == [[1], [1, 2]]
+
+    # The 0.0.24 format records the per-request org as request_org_id.
+    new = pa.table(
+        {
+            "timestamp_start_unix_ms": pa.array([10, 20], pa.uint64()),
+            "total_hashes": pa.array([[b"a" * 32], [b"a" * 32, b"b" * 32]], hash_type),
+            "provided_session_id": pa.array(["s1", None], pa.string()),
+            "request_org_id": pa.array(["o1", "o2"], pa.string()),
+            "__version__": pa.array(["0.0.24", "0.0.24"], pa.string()),
+        }
+    )
+    source = tmp_path / "new.parquet"
+    pq.write_table(new, source)
+    output = tmp_path / "anonymized-new.parquet"
+
+    llm_runtime_metrics.anonymize_parquet(str(source), str(output))
+
+    table = pq.read_table(output)
+    assert table.column("provided_session_id").to_pylist() == ["1", None]
+    # Distinct request orgs stay distinct after pseudonymization.
+    assert table.column("request_org_id").to_pylist() != ["o1", "o2"]
+    assert len(set(table.column("request_org_id").to_pylist())) == 2

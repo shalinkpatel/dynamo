@@ -259,7 +259,7 @@ pub struct RequestLogEntry {
     pub request_canceled: bool,
     pub cached_tokens_reference: Option<u64>,
     pub model_name: String,
-    pub org_id: String,
+    pub request_org_id: String,
     #[serde(default)]
     pub component_name: Option<String>,
     #[serde(default)]
@@ -712,7 +712,7 @@ pub struct RequestTrace {
     terminal: bool,
     cached_tokens: Option<u64>,
     model_name: String,
-    org_id: String,
+    request_org_id: String,
     block_size: usize,
     features: Vec<String>,
     speculation_ratio: Option<f64>,
@@ -1066,6 +1066,7 @@ impl RequestTraceFactory {
             None,
             features,
             service_tier,
+            None,
         );
         trace.append_tokens(input_token_ids);
         trace
@@ -1086,6 +1087,7 @@ impl RequestTraceFactory {
             None,
             features,
             service_tier,
+            None,
         )
     }
 
@@ -1097,6 +1099,7 @@ impl RequestTraceFactory {
         b10_request_id: Option<&str>,
         features: Vec<String>,
         service_tier: Option<ServiceTier>,
+        org_id: Option<&str>,
     ) -> RequestTrace {
         let worker = self.recorder.current_worker();
         RequestTrace {
@@ -1114,7 +1117,13 @@ impl RequestTraceFactory {
             terminal: false,
             cached_tokens: None,
             model_name: self.model_name.clone(),
-            org_id: self.org_id.clone(),
+            // Per-request override falls back to the factory-level (deployment) value.
+            // Hashed here, not at write time: build_log_entry copies request_org_id verbatim
+            // into the log row, so this is the only place raw orgs are kept out of
+            // recorded captures. The anonymize/compaction tool re-hashes separately.
+            request_org_id: org_id
+                .map(hash_unkeyed_string)
+                .unwrap_or_else(|| self.org_id.clone()),
             block_size: self.block_size,
             features,
             speculation_ratio: None,
@@ -1318,6 +1327,7 @@ impl RequestMetricsFactory {
             None,
             None,
             None,
+            None,
         )
         .expect("unlabeled new_request cannot fail")
     }
@@ -1339,6 +1349,7 @@ impl RequestMetricsFactory {
             input_token_count,
             features,
             provided_session_id,
+            None,
             None,
             None,
             None,
@@ -1385,6 +1396,7 @@ impl RequestMetricsFactory {
         b10_request_id: Option<&str>,
         service_tier: Option<ServiceTier>,
         dp_rank: Option<u8>,
+        org_id: Option<&str>,
     ) -> anyhow::Result<RequestMetricsRequest> {
         // When the token slice is provided, derive the count from it to avoid
         // a mismatch between the two arguments.
@@ -1399,10 +1411,11 @@ impl RequestMetricsFactory {
             b10_request_id,
             service_tier,
             dp_rank,
-            |count, sid, b10_id, feats, tier| {
+            org_id,
+            |count, sid, b10_id, feats, tier, org| {
                 let mut trace = self
                     .trace_factory
-                    .create_trace_base(count, sid, b10_id, feats, tier);
+                    .create_trace_base(count, sid, b10_id, feats, tier, org);
                 // Skip hashing on the count-only path.
                 if let Some(ids) = input_token_ids {
                     trace.append_tokens(ids);
@@ -1422,6 +1435,7 @@ impl RequestMetricsFactory {
         b10_request_id: Option<&str>,
         service_tier: Option<ServiceTier>,
         dp_rank: Option<u8>,
+        org_id: Option<&str>,
         create_trace: F,
     ) -> anyhow::Result<RequestMetricsRequest>
     where
@@ -1431,6 +1445,7 @@ impl RequestMetricsFactory {
             Option<&str>,
             Vec<String>,
             Option<ServiceTier>,
+            Option<&str>,
         ) -> RequestTrace,
     {
         // Resolve labeled handles first so any registry error (cardinality cap,
@@ -1468,6 +1483,7 @@ impl RequestMetricsFactory {
                 b10_request_id,
                 features_vec,
                 service_tier,
+                org_id,
             ),
             started_at: Instant::now(),
             input_tokens: input_token_count as u64,
@@ -2138,7 +2154,7 @@ impl RequestTrace {
             request_canceled: canceled,
             cached_tokens_reference: self.cached_tokens,
             model_name: self.model_name.clone(),
-            org_id: self.org_id.clone(),
+            request_org_id: self.request_org_id.clone(),
             component_name: self.factory.component_name.clone(),
             component_id: Some(self.factory.component_id.clone()),
             block_size: self.block_size,
@@ -2573,7 +2589,7 @@ pub(crate) fn serialize_to_parquet(entries: &[RequestLogEntry]) -> anyhow::Resul
         Field::new("request_canceled", DataType::UInt8, false),
         Field::new("cached_tokens_reference", DataType::UInt64, true),
         Field::new("model_name", DataType::Utf8, false),
-        Field::new("org_id", DataType::Utf8, false),
+        Field::new("request_org_id", DataType::Utf8, false),
         Field::new("component_name", DataType::Utf8, true),
         Field::new("component_id", DataType::Utf8, true),
         Field::new("block_size", DataType::UInt64, false),
@@ -2646,7 +2662,7 @@ pub(crate) fn serialize_to_parquet(entries: &[RequestLogEntry]) -> anyhow::Resul
     let cached_tokens_ref: Vec<Option<u64>> =
         entries.iter().map(|e| e.cached_tokens_reference).collect();
     let model_name: Vec<String> = entries.iter().map(|e| e.model_name.clone()).collect();
-    let org_id: Vec<String> = entries.iter().map(|e| e.org_id.clone()).collect();
+    let request_org_id: Vec<String> = entries.iter().map(|e| e.request_org_id.clone()).collect();
     let component_name: Vec<Option<String>> =
         entries.iter().map(|e| e.component_name.clone()).collect();
     let component_id: Vec<Option<String>> =
@@ -2681,7 +2697,7 @@ pub(crate) fn serialize_to_parquet(entries: &[RequestLogEntry]) -> anyhow::Resul
             Arc::new(UInt8Array::from(request_canceled)),
             Arc::new(UInt64Array::from(cached_tokens_ref)),
             Arc::new(StringArray::from(model_name)),
-            Arc::new(StringArray::from(org_id)),
+            Arc::new(StringArray::from(request_org_id)),
             Arc::new(StringArray::from(component_name)),
             Arc::new(StringArray::from(component_id)),
             Arc::new(UInt64Array::from(block_size)),
@@ -3521,7 +3537,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[100, 101, 102, 103, 104], Some(2), true, None);
@@ -3568,7 +3584,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[100, 101, 102], Some(2), true, None);
@@ -3669,7 +3685,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[100, 101, 102, 103, 104], Some(2), true, None);
@@ -3710,7 +3726,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11], Some(2), true, None);
@@ -3752,7 +3768,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         let snapshot = factory.snapshot();
@@ -3784,7 +3800,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
 
@@ -3859,7 +3875,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10], Some(2), true, None);
@@ -3892,7 +3908,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    None, None,
                 )
                 .unwrap();
             req.record_tokens(&[10], Some(2), true, None);
@@ -3924,7 +3940,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12, 13, 14], Some(2), true, None);
@@ -3956,7 +3972,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    None, None,
                 )
                 .unwrap();
         }
@@ -3987,7 +4003,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -4031,7 +4047,7 @@ mod tests {
             request_canceled: false,
             cached_tokens_reference: None,
             model_name: "unset_model_name".to_string(),
-            org_id: String::new(),
+            request_org_id: String::new(),
             component_name: None,
             component_id: None,
             block_size: DEFAULT_BLOCK_SIZE,
@@ -4159,6 +4175,52 @@ mod tests {
     }
 
     #[test]
+    fn per_request_org_id_overrides_factory_value() {
+        let factory = RequestMetricsFactory::new(RequestMetricsOptions {
+            trace: RequestTraceOptions {
+                org_id: "deployment-org".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+        let overridden = factory
+            .new_request_labeled(
+                None,
+                0,
+                RequestFeatures::NONE,
+                None,
+                None,
+                None,
+                None,
+                Some("per-request-org"),
+            )
+            .unwrap();
+        let fallback = factory
+            .new_request_labeled(
+                None,
+                0,
+                RequestFeatures::NONE,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let overridden_entry = overridden.trace.build_log_entry(false);
+        let fallback_entry = fallback.trace.build_log_entry(false);
+        assert_eq!(
+            overridden_entry.request_org_id,
+            blake3::hash("per-request-org".as_bytes()).to_hex().to_string()
+        );
+        assert_eq!(fallback_entry.request_org_id, factory.trace_factory.org_id);
+        assert_ne!(overridden_entry.request_org_id, fallback_entry.request_org_id);
+    }
+
+    #[test]
     fn perf_record_tokens_mean_latency_is_reasonable_in_dev_profile() {
         let factory = RequestMetricsFactory::new(RequestMetricsOptions::default()).unwrap();
 
@@ -4180,7 +4242,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    None,
+                    None, None,
                 )
                 .unwrap();
 
@@ -4262,7 +4324,7 @@ mod tests {
                         None,
                         None,
                         tier,
-                        rank,
+                        rank, None,
                     )
                     .unwrap();
 
@@ -4359,7 +4421,7 @@ mod tests {
             request_canceled: false,
             cached_tokens_reference: Some(5),
             model_name: "test-model".to_string(),
-            org_id: "test-org-123".to_string(),
+            request_org_id: "test-org-123".to_string(),
             component_name: Some("frontend".to_string()),
             component_id: Some("12345".to_string()),
             block_size: DEFAULT_BLOCK_SIZE,
@@ -4399,7 +4461,7 @@ mod tests {
             "request_canceled",
             "cached_tokens_reference",
             "model_name",
-            "org_id",
+            "request_org_id",
             "component_name",
             "component_id",
             "block_size",
@@ -4479,7 +4541,7 @@ mod tests {
                 request_canceled: false,
                 cached_tokens_reference: Some(5),
                 model_name: "test-model".to_string(),
-                org_id: "test-org".to_string(),
+                request_org_id: "test-org".to_string(),
                 component_name: None,
                 component_id: None,
                 block_size: DEFAULT_BLOCK_SIZE,
@@ -4521,7 +4583,7 @@ mod tests {
                 request_canceled: true,
                 cached_tokens_reference: None,
                 model_name: "test-model-2".to_string(),
-                org_id: "test-org-2".to_string(),
+                request_org_id: "test-org-2".to_string(),
                 component_name: None,
                 component_id: None,
                 block_size: DEFAULT_BLOCK_SIZE,
@@ -4650,7 +4712,7 @@ mod tests {
             request_canceled: false,
             cached_tokens_reference: None,
             model_name: "test-model".to_string(),
-            org_id: "test-org".to_string(),
+            request_org_id: "test-org".to_string(),
             component_name: None,
             component_id: None,
             block_size: DEFAULT_BLOCK_SIZE,
@@ -4706,7 +4768,7 @@ mod tests {
             request_canceled: false,
             cached_tokens_reference: None,
             model_name: "test-model".to_string(),
-            org_id: "test-org".to_string(),
+            request_org_id: "test-org".to_string(),
             component_name: Some("frontend".to_string()),
             component_id: Some("12345".to_string()),
             block_size: DEFAULT_BLOCK_SIZE,
@@ -4886,7 +4948,7 @@ mod tests {
                 None,
                 None,
                 Some(ServiceTier::Fast),
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5002,7 +5064,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5031,7 +5093,7 @@ mod tests {
                 None,
                 None,
                 Some(ServiceTier::Fast),
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5067,7 +5129,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(3),
+                Some(3), None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5163,7 +5225,7 @@ mod tests {
                 None,
                 None,
                 Some(ServiceTier::Priority),
-                Some(7),
+                Some(7), None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5235,7 +5297,7 @@ mod tests {
                     None,
                     None,
                     None,
-                    Some(rank),
+                    Some(rank), None,
                 )
                 .unwrap();
             req.record_tokens(&[10, 11], Some(2), true, None);
@@ -5262,7 +5324,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(31),
+                Some(31), None,
             )
             .unwrap();
         req.record_tokens(&[10, 11], Some(2), true, None);
@@ -5291,7 +5353,7 @@ mod tests {
                 None,
                 None,
                 Some(ServiceTier::Priority),
-                Some(33),
+                Some(33), None,
             )
             .unwrap();
         req.record_tokens(&[10, 11], Some(2), true, None);
@@ -5329,7 +5391,7 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                None, None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5356,7 +5418,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(0),
+                Some(0), None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -5424,7 +5486,7 @@ mod tests {
                                 None,
                                 None,
                                 tier,
-                                rank,
+                                rank, None,
                             )
                             .unwrap();
                         req.record_tokens(&[10, 11, 12, 13, 14], Some(4), true, None);
@@ -5522,7 +5584,7 @@ mod tests {
                         None,
                         b10_id,
                         None,
-                        None,
+                        None, None,
                     )
                     .unwrap()
             };
@@ -5610,10 +5672,18 @@ mod tests {
         // One full block each: serialize_to_parquet rejects batches with no hashes at all.
         let block: Vec<u32> = (0..DEFAULT_BLOCK_SIZE as u32).collect();
         let mut routed_trace =
-            factory.create_trace_base(block.len(), None, Some(RAW_B10_REQUEST_ID), vec![], None);
+            factory.create_trace_base(
+                block.len(),
+                None,
+                Some(RAW_B10_REQUEST_ID),
+                vec![],
+                None,
+                None,
+            );
         routed_trace.append_tokens(&block);
         routed_trace.set_routed_workers(routed(11, Some(21)));
-        let mut unrouted_trace = factory.create_trace_base(block.len(), None, None, vec![], None);
+        let mut unrouted_trace =
+            factory.create_trace_base(block.len(), None, None, vec![], None, None);
         unrouted_trace.append_tokens(&block);
         let entries = vec![
             routed_trace.build_log_entry(false),
@@ -5688,7 +5758,7 @@ mod tests {
                 Some("session"),
                 None,
                 Some(ServiceTier::Fast),
-                None,
+                None, None,
             )
             .unwrap();
         let mut direct = factory.trace_factory.new_trace(
@@ -5705,7 +5775,7 @@ mod tests {
         assert_eq!(comparable_entry(&labeled.trace), comparable_entry(&direct));
 
         let counted = factory
-            .new_request_labeled(None, 150, features, Some("session"), None, None, None)
+            .new_request_labeled(None, 150, features, Some("session"), None, None, None, None,)
             .unwrap();
         let direct_count = factory.trace_factory.new_trace_with_count(
             150,

@@ -32,8 +32,9 @@ endpoints, the proxy must support HTTP `CONNECT`. Omit `s3_proxy_url` for a
 direct connection. `compact_s3_parquet_to_local` accepts the same option for
 downloads. Use `s3_endpoint` only for an S3-compatible endpoint override.
 
-In request-log records, `model_name` is stored as supplied. `org_id` is hashed
-without a salt. `provided_session_id` is hashed without a salt so the same ID
+In request-log records, `model_name` is stored as supplied. `request_org_id`
+(since 0.0.24; older records call it `org_id`) is the per-request organization
+ID, hashed without a salt. `provided_session_id` is hashed without a salt so the same ID
 has the same digest across deployments. `request_log_hash_salt` applies only to
 the token-block hashes in `total_hashes`; without it, those hashes are unkeyed.
 Timing, token counts, flags, and other metadata are stored as plain values.

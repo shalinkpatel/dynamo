@@ -203,6 +203,7 @@ class RequestMetricsFactory:
         service_tier: str | None = None,
         dp_rank: int | None = None,
         b10_request_id: str | None = None,
+        org_id: str | None = None,
     ) -> RequestMetrics: ...
     def snapshot(self) -> RequestMetricsSnapshot: ...
     def prometheus_samples(
@@ -250,12 +251,13 @@ def anonymize_parquet(
     output_path: str,
     columns_to_pseudonymize: Sequence[str] = [
         "provided_session_id",
+        "request_org_id",
         "org_id",
         "total_hashes",
         "prefill_worker_id",
         "decode_worker_id",
     ],
-    columns_to_drop: Sequence[str] = ["org_id", "b10_request_id"],
+    columns_to_drop: Sequence[str] = ["request_org_id", "org_id", "b10_request_id"],
     min_timestamp: int = 0,
 ) -> int: ...
 def hash_b10_request_id(b10_request_id: str) -> str: ...

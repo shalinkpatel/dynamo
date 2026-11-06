@@ -624,7 +624,7 @@ impl PyRequestMetricsFactory {
         self.inner.request_log_enabled()
     }
 
-    #[pyo3(signature = (input_token_ids, features = 0, session_id = None, service_tier = None, dp_rank = None, b10_request_id = None))]
+    #[pyo3(signature = (input_token_ids, features = 0, session_id = None, service_tier = None, dp_rank = None, b10_request_id = None, org_id = None))]
     fn new_request(
         &self,
         input_token_ids: &Bound<'_, PyAny>,
@@ -633,6 +633,7 @@ impl PyRequestMetricsFactory {
         service_tier: Option<String>,
         dp_rank: Option<i64>,
         b10_request_id: Option<String>,
+        org_id: Option<String>,
     ) -> PyResult<PyRequestMetricsRequest> {
         let tier = match service_tier.as_deref() {
             Some(value) => Some(
@@ -663,6 +664,7 @@ impl PyRequestMetricsFactory {
                         b10_request_id.as_deref(),
                         tier,
                         dp_rank,
+                        org_id.as_deref(),
                     )
                     .map_err(|e| PyValueError::new_err(e.to_string()))?,
             });
@@ -681,6 +683,7 @@ impl PyRequestMetricsFactory {
                     b10_request_id.as_deref(),
                     tier,
                     dp_rank,
+                    org_id.as_deref(),
                 )
                 .map_err(|e| PyValueError::new_err(e.to_string()))?,
         })
@@ -1062,6 +1065,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         req.record_tokens(&[10, 11, 12], Some(2), true, None);
@@ -1091,6 +1095,7 @@ mod tests {
                 Some(&[1, 2, 3, 4]),
                 4,
                 RsRequestFeatures::TOOLS | RsRequestFeatures::IMAGE,
+                None,
                 None,
                 None,
                 None,

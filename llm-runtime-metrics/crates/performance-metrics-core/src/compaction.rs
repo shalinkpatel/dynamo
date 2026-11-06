@@ -38,8 +38,9 @@ pub struct AnonymizeConfig {
 
 /// Default columns pseudonymized in anonymized outputs. Listed columns a file
 /// lacks (e.g. older schemas) are skipped.
-const DEFAULT_ANONYMIZE_PSEUDONYMIZE_COLUMNS: [&str; 5] = [
+const DEFAULT_ANONYMIZE_PSEUDONYMIZE_COLUMNS: [&str; 6] = [
     "provided_session_id",
+    "request_org_id",
     "org_id",
     "total_hashes",
     "prefill_worker_id",
@@ -47,7 +48,7 @@ const DEFAULT_ANONYMIZE_PSEUDONYMIZE_COLUMNS: [&str; 5] = [
 ];
 /// Default columns dropped from anonymized outputs. A column in both lists is
 /// pseudonymized, so b10_request_id must stay off the pseudonymize list.
-const DEFAULT_ANONYMIZE_DROP_COLUMNS: [&str; 2] = ["org_id", "b10_request_id"];
+const DEFAULT_ANONYMIZE_DROP_COLUMNS: [&str; 3] = ["request_org_id", "org_id", "b10_request_id"];
 
 impl AnonymizeConfig {
     /// The default lists for published (anonymized) outputs.
@@ -1406,8 +1407,8 @@ mod tests {
                 "{name} must not be invented"
             );
         }
-        // org_id is in both lists, so it is pseudonymized rather than dropped.
-        let org = batch.column_by_name("org_id").unwrap();
+        // request_org_id is in both lists, so it is pseudonymized rather than dropped.
+        let org = batch.column_by_name("request_org_id").unwrap();
         let org = org.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!((org.value(0), org.value(1)), ("1", "1"));
     }
