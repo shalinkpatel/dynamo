@@ -208,6 +208,9 @@ message ResponseOpenOutcomeRequest
     // failure, timeout, or cancellation before admission; no ResponseFinish.
     OpenFailure failed = 4;
   }
+  // Required: the attempt's CommitIntendRequest.input, so any replica can
+  // settle the attempt without having seen CommitIntend.
+  LocateRequest input = 5;
 }
 
 message OpenFailure
@@ -237,6 +240,8 @@ message ResponseFinishRequest
   string attempt_id = 1;
   // Required non-unspecified reason describing the admitted response's end.
   Reason reason = 2;
+  // Required: the attempt's CommitIntendRequest.input.model_id.
+  string model_id = 3;
 }
 
 message NewRequest

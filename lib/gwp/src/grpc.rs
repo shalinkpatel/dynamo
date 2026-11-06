@@ -885,6 +885,7 @@ mod tests {
         );
         locator
             .response_open_outcome(native::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: attempt_id.clone(),
                 outcome: Some(native::response_open_outcome_request::Outcome::Admitted(
                     native::Admission {
@@ -898,6 +899,7 @@ mod tests {
             .unwrap();
         locator
             .response_finish(native::ResponseFinishRequest {
+                model_id: String::new(),
                 attempt_id,
                 reason: native::response_finish_request::Reason::Completed as i32,
             })

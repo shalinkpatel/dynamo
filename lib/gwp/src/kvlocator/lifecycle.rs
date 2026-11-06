@@ -814,6 +814,7 @@ mod lifecycle_tests {
 
     fn admitted(attempt: &str) -> pb::ResponseOpenOutcomeRequest {
         pb::ResponseOpenOutcomeRequest {
+            input: None,
             attempt_id: attempt_id(attempt),
             outcome: Some(pb::response_open_outcome_request::Outcome::Admitted(
                 pb::Admission {
@@ -831,6 +832,7 @@ mod lifecycle_tests {
         reason: pb::response_finish_request::Reason,
     ) -> pb::ResponseFinishRequest {
         pb::ResponseFinishRequest {
+            model_id: String::new(),
             attempt_id: attempt_id(attempt),
             reason: reason as i32,
         }
@@ -973,6 +975,7 @@ mod lifecycle_tests {
         let lifecycle = make_lifecycle().await;
         lifecycle
             .open(&pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: attempt_id("a1"),
                 outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                     pb::DeniedGeneration {
@@ -1150,6 +1153,7 @@ mod lifecycle_tests {
             changed,
             admitted("a1"),
             pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: attempt_id("a1"),
                 outcome: None,
             },
@@ -1329,6 +1333,7 @@ mod lifecycle_tests {
                 };
                 lifecycle
                     .open(&pb::ResponseOpenOutcomeRequest {
+                        input: None,
                         attempt_id: attempt_id("a1"),
                         outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                             pb::DeniedGeneration {
@@ -1415,6 +1420,7 @@ mod lifecycle_tests {
         for kind in [0, 999] {
             let error = lifecycle
                 .open(&pb::ResponseOpenOutcomeRequest {
+                    input: None,
                     attempt_id: attempt_id("a1"),
                     outcome: Some(pb::response_open_outcome_request::Outcome::Failed(
                         pb::OpenFailure {
@@ -1430,6 +1436,7 @@ mod lifecycle_tests {
         assert_eq!(active_requests(&lifecycle).await, 1);
         lifecycle
             .open(&pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: attempt_id("a1"),
                 outcome: Some(pb::response_open_outcome_request::Outcome::Failed(
                     pb::OpenFailure {
@@ -1886,6 +1893,7 @@ mod lifecycle_tests {
                     lifecycle.intend(&request).await.unwrap();
                 }
                 let mut opening = pb::ResponseOpenOutcomeRequest {
+                    input: None,
                     attempt_id: request.attempt_id.clone(),
                     outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                         pb::DeniedGeneration {
@@ -2083,6 +2091,7 @@ mod lifecycle_tests {
                     _ => unreachable!(),
                 }
                 let opening = pb::ResponseOpenOutcomeRequest {
+                    input: None,
                     attempt_id: request.attempt_id.clone(),
                     outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                         pb::DeniedGeneration {
@@ -2185,6 +2194,7 @@ mod lifecycle_tests {
                 .unwrap();
             assert!(attempt.admission_recorded);
             let opening = pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: request.attempt_id.clone(),
                 outcome: attempt.outcome.clone(),
             };
@@ -2259,6 +2269,7 @@ mod lifecycle_tests {
                     pb::response_open_outcome_request::Outcome::Admitted(admission)
                 };
                 let opening = pb::ResponseOpenOutcomeRequest {
+                    input: None,
                     attempt_id: request.attempt_id.clone(),
                     outcome: Some(outcome),
                 };
@@ -2357,6 +2368,7 @@ mod lifecycle_tests {
                 pb::response_open_outcome_request::Outcome::Admitted(admission)
             };
             let opening = pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: request.attempt_id.clone(),
                 outcome: Some(outcome),
             };
@@ -2451,6 +2463,7 @@ mod lifecycle_tests {
             admission.prefill_worker_id = WORKER + 1;
             lifecycle
                 .open(&pb::ResponseOpenOutcomeRequest {
+                    input: None,
                     attempt_id: request.attempt_id.clone(),
                     outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                         pb::DeniedGeneration {
@@ -2535,6 +2548,7 @@ mod lifecycle_tests {
         };
         lifecycle
             .open(&pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: request.attempt_id.clone(),
                 outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                     pb::DeniedGeneration {

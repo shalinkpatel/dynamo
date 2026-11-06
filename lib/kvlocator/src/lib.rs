@@ -489,6 +489,7 @@ mod tests {
         }));
         let error = locator
             .response_finish(Request::new(pb::ResponseFinishRequest {
+                model_id: String::new(),
                 attempt_id: "a1".into(),
                 reason: 1,
             }))
@@ -511,6 +512,7 @@ mod tests {
         }));
         let error = locator
             .response_open_outcome(Request::new(pb::ResponseOpenOutcomeRequest {
+                input: None,
                 attempt_id: "a1".into(),
                 outcome: Some(pb::response_open_outcome_request::Outcome::Denied(
                     pb::DeniedGeneration::default(),
